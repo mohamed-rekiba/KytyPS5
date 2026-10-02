@@ -73,7 +73,7 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	require(facts.shader_image_gather_extended, "shaderImageGatherExtended");
 	require(facts.independent_blend, "independentBlend");
 	require(facts.tessellation_shader, "tessellationShader");
-	// These used to stop the emulator at device creation, after the device was chosen.
+	// Device creation needs these. Checking them here rejects a device before it is chosen.
 	require(facts.shader_int64, "shaderInt64");
 	require(facts.vertex_pipeline_stores_and_atomics, "vertexPipelineStoresAndAtomics");
 	require(facts.dual_src_blend, "dualSrcBlend");

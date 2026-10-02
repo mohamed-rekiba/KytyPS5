@@ -1,3 +1,6 @@
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -21,8 +24,6 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_vulkan.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -293,7 +294,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		    [&](uint32_t* count, vk::ExtensionProperties* values) {
 			    return device.enumerateDeviceExtensionProperties(nullptr, count, values);
 		    });
-		EXIT_NOT_IMPLEMENTED(available_extensions.empty());
 
 		const auto queue_family = VulkanFindQueueFamily(device, surface);
 		if (queue_family == static_cast<uint32_t>(-1)) {
@@ -609,8 +609,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 	graphics.depth_bounds_enabled       = capabilities.depth_bounds;
 	graphics.shader_host_features       = {
 	    .buffer_int64_atomics        = features12.shaderBufferInt64Atomics == VK_TRUE,
-	    .shared_int64_atomics        = features12.shaderSharedInt64Atomics == VK_TRUE &&
-	                                   workgroup_layout.workgroupMemoryExplicitLayout == VK_TRUE,
+	    .shared_int64_atomics        = capabilities.shader_shared_int64_atomics,
 	    .cull_distance               = device_features.shaderCullDistance == VK_TRUE,
 	    .fragment_shader_barycentric = capabilities.fragment_shader_barycentric,
 	    .float64                     = device_features.shaderFloat64 == VK_TRUE,

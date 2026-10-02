@@ -9845,6 +9845,46 @@ void TestHostFeaturesGateUnavailableCapabilities() {
 #endif
   }
 
+  // 64-bit floating point.
+  {
+    constexpr uint32_t kCapabilityFloat64 = 10u;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    const std::array shader = {
+        EncodeVop1(0x04, 2, 256 + 0), // V_CVT_F64_I32 v[2:3], v0
+        EncodeVop1(0x0f, 4, 256 + 2), // V_CVT_F32_F64 v4, v[2:3]
+        EncodeMubuf0(0x1d, 32, false), EncodeMubuf1(4, 0, 0), // BUFFER_STORE_DWORD v4
+        EncodeSopp(0x01),
+    };
+    const auto with_support = RecompileForTest(shader, options);
+    Check(SpirvContainsCapability(with_support.spirv, kCapabilityFloat64),
+          "the default host features must keep native 64-bit floating point");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    options.host_features = none;
+    ExpectFatal([&] { (void)RecompileForTest(shader, options); },
+                "a 64-bit floating point shader compiled without host support");
+#endif
+  }
+
+  // Native 64-bit LDS atomics.
+  {
+    ShaderComputeInputInfo compute{};
+    compute.lds_size_dwords = 1024;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.input_info.compute = &compute;
+    const std::array shader = {
+        EncodeDs0(0x40), EncodeDs1(0, 2, 1), // DS_ADD_U64 v1, v[2:3]
+        EncodeSopp(0x01),
+    };
+    const auto with_support = RecompileForTest(shader, options);
+    Check(SpirvContainsCapability(with_support.spirv, kCapabilityInt64Atomics),
+          "the default host features must keep native 64-bit LDS atomics");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    options.host_features = none;
+    ExpectFatal([&] { (void)RecompileForTest(shader, options); },
+                "a 64-bit LDS atomic compiled without host support");
+#endif
+  }
+
   // Fragment barycentrics.
   {
     ShaderPixelInputInfo custom_ps_info{};
