@@ -237,6 +237,19 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+void BufferCache::InvalidateWrittenMemory(uint64_t fault_vaddr, bool window_is_mapped) {
+	// Each fault costs a signal and a protection change, which is slow under Rosetta. A game that
+	// rewrites buffers every frame faults on every page it touches, so one fault covers a window.
+	constexpr uint64_t WindowSize = 64 * 1024;
+	const auto         begin      = Common::AlignDown(fault_vaddr, WindowSize);
+	if (window_is_mapped && GuestRange {begin, WindowSize}.Valid() &&
+	    !m_memory_tracker.IsRegionGpuModified(begin, WindowSize)) {
+		InvalidateMemory(begin, WindowSize);
+		return;
+	}
+	InvalidateMemory(fault_vaddr, 1);
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "

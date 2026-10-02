@@ -51,6 +51,10 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// A CPU write faulted at `fault_vaddr`. Unprotects the whole aligned window around it when no
+	// page in the window holds GPU-modified data, so a run of writes costs one fault, not one per
+	// page. Pages the CPU did not write count as written, and the next GPU use uploads them.
+	void                   InvalidateWrittenMemory(uint64_t fault_vaddr, bool window_is_mapped);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);

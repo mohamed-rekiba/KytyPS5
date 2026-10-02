@@ -62,7 +62,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		constexpr uint64_t window = 64 * 1024;
+		m_buffer_cache.InvalidateWrittenMemory(
+		    fault_vaddr, IsMapped(Common::AlignDown(fault_vaddr, window), window));
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
