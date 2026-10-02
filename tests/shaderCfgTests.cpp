@@ -6288,6 +6288,7 @@ void TestPerspectiveCentroidInputs() {
     pixel.ps_perspective_centroid_vgpr = UINT32_MAX;
     Check(key != MakeStageStaticKey(pixel), "centroid input is missing from shader key");
     pixel.ps_perspective_centroid_vgpr = centroid;
+    pixel.ps_multisampled = true; // centroid differs from center only with several samples
     auto options = MakeCompileOptions(ShaderType::Pixel);
     options.input_info.pixel = &pixel;
     const auto result = RecompileForTest(shader, options);
@@ -6305,6 +6306,26 @@ void TestPerspectiveCentroidInputs() {
             "center pair lost its ordinary barycentric loads when centroid was enabled");
     }
     CheckSpirvBinaryValidates(result.spirv);
+
+    // With one sample per pixel the centroid is the pixel center, so the plain barycentrics are
+    // the same value and no interpolation function is needed.
+    pixel.ps_multisampled = false;
+    const auto single = RecompileForTest(shader, options);
+    Check(DisassembleSpirvBinary(single.spirv).find("InterpolateAtCentroid") == std::string::npos &&
+              !SpirvContainsCapability(single.spirv, 52u),
+          "single-sample centroid I/J still used an interpolation function");
+    Check(SpirvHasDecorationValue(single.spirv, 11u, 5286u),
+          "single-sample centroid I/J lost the barycentric builtin");
+    CheckSpirvBinaryValidates(single.spirv);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    // A host that cannot interpolate barycentrics at the centroid stops a multisampled shader.
+    pixel.ps_multisampled = true;
+    options.host_features.centroid_barycentric = false;
+    ExpectFatal([&] { (void)RecompileForTest(shader, options); },
+                "multisampled centroid barycentrics compiled without host support");
+    pixel.ps_multisampled = false;
+    (void)RecompileForTest(shader, options);
+#endif
   }
 }
 
@@ -12436,6 +12457,21 @@ void TestNewShaderRecompilerExpPixelOutputs() {
   Check(!SpirvContainsExtInst(uint16_result.spirv, 62),
         "compressed UINT16 MRT export was incorrectly decoded as FP16");
   CheckSpirvBinaryValidates(uint16_result.spirv);
+
+  // A signed integer target takes raw 16-bit lanes sign-extended into a signed output.
+  ShaderPixelInputInfo sint16_info;
+  sint16_info.target_output_mode[0] = 8;
+  options.input_info.pixel = &sint16_info;
+  auto sint16_result = RecompileForTest(shader, options);
+  const auto sint16_source = DisassembleSpirvBinary(sint16_result.spirv);
+  Check((sint16_source.find("OpVariable %_ptr_Output_v4int Output") != std::string::npos),
+        "SINT16 MRT export did not use a signed integer output");
+  Check(CountSourceOccurrences(sint16_source, "OpBitFieldSExtract") == 4u &&
+            CountSourceOccurrences(sint16_source, "OpBitFieldUExtract") == 0u,
+        "compressed SINT16 MRT export did not sign-extend all low/high 16-bit lanes");
+  Check(!SpirvContainsExtInst(sint16_result.spirv, 62),
+        "compressed SINT16 MRT export was incorrectly decoded as FP16");
+  CheckSpirvBinaryValidates(sint16_result.spirv);
 
   ShaderPixelInputInfo unorm16_info;
   unorm16_info.target_output_mode[0] = 5;

@@ -605,7 +605,24 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
-		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		for (uint32_t i = 0; i < std::size(pixel_info.target_output_mode); i++) {
+			const auto& target = context.GetRenderTarget(i);
+			pixel_info.ps_multisampled |= target.base.addr != 0 && target.attrib.num_fragments > 1;
+		}
+		// An integer target stores the exported bits as they are, whatever the export format says.
+		// The host needs an integer shader output of the same signedness for such a target.
+		for (uint32_t i = 0; i < std::size(pixel_info.target_output_mode); i++) {
+			if (pixel_info.target_output_mode[i] == 0) {
+				continue;
+			}
+			const auto type = context.GetRenderTarget(i).info.channel_type;
+			if (type == Prospero::ChannelType::kUInt) {
+				pixel_info.target_output_mode[i] = 7;
+			} else if (type == Prospero::ChannelType::kSInt) {
+				pixel_info.target_output_mode[i] = 8;
+			}
+		}
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
@@ -619,6 +636,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
 		} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
 		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
+		           pixel_info.target_output_mode[0] != 8 &&
 		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
 		                       std::end(pixel_info.target_output_mode),
 		                       [](uint8_t mode) { return mode == 0; }) &&
@@ -668,6 +686,37 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
+}
+
+// Formats whose texels are integers. Vulkan cannot blend them.
+static bool IsIntegerColorFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8Sint:
+		case vk::Format::eR8G8Uint:
+		case vk::Format::eR8G8Sint:
+		case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eR8G8B8A8Sint:
+		case vk::Format::eB8G8R8A8Uint:
+		case vk::Format::eB8G8R8A8Sint:
+		case vk::Format::eA2R10G10B10UintPack32:
+		case vk::Format::eA2R10G10B10SintPack32:
+		case vk::Format::eA2B10G10R10UintPack32:
+		case vk::Format::eA2B10G10R10SintPack32:
+		case vk::Format::eR16Uint:
+		case vk::Format::eR16Sint:
+		case vk::Format::eR16G16Uint:
+		case vk::Format::eR16G16Sint:
+		case vk::Format::eR16G16B16A16Uint:
+		case vk::Format::eR16G16B16A16Sint:
+		case vk::Format::eR32Uint:
+		case vk::Format::eR32Sint:
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32Sint:
+		case vk::Format::eR32G32B32A32Uint:
+		case vk::Format::eR32G32B32A32Sint: return true;
+		default: return false;
+	}
 }
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
@@ -721,6 +770,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		const bool alpha_remap =
 		    slot == 0 && ps_input_info != nullptr && ps_input_info->alpha_blend_source_remap;
 		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
+		// The color block does not blend integer targets, and Vulkan has no blending for them.
+		if (IsIntegerColorFormat(rendering.color_formats[slot])) {
+			static_params.blend_enable[slot] = false;
+		}
 		if (static_params.blend_enable[slot] && !alpha_remap &&
 		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;

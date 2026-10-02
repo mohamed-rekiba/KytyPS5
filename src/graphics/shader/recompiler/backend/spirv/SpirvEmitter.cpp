@@ -22,7 +22,8 @@ namespace {
 // module later with a message that does not say which guest shader needed it.
 void ValidateHostFeatures(const IR::Program&                program,
                           const Emitter::SpirvRequirements& requirements,
-                          const ShaderHostFeatures&         host_features) {
+                          const ShaderHostFeatures&         host_features,
+                          ShaderStageInputInfo              input_info) {
 	if (!host_features.buffer_int64_atomics && requirements.buffer_int64_atomics) {
 		Fail(program,
 		     "shader needs 64-bit buffer atomics (shaderBufferInt64Atomics), which the host GPU "
@@ -61,6 +62,11 @@ void ValidateHostFeatures(const IR::Program&                program,
 		Fail(program,
 		     "shader exports cull distances (shaderCullDistance), which the host GPU does not "
 		     "enable");
+	}
+	if (!host_features.centroid_barycentric && requirements.centroid_barycentric &&
+	    program.stage == ShaderType::Pixel && input_info.pixel->ps_multisampled) {
+		Fail(program, "multisampled shader reads barycentrics at the centroid, which the host GPU "
+		              "cannot interpolate");
 	}
 	if (!host_features.fragment_shader_barycentric &&
 	    std::ranges::any_of(program.info.inputs, [](const IR::StageInput& input) {
@@ -354,6 +360,11 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					requirements.subgroup_local_invocation_id |=
 					    program.stage != ShaderType::TessellationControl;
 					break;
+				case IR::ValueOpcode::GetBuiltin:
+					requirements.centroid_barycentric |=
+					    inst.Arg(0).U32() ==
+					    static_cast<uint32_t>(IR::StageInputKind::BaryCoordSmoothCentroid);
+					break;
 				case IR::ValueOpcode::ImageQueryLod: requirements.compute_derivatives = true; break;
 				case IR::ValueOpcode::ImageGatherRaw:
 					requirements.image_gather_extended = true;
@@ -393,7 +404,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
-	ValidateHostFeatures(program, state.requirements, host_features);
+	ValidateHostFeatures(program, state.requirements, host_features, input_info);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

@@ -100,6 +100,7 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	caps.depth_bounds = facts.depth_bounds;
 	caps.push_descriptors =
 	    HasExtension(facts.extensions, kPushDescriptorExtension) && !facts.driver_is_moltenvk;
+	caps.centroid_barycentric = caps.fragment_shader_barycentric && !facts.driver_is_moltenvk;
 
 	const auto note = [&](bool available, const char* line) {
 		if (!available) {
@@ -123,6 +124,12 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	note(caps.depth_bounds,
 	     "depthBounds is unavailable: a draw that enables the depth bounds test stops the "
 	     "emulator");
+	// With the extension present but the driver unable to interpolate at the centroid.
+	if (caps.fragment_shader_barycentric && !caps.centroid_barycentric) {
+		decision.unavailable.push_back("centroid barycentrics are unavailable: a multisampled "
+		                               "shader that reads them stops the "
+		                               "emulator");
+	}
 	// Not an error: the renderer uses regular descriptor sets instead.
 	note(caps.push_descriptors,
 	     "push descriptors are not used: MoltenVK binds no buffer sizes for them, so the "

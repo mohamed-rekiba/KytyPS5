@@ -619,6 +619,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 	    .shared_int64_atomics        = capabilities.shader_shared_int64_atomics,
 	    .cull_distance               = device_features.shaderCullDistance == VK_TRUE,
 	    .fragment_shader_barycentric = capabilities.fragment_shader_barycentric,
+	    .centroid_barycentric        = capabilities.centroid_barycentric,
 	    .float64                     = device_features.shaderFloat64 == VK_TRUE,
 	    .subgroup_supported_stages   = static_cast<uint32_t>(properties11.subgroupSupportedStages),
 	};

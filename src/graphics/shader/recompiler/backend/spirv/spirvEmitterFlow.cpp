@@ -41,9 +41,13 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		return EmitAddU32(state, local,
 		                  EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, size)));
 	}
-	const bool centroid = kind == IR::StageInputKind::BaryCoordSmoothCentroid;
-	const auto variable = InputVariableForKind(
-	    state, centroid ? IR::StageInputKind::BaryCoordSmooth : kind);
+	// With one sample per pixel the centroid is the pixel center.
+	const bool centroid = kind == IR::StageInputKind::BaryCoordSmoothCentroid &&
+	                      state.input_info.pixel->ps_multisampled;
+	const auto variable =
+	    InputVariableForKind(state, kind == IR::StageInputKind::BaryCoordSmoothCentroid
+	                                    ? IR::StageInputKind::BaryCoordSmooth
+	                                    : kind);
 	if (variable == 0) {
 		return ConstantU32(state, 0);
 	}
@@ -76,7 +80,8 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
 		return bits;
 	}
-	if (centroid || kind == IR::StageInputKind::BaryCoordSmooth ||
+	if (centroid || kind == IR::StageInputKind::BaryCoordSmoothCentroid ||
+	    kind == IR::StageInputKind::BaryCoordSmooth ||
 	    kind == IR::StageInputKind::BaryCoordNoPerspective) {
 		const auto value   = state.builder.AllocateId();
 		const auto bits    = state.builder.AllocateId();
@@ -249,7 +254,7 @@ uint32_t ExportRawComponent(ValueEmitContext& ctx, uint32_t vector, uint32_t com
 }
 
 uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo& exp,
-                      bool uint_output) {
+                      bool uint_output, bool sint_output) {
 	auto& state = ctx.state;
 	if (exp.compr && !uint_output) {
 		const auto unpack =
@@ -297,9 +302,10 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 					continue;
 				}
 				raw[component] = state.builder.AllocateId();
-				state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), raw[component],
-				                          packed, ConstantU32(state, lane * 16u),
-				                          ConstantU32(state, 16));
+				// A signed target stores the lane's two's complement value.
+				state.builder.AddFunction(
+				    sint_output ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract, TypeU32(state),
+				    raw[component], packed, ConstantU32(state, lane * 16u), ConstantU32(state, 16));
 			}
 		}
 	} else {
@@ -494,9 +500,11 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (state.program.stage != ShaderType::Mesh && variable == 0) {
 			return;
 		}
-		const bool uint_output = MrtOutputMode(state, exp) == 7u;
+		// Mode 7 is a raw unsigned target, mode 8 a raw signed one (set from the target's format).
+		const bool sint_output = MrtOutputMode(state, exp) == 8u;
+		const bool uint_output = MrtOutputMode(state, exp) == 7u || sint_output;
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
-		auto       value       = ExportVector(ctx, data, exp, uint_output);
+		auto       value       = ExportVector(ctx, data, exp, uint_output, sint_output);
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index == 0 && !uint_output && state.input_info.pixel->alpha_blend_source_remap) {
 			// Broadcast logical alpha before swizzling the primary output.
@@ -563,6 +571,12 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    variable, ConstantU32(state, 0));
 			state.builder.AddFunction(spv::OpStore, pointer, value);
 		} else {
+			if (sint_output) {
+				const auto signed_value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitcast, TypeI32Vector(state, 4), signed_value,
+				                          value);
+				value = signed_value;
+			}
 			state.builder.AddFunction(spv::OpStore, variable, value);
 		}
 	});

@@ -183,6 +183,8 @@ struct ShaderPixelInputInfo {
 	// Export logical alpha through MRT1 for blending after channel swizzling.
 	bool                                           alpha_blend_source_remap     = false;
 	bool                                           ps_early_z                   = false;
+	// The render targets have several samples per pixel.
+	bool                                           ps_multisampled              = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
 

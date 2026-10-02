@@ -15,6 +15,8 @@ struct ShaderHostFeatures {
 	bool cull_distance               = true;
 	bool fragment_shader_barycentric = true;
 	bool float64                     = true;
+	// Barycentrics interpolated at the centroid (a multisampled shader that reads them).
+	bool centroid_barycentric = true;
 	// Stages that may use subgroup operations: VkPhysicalDeviceVulkan11Properties::
 	// subgroupSupportedStages, as VkShaderStageFlagBits values. All bits set means every stage.
 	uint32_t subgroup_supported_stages = ~0u;

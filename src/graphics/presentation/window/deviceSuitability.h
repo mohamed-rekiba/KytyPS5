@@ -83,6 +83,8 @@ struct DeviceCapabilities {
 	// Descriptors can be pushed with vkCmdPushDescriptorSet. MoltenVK binds no buffer sizes for
 	// them, so a shader that asks for a buffer length reads a null buffer.
 	bool push_descriptors = false;
+	// Fragment barycentrics interpolated at the centroid. MoltenVK cannot translate them to Metal.
+	bool centroid_barycentric = false;
 };
 
 struct DeviceDecision {

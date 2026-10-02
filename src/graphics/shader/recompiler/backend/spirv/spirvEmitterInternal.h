@@ -71,6 +71,7 @@ struct SpirvRequirements {
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
 	bool float64                      = false;
+	bool centroid_barycentric         = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);

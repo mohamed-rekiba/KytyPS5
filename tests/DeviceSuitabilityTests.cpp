@@ -126,6 +126,10 @@ void TestMoltenVkLikeDeviceIsAccepted() {
 	      "push descriptors must be off on MoltenVK: it binds no buffer sizes for them");
 	Check(Contains(decision.unavailable, "push descriptors"),
 	      "turning push descriptors off must be reported");
+	Check(!decision.capabilities.centroid_barycentric,
+	      "centroid barycentrics must be off on MoltenVK: it cannot translate them to Metal");
+	Check(Contains(decision.unavailable, "centroid barycentrics"),
+	      "unavailable centroid barycentrics must be reported");
 	Check(Contains(decision.unavailable, "image view minLod"),
 	      "an unavailable minLod must be reported");
 	Check(Contains(decision.unavailable, "shaderCullDistance"),
@@ -185,7 +189,7 @@ void TestFullDeviceKeepsEveryCapability() {
 	const auto& c = decision.capabilities;
 	Check(c.image_view_min_lod && c.shader_cull_distance && c.shader_buffer_int64_atomics &&
 	          c.shader_shared_int64_atomics && c.fragment_shader_barycentric && c.depth_bounds &&
-	          c.push_descriptors,
+	          c.push_descriptors && c.centroid_barycentric,
 	      "every optional capability must stay enabled when the device has it");
 }
 
