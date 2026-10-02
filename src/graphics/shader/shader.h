@@ -185,6 +185,11 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_early_z                   = false;
 	// The render targets have several samples per pixel.
 	bool                                           ps_multisampled              = false;
+	// The host has no depth bounds test. When the draw enables one, the pixel shader tests the
+	// depth buffer copy that the renderer made before the draw. 1 = 32-bit float, 2 = 16-bit
+	// normalized; 0 = no test. The test parameters are in push data from the given dword.
+	uint32_t                                       ps_depth_bounds_format       = 0;
+	uint32_t                                       ps_depth_bounds_dword        = 0;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
 

@@ -6329,6 +6329,44 @@ void TestPerspectiveCentroidInputs() {
   }
 }
 
+// The host has no depth bounds test (Metal). The renderer copies the depth buffer to a buffer
+// before the draw, and the pixel shader discards pixels whose stored depth is outside the range.
+void TestDepthBoundsPixelTest() {
+  constexpr uint32_t kOpKill = 252u;
+  constexpr uint32_t kOpConvertUToPtr = 120u;
+  constexpr uint32_t kBuiltInFragCoord = 15u;
+  const uint32_t shader[] = {EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3),
+                             0xbf810000u};
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+
+  ShaderPixelInputInfo off{};
+  options.input_info.pixel = &off;
+  const auto plain = RecompileForTest(shader, options);
+  Check(!SpirvContainsOpcode(plain.spirv, kOpKill) &&
+            !SpirvContainsOpcode(plain.spirv, kOpConvertUToPtr),
+        "a draw without a depth bounds test compiled a depth read");
+
+  for (const uint32_t format : {1u, 2u}) {
+    ShaderPixelInputInfo bounds{};
+    bounds.ps_depth_bounds_format = format;
+    bounds.ps_depth_bounds_dword = 6;
+    options.input_info.pixel = &bounds;
+    const auto result = RecompileForTest(shader, options);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(SpirvContainsOpcode(result.spirv, kOpKill),
+          "depth bounds test does not discard pixels outside the range");
+    Check(SpirvContainsOpcode(result.spirv, kOpConvertUToPtr),
+          "depth bounds test does not read the depth snapshot by address");
+    Check(SpirvHasDecorationValue(result.spirv, 11u, kBuiltInFragCoord),
+          "depth bounds test does not read the pixel position");
+    Check(source.find("PushConstant") != std::string::npos,
+          "depth bounds test does not read its parameters from push constants");
+    Check(format != 2u || source.find("OpConvertUToF") != std::string::npos,
+          "16-bit depth was not converted from its normalized integer value");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestPsInputCountRegisterDecode() {
   HW::Context context;
   // NUM_INTERP is 3 while bit 14 is an independent control flag that must be
@@ -14605,6 +14643,7 @@ int main() {
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestHostFeaturesGateUnavailableCapabilities();
+  TestDepthBoundsPixelTest();
   TestVertexAllOnesExecMaskNeedsNoSubgroup();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();

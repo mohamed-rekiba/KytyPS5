@@ -368,6 +368,7 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind);
+bool     UsesDepthBounds(const EmitterState& state);
 
 const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t location);
 

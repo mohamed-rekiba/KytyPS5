@@ -134,6 +134,11 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
 }
 
+bool UsesDepthBounds(const EmitterState& state) {
+	return state.program.stage == ShaderType::Pixel &&
+	       state.input_info.pixel->ps_depth_bounds_format != 0;
+}
+
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {
 	for (const auto& input: state.inputs) {
 		if (input.kind == kind) {

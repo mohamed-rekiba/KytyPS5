@@ -216,7 +216,8 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 }
 
 void DefineDescriptors(EmitterState& state) {
-	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
+	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
+	    UsesDepthBounds(state)) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -425,6 +426,11 @@ void DefineInputs(EmitterState& state) {
 	state.inputs.reserve(state.program.info.inputs.size());
 	for (const auto& input: state.program.info.inputs) {
 		state.inputs.push_back({input});
+	}
+	if (UsesDepthBounds(state) && std::ranges::none_of(state.inputs, [](const InputBinding& input) {
+		    return input.kind == IR::StageInputKind::FragCoord;
+	    })) {
+		state.inputs.push_back({{IR::StageInputKind::FragCoord, 0, 4, "gl_FragCoord"}});
 	}
 	if (state.lane_count == 2) {
 		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
@@ -672,7 +678,7 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(spv::CapabilityShader);
 	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
-	if (state.program.info.uses_dma) {
+	if (state.program.info.uses_dma || UsesDepthBounds(state)) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -731,7 +737,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma
+	state.builder.AddMemoryModel(state.program.info.uses_dma || UsesDepthBounds(state)
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);

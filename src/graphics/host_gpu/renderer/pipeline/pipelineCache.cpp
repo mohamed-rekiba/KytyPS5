@@ -666,6 +666,18 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
+	if (pixel_active && !m_graphics.depth_bounds_enabled &&
+	    context.GetDepthControl().depth_bounds_enable) {
+		// The host has no depth bounds test: the pixel shader applies it to a copy of the depth
+		// buffer (see EmitDepthBoundsTest).
+		switch (context.GetDepthRenderTarget().z_info.format) {
+			case Prospero::DepthFormat::kZ32F: pixel_info.ps_depth_bounds_format = 1; break;
+			case Prospero::DepthFormat::kZ16: pixel_info.ps_depth_bounds_format = 2; break;
+			default: EXIT("depth bounds test on an unsupported depth format\n");
+		}
+		pixel_info.ps_depth_bounds_dword = push_data_cursor;
+		push_data_cursor += ShaderRecompiler::IR::PushData::DepthBoundsDwordCount;
+	}
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
@@ -845,9 +857,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
-	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
-	static_params.depth_min_bounds         = depth.depth_min_bounds;
-	static_params.depth_max_bounds         = depth.depth_max_bounds;
+	// Without a depth bounds test in hardware the pixel shader applies it, and the bounds travel
+	// in push data, so they must not split pipelines.
+	const bool bounds_in_hardware =
+	    depth.depth_bounds_test_enable && m_graphics.depth_bounds_enabled;
+	static_params.depth_bounds_test_enable = bounds_in_hardware;
+	static_params.depth_min_bounds         = bounds_in_hardware ? depth.depth_min_bounds : 0.0f;
+	static_params.depth_max_bounds         = bounds_in_hardware ? depth.depth_max_bounds : 0.0f;
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;

@@ -297,6 +297,9 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// Depth bounds test of a pixel shader: depth buffer copy address (two dwords), row width in
+	// pixels, minimum and maximum bound as float bits.
+	static constexpr uint32_t        DepthBoundsDwordCount = 5;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 

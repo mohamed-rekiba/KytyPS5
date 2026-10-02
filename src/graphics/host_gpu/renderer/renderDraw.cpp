@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -1020,6 +1021,79 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+// The host has no depth bounds test. The pixel shader applies it to a copy of the depth buffer
+// that this makes before the draw. The copy is exact when the draw leaves the depth buffer alone:
+// a draw that writes or clears depth would test against values that change during the draw.
+void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderState& state,
+                                              vk::PipelineLayout layout) {
+	auto&       depth = state.depth_info;
+	auto&       cache = m_context.GetTextureCache();
+	const auto& ps    = state.ps_input_info;
+	if (!state.ps_active || ps.ps_depth_bounds_format == 0) {
+		EXIT("depth bounds test on a draw without a pixel shader\n");
+	}
+	if (depth.depth_write_enable || depth.depth_load_clear_enable) {
+		EXIT("depth bounds test on a draw that also writes or clears depth\n");
+	}
+	auto&       image = cache.GetImage(depth.image_id);
+	const auto& view  = depth.desc.view_info;
+	if (image.backing.samples != 1 || view.base_level != 0 || view.level_count != 1 ||
+	    view.layer_count != 1) {
+		EXIT("depth bounds test on a multisampled, mipmapped or layered depth target\n");
+	}
+	const auto format  = image.backing.format;
+	const bool f32     = format == vk::Format::eD32Sfloat || format == vk::Format::eD32SfloatS8Uint;
+	const bool unorm16 = format == vk::Format::eD16Unorm || format == vk::Format::eD16UnormS8Uint;
+	if ((ps.ps_depth_bounds_format == 1 && !f32) || (ps.ps_depth_bounds_format == 2 && !unorm16)) {
+		EXIT("depth bounds test: depth format %d does not match the shader's depth read\n",
+		     static_cast<int>(format));
+	}
+	const auto extent = depth.desc.info.extent;
+	const auto bytes =
+	    Common::AlignUp(static_cast<uint64_t>(extent.width) * extent.height * (f32 ? 4u : 2u), 4);
+
+	auto& scheduler = m_context.GetCommandScheduler();
+	auto  snapshot  = std::make_unique<Buffer>(
+	    m_context.GetGraphics(), scheduler, MemoryUsage::DeviceLocal, 0,
+	    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst |
+	        vk::BufferUsageFlagBits::eShaderDeviceAddress,
+	    bytes);
+	const auto address = snapshot->BufferDeviceAddress();
+
+	scheduler.EndRendering();
+	auto                        vk_buffer = buffer.Handle();
+	const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
+	                                   view.layer_count};
+	const auto                  attachment_layout = image.binding.attachment_layout;
+	const auto                  attachment_access = image.binding.attachment_access;
+	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range,
+	              vk_buffer);
+	vk::BufferImageCopy copy {};
+	copy.imageSubresource = {vk::ImageAspectFlagBits::eDepth, view.base_level, view.base_layer, 1};
+	copy.imageExtent      = {extent.width, extent.height, 1};
+	vk_buffer.copyImageToBuffer(image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+	                            snapshot->Handle(), 1, &copy);
+	image.Transit(attachment_layout, attachment_access, range, vk_buffer);
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eFragmentShader;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	vk_buffer.pipelineBarrier2(dependency);
+	scheduler.DeferOperation([owner = std::move(snapshot)]() mutable { owner.reset(); });
+
+	const uint32_t parameters[ShaderRecompiler::IR::PushData::DepthBoundsDwordCount] {
+	    static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u), extent.width,
+	    std::bit_cast<uint32_t>(depth.depth_min_bounds),
+	    std::bit_cast<uint32_t>(depth.depth_max_bounds)};
+	vk_buffer.pushConstants(layout, vk::ShaderStageFlagBits::eFragment,
+	                        ps.ps_depth_bounds_dword * sizeof(uint32_t), sizeof(parameters),
+	                        parameters);
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1125,6 +1199,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        0, sizeof(draw_data), draw_data);
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
+	}
+
+	if (state.depth_info.depth_bounds_test_enable &&
+	    !m_context.GetGraphics().depth_bounds_enabled) {
+		ApplyDepthBoundsByShader(buffer, state, pipeline.pipeline_layout);
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);

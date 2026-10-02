@@ -477,8 +477,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
-	// Ignoring the depth bounds test would change what the draw writes, so stop instead.
-	EXIT_NOT_IMPLEMENTED(static_params.depth_bounds_test_enable && !graphics.depth_bounds_enabled);
+	// Without a depth bounds test in hardware the pixel shader applies it; the pipeline never asks
+	// the device for one.
+	EXIT_IF(static_params.depth_bounds_test_enable && !graphics.depth_bounds_enabled);
 	depth_stencil_info.depthBoundsTestEnable =
 	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
 	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;

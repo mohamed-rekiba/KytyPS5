@@ -39,6 +39,78 @@ void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
 	EmitKillIfBoolFalse(state, active);
 }
 
+// Depth bounds test for hosts that have none. The renderer copies the depth buffer to a buffer
+// before the draw; its address, row width and the bounds are in push data. A pixel whose stored
+// depth is outside [min, max] is discarded before the guest shader runs.
+void EmitDepthBoundsTest(EmitterState& state) {
+	if (!UsesDepthBounds(state)) {
+		return;
+	}
+	const auto& pixel = *state.input_info.pixel;
+	const auto  push  = [&](uint32_t dword) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, pixel.ps_depth_bounds_dword + dword));
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto coordinate = [&](uint32_t component) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer,
+		    InputVariableForKind(state, IR::StageInputKind::FragCoord),
+		    ConstantU32(state, component));
+		state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
+		return Unary(state, spv::OpConvertFToU, TypeU32(state), value);
+	};
+	const auto texel =
+	    Binary(state, spv::OpIAdd, TypeU32(state),
+	           Binary(state, spv::OpIMul, TypeU32(state), coordinate(1), push(2)), coordinate(0));
+	const bool half_depth = pixel.ps_depth_bounds_format == 2u;
+	// Texels are 4 bytes, or 2 bytes for 16-bit depth, which the copy packs two to a dword.
+	const auto word    = half_depth ? Binary(state, spv::OpShiftRightLogical, TypeU32(state), texel,
+	                                         ConstantU32(state, 1))
+	                                : texel;
+	const auto address = Binary(state, spv::OpIAdd, TypeScalarU64(state),
+	                            DeviceAddressFromWords(state, push(0), push(1)),
+	                            Binary(state, spv::OpIMul, TypeScalarU64(state),
+	                                   Unary(state, spv::OpUConvert, TypeScalarU64(state), word),
+	                                   ConstantDeviceAddress(state, sizeof(uint32_t))));
+	const auto pointer = state.builder.AllocateId();
+	const auto bits    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+	                          address);
+	constexpr uint32_t alignment = sizeof(uint32_t);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), bits, pointer,
+	                          spv::MemoryAccessAlignedMask, alignment);
+	uint32_t depth = 0;
+	if (half_depth) {
+		const auto shift =
+		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		           Binary(state, spv::OpBitwiseAnd, TypeU32(state), texel, ConstantU32(state, 1)),
+		           ConstantU32(state, 4));
+		const auto raw =
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		           Binary(state, spv::OpShiftRightLogical, TypeU32(state), bits, shift),
+		           ConstantU32(state, 0xffffu));
+		depth = Binary(state, spv::OpFMul, TypeF32(state),
+		               Unary(state, spv::OpConvertUToF, TypeF32(state), raw),
+		               ConstantF32Value(state, 1.0f / 65535.0f));
+	} else {
+		depth = Unary(state, spv::OpBitcast, TypeF32(state), bits);
+	}
+	const auto minimum = Unary(state, spv::OpBitcast, TypeF32(state), push(3));
+	const auto maximum = Unary(state, spv::OpBitcast, TypeF32(state), push(4));
+	const auto inside =
+	    Binary(state, spv::OpLogicalAnd, TypeBool(state),
+	           Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), depth, minimum),
+	           Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), depth, maximum));
+	EmitKillIfBoolFalse(state, inside);
+}
+
 uint32_t SpillPointerType(ValueEmitContext& ctx, IR::Type type) {
 	const auto value_type = TypeId(ctx.state, type);
 	return value_type == 0 ? 0 : TypePointer(ctx.state, spv::StorageClassFunction, value_type);
@@ -752,6 +824,7 @@ void EmitProgram(EmitterState& state) {
 		                          ConstantU32(state, 1));
 	}
 	EmitMemoryOffsets(state);
+	EmitDepthBoundsTest(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {
