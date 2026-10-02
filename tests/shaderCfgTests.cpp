@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/shader/meshEmulation.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -126,6 +127,8 @@ struct TestCompileResult {
   std::string ir_dump;
   ShaderRecompiler::IR::Program program;
   ShaderRecompiler::IR::ResourceSnapshot resources;
+  std::vector<uint32_t> mesh_vertex_spirv;
+  uint32_t mesh_slot_words = 0;
 };
 
 TestCompileResult RecompileForTest(
@@ -151,7 +154,8 @@ TestCompileResult RecompileForTest(
       std::move(translated), options, specialization, push_data_start_dword);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
-          std::move(resources)};
+          std::move(resources), std::move(compiled.mesh_vertex_spirv),
+          compiled.mesh_slot_words};
 }
 
 void CompilePixelRuntime(const ShaderParams &params,
@@ -9947,9 +9951,9 @@ void TestHostFeaturesGateUnavailableCapabilities() {
   // Subgroup operations are only allowed in the stages the device lists.
   {
     constexpr uint32_t kVertexStageBit = 0x1u;
+    // A lane exchange has no single-lane meaning, so it still needs the host's subgroup operations.
     const std::array shader = {
-        EncodeVop1(0x02, 24, 5 + 256), // V_READFIRSTLANE_B32 s24, v5
-        EncodeVop1(0x01, 0, 24),       // V_MOV_B32 v0, s24
+        EncodeVop1(0x01, 0, 250), EncodeVop1Dpp(5), // V_MOV_B32 v0, v5 dpp
         EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), // position
         EncodeSopp(0x01),
     };
@@ -9964,6 +9968,52 @@ void TestHostFeaturesGateUnavailableCapabilities() {
     auto compute = MakeCompileOptions(ShaderType::Compute);
     compute.host_features.subgroup_supported_stages = 0x32u;
     (void)RecompileForTest(shader, compute);
+  }
+
+  // Without subgroup operations in the stage, a guest wave is one invocation with one active lane.
+  // The first active lane is then the invocation itself, so READFIRSTLANE is its own value. This is
+  // the shape of the loop that GPU compilers emit to index registers by a per-lane value.
+  {
+    constexpr uint32_t kCapabilityGroupNonUniform = 61u;
+    const std::array shader = {
+        EncodeVop1(0x02, 24, 5 + 256), // V_READFIRSTLANE_B32 s24, v5
+        EncodeVop1(0x01, 0, 24),       // V_MOV_B32 v0, s24
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    const auto native = RecompileForTest(shader, options);
+    Check(SpirvContainsCapability(native.spirv, kCapabilityGroupNonUniform),
+          "a host with subgroup operations in the vertex stage lost the real READFIRSTLANE");
+    options.host_features.subgroup_supported_stages = 0x32u; // no vertex
+    const auto lowered = RecompileForTest(shader, options);
+    Check(!SpirvContainsCapability(lowered.spirv, kCapabilityGroupNonUniform),
+          "READFIRSTLANE in a stage without subgroup operations still used them");
+    CheckSpirvBinaryValidates(lowered.spirv);
+  }
+
+  // The loop's other half: a compare that makes a lane mask (a ballot) from a per-lane value that
+  // was just read from the first lane, then a select by that mask.
+  {
+    constexpr uint32_t kCapabilityGroupNonUniformBallot = 64u;
+    const std::array shader = {
+        EncodeVop1(0x02, 9, 5 + 256),  // V_READFIRSTLANE_B32 s9, v5
+        EncodeVopc(0xc2, 9, 6),        // V_CMP_EQ_U32 vcc, s9, v6
+        EncodeSop1(0x0f, 20, 106),     // S_BCNT1_I32_B64 s20, vcc (reads the mask as a scalar)
+        EncodeVop1(0x01, 0, 20),       // V_MOV_B32 v0, s20
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    const auto native = RecompileForTest(shader, options);
+    Check(SpirvContainsCapability(native.spirv, kCapabilityGroupNonUniformBallot),
+          "a host with subgroup operations in the vertex stage lost the real ballot");
+    options.host_features.subgroup_supported_stages = 0x32u; // no vertex
+    const auto lowered = RecompileForTest(shader, options);
+    Check(!SpirvContainsCapability(lowered.spirv, kCapabilityGroupNonUniformBallot) &&
+              !SpirvContainsCapability(lowered.spirv, 61u),
+          "a lane mask in a stage without subgroup operations still used them");
+    CheckSpirvBinaryValidates(lowered.spirv);
   }
 
   // Fragment barycentrics.
@@ -10247,6 +10297,46 @@ void TestMeshExportStorage() {
           "mesh staging must retain guest LDS, shared Layer and allocation within the host budget");
     Check(private_bytes == (4u * 16u + 4u) * (64u / subgroup_size),
           "mesh vertex and primitive exports lost their separate logical-lane storage");
+  }
+
+  // The same shader for a host without mesh shaders: a compute shader that writes this
+  // workgroup's record (vertices, primitives and counts) through a device address.
+  for (const uint32_t subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    mesh.emulated = true;
+    options.back_code = std::span{back};
+    const auto emulated = RecompileForTest(std::span{front}, options, nullptr, nullptr,
+                                           PushData::MeshEmulatedDrawDwordCount);
+    mesh.emulated = false;
+    CheckSpirvBinaryValidates(emulated.spirv);
+    const auto compute = DisassembleSpirvBinary(emulated.spirv);
+    Check(compute.find("OpEntryPoint GLCompute") != std::string::npos &&
+              !SpirvContainsCapability(emulated.spirv, 5283u) /* MeshShadingEXT */ &&
+              compute.find("OpSetMeshOutputsEXT") == std::string::npos,
+          "emulated mesh shader is not a plain compute shader");
+    Check(compute.find("OpConvertUToPtr") != std::string::npos &&
+              compute.find("PhysicalStorageBuffer") != std::string::npos,
+          "emulated mesh shader does not write its record by device address");
+    Check(compute.find("OpDecorate %gl_WorkGroupID BuiltIn WorkgroupId") != std::string::npos,
+          "emulated mesh shader cannot find its workgroup");
+    // Position and three parameters make four vec4 per vertex: 4 words of header, 192 vertices of
+    // 16 words, 176 primitives of 2 words.
+    Check(MeshEmulationLayout{192, 176, 4}.SlotWords() == 4u + 192u * 16u + 176u * 2u,
+          "mesh record layout changed");
+    Check(emulated.mesh_slot_words == MeshEmulationLayout{192, 176, 4}.SlotWords(),
+          "emulated mesh shader reports a record size that differs from its layout");
+    // The vertex shader that draws the records: one triangle per primitive slot, reading the
+    // position and the three parameters, and the layer, back from the record.
+    CheckSpirvBinaryValidates(emulated.mesh_vertex_spirv);
+    const auto vertex = DisassembleSpirvBinary(emulated.mesh_vertex_spirv);
+    Check(vertex.find("OpEntryPoint Vertex") != std::string::npos &&
+              vertex.find("BuiltIn VertexIndex") != std::string::npos &&
+              vertex.find("BuiltIn Position") != std::string::npos &&
+              vertex.find("BuiltIn Layer") != std::string::npos &&
+              vertex.find("Location 0") != std::string::npos &&
+              vertex.find("Location 2") != std::string::npos &&
+              vertex.find("Location 3") == std::string::npos,
+          "emulated mesh vertex shader lacks the draw's inputs and outputs");
   }
 }
 

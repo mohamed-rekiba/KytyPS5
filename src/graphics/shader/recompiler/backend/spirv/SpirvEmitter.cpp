@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <string>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -41,7 +42,10 @@ void ValidateHostFeatures(const IR::Program&                program,
 	    requirements.subgroup_local_invocation_id) {
 		// VkShaderStageFlagBits value of the stage the SPIR-V runs in.
 		uint32_t stage_bit = 0;
-		switch (Emitter::ExecutionModelForStage(program.stage)) {
+		const auto model     = program.stage == ShaderType::Mesh && input_info.vertex->mesh.emulated
+		                           ? spv::ExecutionModelGLCompute
+		                           : Emitter::ExecutionModelForStage(program.stage);
+		switch (model) {
 			case spv::ExecutionModelVertex: stage_bit = 0x1u; break;
 			case spv::ExecutionModelTessellationControl: stage_bit = 0x2u; break;
 			case spv::ExecutionModelTessellationEvaluation: stage_bit = 0x4u; break;
@@ -51,8 +55,14 @@ void ValidateHostFeatures(const IR::Program&                program,
 			default: break;
 		}
 		if ((host_features.subgroup_supported_stages & stage_bit) != stage_bit) {
-			Fail(program, "shader uses subgroup operations (lane id, ballot, shuffle) in a stage "
-			              "the host GPU does not support them in (subgroupSupportedStages)");
+			const auto reason =
+			    std::string(
+			        "shader uses subgroup operations (lane id, ballot, shuffle) in a stage "
+			        "the host GPU does not support them in (subgroupSupportedStages); first "
+			        "needed by ") +
+			    std::string(requirements.subgroup_reason.empty() ? std::string_view("?")
+			                                                     : requirements.subgroup_reason);
+			Fail(program, reason.c_str());
 		}
 	}
 	if (!host_features.cull_distance &&
@@ -249,6 +259,22 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	SpirvRequirements requirements {};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
+			// Remember the first instruction that makes the shader need a subgroup operation.
+			struct SubgroupNote {
+				SpirvRequirements& requirements;
+				IR::ValueOpcode    opcode;
+				bool               before;
+				~SubgroupNote() {
+					const bool now = requirements.subgroup_ballot ||
+					                 requirements.subgroup_shuffle ||
+					                 requirements.subgroup_local_invocation_id;
+					if (!before && now && requirements.subgroup_reason.empty()) {
+						requirements.subgroup_reason = IR::ValueOpcodeName(opcode);
+					}
+				}
+			} subgroup_note {requirements, inst.GetOpcode(),
+			                 requirements.subgroup_ballot || requirements.subgroup_shuffle ||
+			                     requirements.subgroup_local_invocation_id};
 			requirements.float64 |= inst.GetType() == IR::Type::F64;
 			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
 			    inst.GetType() == IR::Type::U64) {
@@ -412,8 +438,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 	        : 1u;
 	DefineModule(state);
 	EmitProgram(state);
-	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
-	                            "main", state.interface_variables);
+	state.builder.AddEntryPoint(MeshEmulated(state) ? spv::ExecutionModelGLCompute
+	                                                : ExecutionModelForStage(state.program.stage),
+	                            state.main_func, "main", state.interface_variables);
 
 	return state.builder.Build();
 }

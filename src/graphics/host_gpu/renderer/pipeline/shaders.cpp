@@ -228,7 +228,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                        rendering.stencil_format != vk::Format::eUndefined;
 	EXIT_IF(!vs_input_info.stage);
 	const bool mesh = vs_input_info.stage.program->stage == ShaderType::Mesh;
-	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
+	// Without mesh shaders a compute shader writes the records and a generated vertex shader draws
+	// them (see meshEmulation.h).
+	const bool mesh_emulated = mesh && vs_input_info.stage.program->mesh_emulated;
+	EXIT_NOT_IMPLEMENTED(mesh && !mesh_emulated && !graphics.mesh_shader_enabled);
+	EXIT_IF(mesh_emulated && vertex_program.mesh_vertex_module == nullptr);
 	const bool rect_list =
 	    !mesh && !tessellation && static_params.topology == vk::PrimitiveTopology::ePatchList;
 
@@ -257,10 +261,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
-		shader_stages[shader_stage_count++] = {.stage =
-		                                           NativeShaderStage(vertex_info[i].logical_stage),
-		                                       .module = programs.vertex[i].module,
-		                                       .pName  = "main"};
+		shader_stages[shader_stage_count++] =
+		    mesh_emulated
+		        ? vk::PipelineShaderStageCreateInfo {.stage = vk::ShaderStageFlagBits::eVertex,
+		                                             .module =
+		                                                 programs.vertex[i].mesh_vertex_module,
+		                                             .pName = "main"}
+		        : vk::PipelineShaderStageCreateInfo {
+		              .stage  = NativeShaderStage(vertex_info[i].logical_stage),
+		              .module = programs.vertex[i].module,
+		              .pName  = "main"};
 	}
 	if (rect_list) {
 		shader_stages[shader_stage_count++] = {.stage =
@@ -341,9 +351,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vertex_input_info.pVertexAttributeDescriptions    = input_attr;
 
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
-	input_assembly.topology = static_params.topology;
+	// An emulated mesh draw is a triangle list without vertex input.
+	input_assembly.topology =
+	    mesh_emulated ? vk::PrimitiveTopology::eTriangleList : static_params.topology;
 	input_assembly.primitiveRestartEnable =
-	    static_params.primitive_restart_enable ? VK_TRUE : VK_FALSE;
+	    !mesh_emulated && static_params.primitive_restart_enable ? VK_TRUE : VK_FALSE;
 
 	vk::PipelineViewportDepthClipControlCreateInfoEXT depth_clip_control {};
 	depth_clip_control.negativeOneToOne = (static_params.negative_one_to_one ? VK_TRUE : VK_FALSE);
@@ -440,7 +452,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
 	for (const auto& stage: vertex_info) {
-		const auto native_stage = NativeShaderStage(stage.logical_stage);
+		const auto native_stage = NativeShaderStage(*stage.stage.program);
 		AddLayoutBindings(descriptor_bindings, *stage.stage.program, native_stage);
 		graphics_stages |= native_stage;
 	}
@@ -450,14 +462,19 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                  vk::ShaderStageFlagBits::eFragment);
 	}
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	const vk::PushConstantRange push_constants {graphics_stages, 0,
-	                                            ShaderRecompiler::IR::NativePushConstantSize};
+	// An emulated mesh program is bound to the compute pipeline, so the graphics layout pushes to
+	// the pixel shader only, plus the vertex shader's record address.
+	vk::PushConstantRange push_constants[2] {
+	    {mesh_emulated ? vk::ShaderStageFlagBits::eFragment : graphics_stages, 0,
+	     ShaderRecompiler::IR::NativePushConstantSize},
+	    {vk::ShaderStageFlagBits::eVertex, 0,
+	     ShaderRecompiler::IR::PushData::MeshEmulatedDrawDwordCount * sizeof(uint32_t)}};
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
 	pipeline_layout_info.setLayoutCount         = 1;
 	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
-	pipeline_layout_info.pushConstantRangeCount = 1;
-	pipeline_layout_info.pPushConstantRanges    = &push_constants;
+	pipeline_layout_info.pushConstantRangeCount = mesh_emulated ? 2u : 1u;
+	pipeline_layout_info.pPushConstantRanges    = push_constants;
 
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
@@ -523,8 +540,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pNext                    = &rendering_info;
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;
-	pipeline_info.pVertexInputState        = mesh ? nullptr : &vertex_input_info;
-	pipeline_info.pInputAssemblyState      = mesh ? nullptr : &input_assembly;
+	const vk::PipelineVertexInputStateCreateInfo no_vertex_input {};
+	pipeline_info.pVertexInputState =
+	    mesh_emulated ? &no_vertex_input : (mesh ? nullptr : &vertex_input_info);
+	pipeline_info.pInputAssemblyState = mesh && !mesh_emulated ? nullptr : &input_assembly;
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
 	tessellation_state.patchControlPoints =
 	    tessellation ? vs_input_info.tess.input_control_points : 3u;
@@ -558,6 +577,31 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+
+	if (mesh_emulated) {
+		// The compute pipeline that writes the records. Its layout shares the descriptor set layout
+		// with the graphics pipeline's.
+		const vk::PushConstantRange  compute_push {vk::ShaderStageFlagBits::eCompute, 0,
+		                                           ShaderRecompiler::IR::NativePushConstantSize};
+		vk::PipelineLayoutCreateInfo compute_layout_info {};
+		compute_layout_info.setLayoutCount         = 1;
+		compute_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
+		compute_layout_info.pushConstantRangeCount = 1;
+		compute_layout_info.pPushConstantRanges    = &compute_push;
+		EXIT_NOT_IMPLEMENTED(graphics.device.createPipelineLayout(&compute_layout_info, nullptr,
+		                                                          &pipeline.mesh_compute_layout) !=
+		                     vk::Result::eSuccess);
+		vk::ComputePipelineCreateInfo compute_info {};
+		compute_info.stage             = {.stage  = vk::ShaderStageFlagBits::eCompute,
+		                                  .module = vertex_program.module,
+		                                  .pName  = "main"};
+		compute_info.layout            = pipeline.mesh_compute_layout;
+		compute_info.basePipelineIndex = -1;
+		EXIT_NOT_IMPLEMENTED(
+		    graphics.device.createComputePipelines(driver_cache, 1, &compute_info, nullptr,
+		                                           &pipeline.mesh_compute) != vk::Result::eSuccess);
+		pipeline.mesh_slot_words = vertex_program.mesh_slot_words;
+	}
 
 	if (tess_control_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);

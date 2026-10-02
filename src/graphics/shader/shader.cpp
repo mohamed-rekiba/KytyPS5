@@ -616,11 +616,12 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.mesh.threads_num[0]);
 	if (info.mesh.threads_num[0] != 0) {
 		const auto& mesh = info.mesh;
-		key.insert(key.end(), {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
-		                       mesh.scratch_size_dwords, mesh.input_primitive,
-		                       mesh.primitives_per_group, mesh.vertices_per_group,
-		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       static_cast<uint32_t>(mesh.fast_launch)});
+		key.insert(key.end(),
+		           {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
+		            mesh.scratch_size_dwords, mesh.input_primitive, mesh.primitives_per_group,
+		            mesh.vertices_per_group, mesh.max_vertices, mesh.max_primitives,
+		            mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch),
+		            static_cast<uint32_t>(mesh.emulated)});
 	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {

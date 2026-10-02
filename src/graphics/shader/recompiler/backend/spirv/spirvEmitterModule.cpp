@@ -432,15 +432,18 @@ void DefineInputs(EmitterState& state) {
 	    })) {
 		state.inputs.push_back({{IR::StageInputKind::FragCoord, 0, 4, "gl_FragCoord"}});
 	}
+	const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components, const char* name) {
+		if (std::ranges::none_of(
+		        state.inputs, [kind](const InputBinding& input) { return input.kind == kind; })) {
+			state.inputs.push_back({{kind, 0, components, name}});
+		}
+	};
+	if (MeshEmulated(state)) {
+		// The compute entry point picks its record by workgroup and invocation.
+		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
+		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
+	}
 	if (state.lane_count == 2) {
-		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
-		                             const char* name) {
-			if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
-				    return input.kind == kind;
-			    })) {
-				state.inputs.push_back({{kind, 0, components, name}});
-			}
-		};
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
 			    return input.kind == IR::StageInputKind::GlobalInvocationId;
@@ -661,14 +664,15 @@ void DefineModule(EmitterState& state) {
 	state.main_func = state.builder.AllocateId();
 	if (state.program.stage == ShaderType::Mesh) {
 		state.mesh_guest_func = state.builder.AllocateId();
-		state.builder.RequireCapability(spv::CapabilityMeshShadingEXT); // MeshShadingEXT
-		state.builder.RequireExtension("SPV_EXT_mesh_shader");
-		state.builder.AddExecutionMode(state.main_func,
-		                               spv::ExecutionModeOutputTrianglesEXT); // OutputTrianglesEXT
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
-		                               state.input_info.vertex->mesh.max_vertices);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
-		                               state.input_info.vertex->mesh.max_primitives);
+		if (!MeshEmulated(state)) {
+			state.builder.RequireCapability(spv::CapabilityMeshShadingEXT); // MeshShadingEXT
+			state.builder.RequireExtension("SPV_EXT_mesh_shader");
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputTrianglesEXT);
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
+			                               state.input_info.vertex->mesh.max_vertices);
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
+			                               state.input_info.vertex->mesh.max_primitives);
+		}
 	}
 	if (state.program.stage == ShaderType::TessellationControl ||
 	    state.program.stage == ShaderType::TessellationEvaluation) {
@@ -678,7 +682,7 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(spv::CapabilityShader);
 	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
-	if (state.program.info.uses_dma || UsesDepthBounds(state)) {
+	if (state.program.info.uses_dma || UsesDepthBounds(state) || MeshEmulated(state)) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -737,7 +741,8 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma || UsesDepthBounds(state)
+	state.builder.AddMemoryModel(state.program.info.uses_dma || UsesDepthBounds(state) ||
+	                                     MeshEmulated(state)
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);

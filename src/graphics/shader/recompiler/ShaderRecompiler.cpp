@@ -607,6 +607,19 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
+	// One guest lane per host invocation, and no subgroup operations on the host in this stage.
+	const auto single_lane_stage_bit =
+	    options.stage == ShaderType::Vertex || options.stage == ShaderType::Local ? 0x1u
+	    : options.stage == ShaderType::TessellationEvaluation                     ? 0x4u
+	                                                                              : 0u;
+	if (single_lane_stage_bit != 0u &&
+	    (options.host_features.subgroup_supported_stages & single_lane_stage_bit) == 0u &&
+	    IR::LowerLaneOpsToSingleLane(ir) != 0u) {
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	LowerTessellationMemory(ir, options);
 	std::string cfg_dump;
 	if (options.dump_ir) {
@@ -686,7 +699,13 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
 	CompileResult result;
-	result.spirv   = std::move(spirv);
+	result.spirv = std::move(spirv);
+	if (ir.stage == ShaderType::Mesh && options.input_info.vertex->mesh.emulated) {
+		auto vertex              = Spirv::EmitMeshEmulationVertexProgram(ir, options.input_info);
+		result.mesh_vertex_spirv = std::move(vertex.spirv);
+		result.mesh_slot_words   = vertex.slot_words;
+		ir.mesh_emulated         = true;
+	}
 	result.program = std::move(ir);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(translated.decoded_dump);

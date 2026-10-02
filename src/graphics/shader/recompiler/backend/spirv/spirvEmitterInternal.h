@@ -19,6 +19,7 @@
 #include <map>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -72,13 +73,17 @@ struct SpirvRequirements {
 	bool coherent_buffers             = false;
 	bool float64                      = false;
 	bool centroid_barycentric         = false;
+	// The first instruction that needs a subgroup operation, for messages.
+	std::string_view subgroup_reason;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
-	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
+	    : builder(program_.stage == ShaderType::Mesh && !input_info_.vertex->mesh.emulated
+	                  ? 0x00010400u
+	                  : 0x00010300u),
 	      program(program_), input_info(input_info_),
 	      requirements(AnalyzeProgramRequirements(program_)) {}
 
@@ -349,6 +354,7 @@ void     DefineTessellationInterfaces(EmitterState& state);
 void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state);
 void     EmitMeshEntryPoint(EmitterState& state);
+void     EmitMeshComputeEntryPoint(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
@@ -369,6 +375,7 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind);
 bool     UsesDepthBounds(const EmitterState& state);
+bool     MeshEmulated(const EmitterState& state);
 
 const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t location);
 

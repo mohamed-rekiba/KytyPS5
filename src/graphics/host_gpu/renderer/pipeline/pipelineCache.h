@@ -99,6 +99,9 @@ struct PipelineVertexInputState {
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
+	// An emulated mesh program: `module` is its compute shader, and this draws what it wrote.
+	vk::ShaderModule mesh_vertex_module = nullptr;
+	uint32_t         mesh_slot_words    = 0;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
@@ -116,6 +119,11 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// An emulated mesh draw first runs this compute pipeline, with its own layout over the same
+		// descriptor set layout, and `pipeline` then draws what it wrote.
+		vk::Pipeline       mesh_compute        = nullptr;
+		vk::PipelineLayout mesh_compute_layout = nullptr;
+		uint32_t           mesh_slot_words     = 0;
 	};
 
 	struct GraphicsPrograms {

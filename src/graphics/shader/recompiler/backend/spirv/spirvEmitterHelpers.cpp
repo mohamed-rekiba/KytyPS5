@@ -134,6 +134,10 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
 }
 
+bool MeshEmulated(const EmitterState& state) {
+	return state.program.stage == ShaderType::Mesh && state.input_info.vertex->mesh.emulated;
+}
+
 bool UsesDepthBounds(const EmitterState& state) {
 	return state.program.stage == ShaderType::Pixel &&
 	       state.input_info.pixel->ps_depth_bounds_format != 0;

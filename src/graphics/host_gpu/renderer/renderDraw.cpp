@@ -1022,8 +1022,9 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 }
 
 // The host has no depth bounds test. The pixel shader applies it to a copy of the depth buffer
-// that this makes before the draw. The copy is exact when the draw leaves the depth buffer alone:
-// a draw that writes or clears depth would test against values that change during the draw.
+// that this makes before the draw. The copy is exact when the draw does not change the depth it
+// tests against, so a draw that writes depth stops here. A draw that starts with a depth clear
+// tests against the clear value everywhere, so the buffer is filled with it instead of copied.
 void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderState& state,
                                               vk::PipelineLayout layout) {
 	auto&       depth = state.depth_info;
@@ -1032,8 +1033,11 @@ void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderS
 	if (!state.ps_active || ps.ps_depth_bounds_format == 0) {
 		EXIT("depth bounds test on a draw without a pixel shader\n");
 	}
-	if (depth.depth_write_enable || depth.depth_load_clear_enable) {
-		EXIT("depth bounds test on a draw that also writes or clears depth\n");
+	if (depth.depth_write_enable) {
+		EXIT("depth bounds test on a draw that also writes depth: test=%d compare=%d "
+		     "bounds=%f..%f\n",
+		     depth.depth_test_enable, static_cast<int>(depth.depth_compare_op),
+		     depth.depth_min_bounds, depth.depth_max_bounds);
 	}
 	auto&       image = cache.GetImage(depth.image_id);
 	const auto& view  = depth.desc.view_info;
@@ -1061,19 +1065,29 @@ void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderS
 	const auto address = snapshot->BufferDeviceAddress();
 
 	scheduler.EndRendering();
-	auto                        vk_buffer = buffer.Handle();
-	const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
-	                                   view.layer_count};
-	const auto                  attachment_layout = image.binding.attachment_layout;
-	const auto                  attachment_access = image.binding.attachment_access;
-	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range,
-	              vk_buffer);
-	vk::BufferImageCopy copy {};
-	copy.imageSubresource = {vk::ImageAspectFlagBits::eDepth, view.base_level, view.base_layer, 1};
-	copy.imageExtent      = {extent.width, extent.height, 1};
-	vk_buffer.copyImageToBuffer(image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
-	                            snapshot->Handle(), 1, &copy);
-	image.Transit(attachment_layout, attachment_access, range, vk_buffer);
+	auto vk_buffer = buffer.Handle();
+	if (depth.depth_load_clear_enable) {
+		// The pass clears the depth buffer first: every pixel holds the clear value.
+		const auto clear = depth.depth_clear_value;
+		const auto half =
+		    static_cast<uint32_t>(std::lround(std::clamp(clear, 0.0f, 1.0f) * 65535.0f));
+		const auto word = f32 ? std::bit_cast<uint32_t>(clear) : (half | (half << 16u));
+		vk_buffer.fillBuffer(snapshot->Handle(), 0, bytes, word);
+	} else {
+		const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
+		                                   view.layer_count};
+		const auto                  attachment_layout = image.binding.attachment_layout;
+		const auto                  attachment_access = image.binding.attachment_access;
+		image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+		              range, vk_buffer);
+		vk::BufferImageCopy copy {};
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eDepth, view.base_level, view.base_layer,
+		                         1};
+		copy.imageExtent      = {extent.width, extent.height, 1};
+		vk_buffer.copyImageToBuffer(image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                            snapshot->Handle(), 1, &copy);
+		image.Transit(attachment_layout, attachment_access, range, vk_buffer);
+	}
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
 	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
@@ -1102,8 +1116,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
-	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
-	uint32_t   mesh_groups = 0;
+	const bool mesh_active   = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	const bool mesh_emulated = mesh_active && state.vertex_info[0].mesh.emulated;
+	uint32_t   mesh_groups   = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
@@ -1122,11 +1137,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			return;
 		}
 		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
+		bool within_limits = false;
+		if (mesh_emulated) {
+			const auto& limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+			within_limits      = mesh_groups <= limits.maxComputeWorkGroupCount[0] &&
+			                     draw.instance_count <= limits.maxComputeWorkGroupCount[1];
+		} else {
+			const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+			within_limits      = mesh_groups <= limits.maxMeshWorkGroupCount[0] &&
+			                     draw.instance_count <= limits.maxMeshWorkGroupCount[1] &&
+			                     static_cast<uint64_t>(mesh_groups) * draw.instance_count <=
+			                         limits.maxMeshWorkGroupTotalCount;
+		}
+		if (!within_limits) {
 			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
 			     draw.instance_count);
 		}
@@ -1178,14 +1201,80 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory.
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
+	std::array<uint32_t, ShaderRecompiler::IR::PushData::MeshEmulatedDrawDwordCount>
+	    mesh_draw_data {};
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
-	if (mesh_active) {
+	// An emulated mesh draw: a compute pass writes one record per workgroup (meshEmulation.h), then
+	// the vertex shader draws the records.
+	uint32_t mesh_vertex_count = 0;
+	if (mesh_emulated) {
+		const auto& mesh = state.vertex_info[0].mesh;
+		EXIT_IF(pipeline.mesh_compute == nullptr || mesh.max_primitives == 0);
+		const uint64_t slots = static_cast<uint64_t>(mesh_groups) * draw.instance_count;
+		const uint64_t bytes = slots * pipeline.mesh_slot_words * sizeof(uint32_t);
+		if (bytes == 0 || bytes > (1ull << 31) ||
+		    slots * mesh.max_primitives * 3u > std::numeric_limits<uint32_t>::max()) {
+			EXIT("emulated mesh draw is too large: %llu groups, %llu bytes\n",
+			     static_cast<unsigned long long>(slots), static_cast<unsigned long long>(bytes));
+		}
+		mesh_vertex_count = static_cast<uint32_t>(slots * mesh.max_primitives * 3u);
+		auto& scheduler   = m_context.GetCommandScheduler();
+		auto  records     = std::make_unique<Buffer>(
+		    m_context.GetGraphics(), scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		    bytes);
+		const auto address = records->BufferDeviceAddress();
+		mesh_draw_data     = {draw.index_count,
+		                      draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
+		                                       : emit.first_vertex,
+		                      emit.first_instance,
+		                      index_source.guest_element_size,
+		                      static_cast<uint32_t>(index_source.address),
+		                      static_cast<uint32_t>(index_source.address >> 32u),
+		                      static_cast<uint32_t>(address),
+		                      static_cast<uint32_t>(address >> 32u),
+		                      mesh_groups};
+		scheduler.EndRendering();
+		const PipelineCache::Pipeline compute_view {
+		    .pipeline_layout       = pipeline.mesh_compute_layout,
+		    .pipeline              = pipeline.mesh_compute,
+		    .descriptor_set_layout = pipeline.descriptor_set_layout,
+		    .uses_push_descriptors = pipeline.uses_push_descriptors};
+		PreparedBindings* mesh_stage = &bindings.vertex[0];
+		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, compute_view,
+		               std::span {&mesh_stage, 1u});
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.mesh_compute);
+		vk_buffer.pushConstants(pipeline.mesh_compute_layout, vk::ShaderStageFlagBits::eCompute, 0,
+		                        sizeof(mesh_draw_data), mesh_draw_data.data());
+		vk_buffer.dispatch(mesh_groups, draw.instance_count, 1);
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eVertexShader;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		vk_buffer.pipelineBarrier2(dependency);
+		scheduler.DeferOperation([owner = std::move(records)]() mutable { owner.reset(); });
+		// Only the pixel shader's bindings go with the graphics pipeline.
+		const auto graphics_stages = state.ps_active
+		                                 ? std::span {&descriptor_stages[stage_count - 1], 1u}
+		                                 : std::span<PreparedBindings* const> {};
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, graphics_stages);
+		vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0,
+		                        sizeof(mesh_draw_data), mesh_draw_data.data());
+	} else {
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	}
+	if (mesh_emulated) {
+		// Everything the draw needs is bound.
+	} else if (mesh_active) {
 		const uint32_t draw_data[] {
 		    draw.index_count,
 		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
@@ -1220,7 +1309,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_active) {
+	if (mesh_emulated) {
+		vk_buffer.draw(mesh_vertex_count, 1, 0, 0);
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
@@ -1232,7 +1323,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
 		if (HasShaderBufferWrites(stage.stage)) {
-			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
+			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(*stage.stage.program));
 		}
 	}
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {

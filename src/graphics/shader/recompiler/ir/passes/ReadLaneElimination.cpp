@@ -138,4 +138,36 @@ ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 	return stats;
 }
 
+uint32_t LowerLaneOpsToSingleLane(Program& program) {
+	uint32_t replaced = 0;
+	for (auto* block: program.blocks) {
+		for (auto it = block->begin(); it != block->end(); ++it) {
+			auto& inst = *it;
+			switch (inst.GetOpcode()) {
+				case ValueOpcode::ReadFirstLane:
+				case ValueOpcode::ReadLane:
+					inst.ReplaceUsesWith(inst.Arg(0));
+					replaced++;
+					break;
+				case ValueOpcode::LaneId:
+					inst.ReplaceUsesWith(Value(0u));
+					replaced++;
+					break;
+				case ValueOpcode::Ballot: {
+					const auto all = block->PrependNewInst(
+					    it, ValueOpcode::SelectU32, {inst.Arg(0), Value(0xffffffffu), Value(0u)});
+					const auto word = Value(&*all);
+					const auto mask = block->PrependNewInst(
+					    it, ValueOpcode::CompositeConstructU32x4, {word, word, word, word});
+					inst.ReplaceUsesWith(Value(&*mask));
+					replaced++;
+					break;
+				}
+				default: break;
+			}
+		}
+	}
+	return replaced;
+}
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
