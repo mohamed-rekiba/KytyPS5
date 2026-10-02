@@ -613,6 +613,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 	    .cull_distance               = device_features.shaderCullDistance == VK_TRUE,
 	    .fragment_shader_barycentric = capabilities.fragment_shader_barycentric,
 	    .float64                     = device_features.shaderFloat64 == VK_TRUE,
+	    .subgroup_supported_stages   = static_cast<uint32_t>(properties11.subgroupSupportedStages),
 	};
 
 	return device;

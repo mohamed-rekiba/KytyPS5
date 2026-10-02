@@ -9885,6 +9885,28 @@ void TestHostFeaturesGateUnavailableCapabilities() {
 #endif
   }
 
+  // Subgroup operations are only allowed in the stages the device lists.
+  {
+    constexpr uint32_t kVertexStageBit = 0x1u;
+    const std::array shader = {
+        EncodeVop1(0x02, 24, 5 + 256), // V_READFIRSTLANE_B32 s24, v5
+        EncodeVop1(0x01, 0, 24),       // V_MOV_B32 v0, s24
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    (void)RecompileForTest(shader, options);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    options.host_features.subgroup_supported_stages = ~kVertexStageBit;
+    ExpectFatal([&] { (void)RecompileForTest(shader, options); },
+                "a vertex shader with a lane operation compiled without host support");
+#endif
+    // The same shader is fine in a stage the device lists (fragment 0x10 | compute 0x20).
+    auto compute = MakeCompileOptions(ShaderType::Compute);
+    compute.host_features.subgroup_supported_stages = 0x32u;
+    (void)RecompileForTest(shader, compute);
+  }
+
   // Fragment barycentrics.
   {
     ShaderPixelInputInfo custom_ps_info{};
@@ -9927,6 +9949,33 @@ void TestHostFeaturesGateUnavailableCapabilities() {
     Check(!SpirvContainsCapability(flat.spirv, kCapabilityFragmentBarycentric),
           "a flat input required fragment barycentric support");
   }
+}
+
+// Captured from Contra: Operation Galuga (hash c22d9ddc825b8c3b): a full-screen triangle vertex
+// shader. Its prologue sets EXEC from the wave's thread count. A graphics stage runs one guest
+// lane per host invocation, so EXEC is all ones and each invocation's bit of it is always set.
+// That needs no lane id, which a Metal vertex function cannot read.
+void TestVertexAllOnesExecMaskNeedsNoSubgroup() {
+  constexpr uint32_t kCapabilityGroupNonUniform = 61u;
+  constexpr uint32_t kFragmentAndComputeStages = 0x30u;
+  const std::array<uint32_t, 28> shader = {
+      0xbfa00001u, 0x93eaff03u, 0x00080008u, 0x876bff03u, 0x000000ffu, 0x8f6a8c6au,
+      0x887c6a6bu, 0xbf900009u, 0x906a8803u, 0x81ea6a80u, 0x90fe6ac1u, 0xf8000941u,
+      0x00000000u, 0x81ea0380u, 0xbf8cff0fu, 0x90fe6ac1u, 0x34040a81u, 0x36060ac2u,
+      0x7e000280u, 0x7e0202f2u, 0x36040482u, 0x4a0606c1u, 0x4a0404c1u, 0x7e060b03u,
+      0x7e040b02u, 0xf80008cfu, 0x01000302u, 0xbf810000u,
+  };
+  ShaderVertexInputInfo input{};
+  input.wave_size = 64u;
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.user_data_base = 8;
+  options.input_info.vertex = &input;
+  options.wave_size = 64u;
+  options.host_features.subgroup_supported_stages = kFragmentAndComputeStages;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(!SpirvContainsCapability(result.spirv, kCapabilityGroupNonUniform),
+        "an all-ones EXEC mask in a vertex shader still needed subgroup operations");
 }
 
 void TestNewShaderRecompilerBranchConditionForms() {
@@ -14520,6 +14569,7 @@ int main() {
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestHostFeaturesGateUnavailableCapabilities();
+  TestVertexAllOnesExecMaskNeedsNoSubgroup();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();

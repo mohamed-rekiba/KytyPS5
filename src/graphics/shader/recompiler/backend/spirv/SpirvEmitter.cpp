@@ -36,6 +36,24 @@ void ValidateHostFeatures(const IR::Program&                program,
 		Fail(program, "shader needs 64-bit floating point (shaderFloat64), which the host GPU "
 		              "does not enable");
 	}
+	if (requirements.subgroup_ballot || requirements.subgroup_shuffle ||
+	    requirements.subgroup_local_invocation_id) {
+		// VkShaderStageFlagBits value of the stage the SPIR-V runs in.
+		uint32_t stage_bit = 0;
+		switch (Emitter::ExecutionModelForStage(program.stage)) {
+			case spv::ExecutionModelVertex: stage_bit = 0x1u; break;
+			case spv::ExecutionModelTessellationControl: stage_bit = 0x2u; break;
+			case spv::ExecutionModelTessellationEvaluation: stage_bit = 0x4u; break;
+			case spv::ExecutionModelFragment: stage_bit = 0x10u; break;
+			case spv::ExecutionModelGLCompute: stage_bit = 0x20u; break;
+			case spv::ExecutionModelMeshEXT: stage_bit = 0x80u; break;
+			default: break;
+		}
+		if ((host_features.subgroup_supported_stages & stage_bit) != stage_bit) {
+			Fail(program, "shader uses subgroup operations (lane id, ballot, shuffle) in a stage "
+			              "the host GPU does not support them in (subgroupSupportedStages)");
+		}
+	}
 	if (!host_features.cull_distance &&
 	    std::ranges::any_of(program.info.outputs, [](const IR::StageOutput& output) {
 		    return output.kind == IR::StageOutputKind::CullDistance;

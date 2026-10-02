@@ -663,12 +663,13 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 
 // In wave32, extracting this invocation's bit from a ballot recovers its predicate.
 // Keep that identity through scalar EXEC operations and their loop-carried mask Phis.
+// The bit of a constant mask is known in any wave size.
 class LaneMaskProjection {
 public:
 	explicit LaneMaskProjection(std::unordered_set<Inst*>& lowered_ancillary)
 	    : m_lowered_ancillary(lowered_ancillary) {}
 
-	void Fold(Inst& inst) {
+	void Fold(Inst& inst, bool wave32) {
 		if (inst.GetOpcode() != ValueOpcode::INotEqual32 || !Immediate(Arg(inst, 1), 0u)) return;
 		const auto* bit = Arg(inst, 0).TryInstruction();
 		if (bit == nullptr || bit->GetOpcode() != ValueOpcode::BitwiseAnd32 ||
@@ -680,6 +681,13 @@ public:
 		    !Immediate(Arg(*index, 1), 31u)) return;
 		const auto* lane = Arg(*index, 0).TryInstruction();
 		if (lane == nullptr || lane->GetOpcode() != ValueOpcode::LaneId) return;
+		// Every lane sees the same bit of a constant mask, whatever the wave size.
+		const auto mask = Arg(*shift, 0);
+		if (mask.IsImmediate() && (Immediate(mask, 0u) || Immediate(mask, UINT32_MAX))) {
+			Replace(inst, Value(mask.U32() != 0u));
+			return;
+		}
+		if (!wave32) return;
 		m_visited.clear();
 		m_grounded = false;
 		if (CanProject(Arg(*shift, 0)) && m_grounded) Replace(inst, Project(Arg(*shift, 0)));
@@ -764,7 +772,7 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	LaneMaskProjection mask_projection(lowered_ancillary);
 	for (auto* block: blocks) {
 		for (auto inst = block->begin(); inst != block->end(); ++inst) {
-			if (wave_size == 32u) mask_projection.Fold(*inst);
+			mask_projection.Fold(*inst, wave_size == 32u);
 			FoldInstruction(*block, inst, lowered_ancillary);
 		}
 	}
