@@ -9780,6 +9780,115 @@ void TestCapturedBufferAtomicsX2() {
   }
 }
 
+// The renderer tells the recompiler which optional device capabilities are enabled. A shader
+// that needs one that is off must stop with a message that names it; a shader that does not need
+// it must still compile.
+void TestHostFeaturesGateUnavailableCapabilities() {
+  ShaderHostFeatures none;
+  none.buffer_int64_atomics = false;
+  none.shared_int64_atomics = false;
+  none.cull_distance = false;
+  none.fragment_shader_barycentric = false;
+  none.float64 = false;
+
+  constexpr uint32_t kCapabilityInt64Atomics = 12u;
+  constexpr uint32_t kCapabilityCullDistance = 33u;
+  constexpr uint32_t kCapabilityFragmentBarycentric = 5284u;
+
+  // A shader that needs no optional capability compiles with every one off.
+  {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.host_features = none;
+    const std::array shader = {EncodeSopp(0x01)};
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(!SpirvContainsCapability(result.spirv, kCapabilityInt64Atomics),
+          "a shader without 64-bit atomics gained Int64Atomics");
+  }
+
+  // Cull distance. The default (every capability on) is covered by the aux-export tests.
+  {
+    ShaderVertexInputInfo vertex{};
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.input_info.vertex = &vertex;
+    options.host_features = none;
+
+    const uint32_t clip_only[] = {
+        EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
+        EncodeExp0(0x0d, 0x6), EncodeExp1(4, 5, 6, 7),
+        0xbf810000u,
+    };
+    vertex.pa_cl_vs_out_cntl = 0x00800050u; // clip distances only
+    const auto clip = RecompileForTest(clip_only, options);
+    CheckSpirvBinaryValidates(clip.spirv);
+    Check(!SpirvContainsCapability(clip.spirv, kCapabilityCullDistance),
+          "a clip-only shader emitted the CullDistance capability");
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    vertex.pa_cl_vs_out_cntl = 0x0080a050u; // clip and cull distances
+    ExpectFatal([&] { (void)RecompileForTest(clip_only, options); },
+                "a shader that exports cull distances compiled without host support");
+#endif
+  }
+
+  // 64-bit buffer atomics.
+  {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    const std::array shader = {0xe1680018u, 0x80000000u, EncodeSopp(0x01)}; // BUFFER_ATOMIC_OR_X2
+    const auto with_support = RecompileForTest(shader, options);
+    Check(SpirvContainsCapability(with_support.spirv, kCapabilityInt64Atomics),
+          "the default host features must keep native 64-bit buffer atomics");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    options.host_features = none;
+    ExpectFatal([&] { (void)RecompileForTest(shader, options); },
+                "a 64-bit buffer atomic compiled without host support");
+#endif
+  }
+
+  // Fragment barycentrics.
+  {
+    ShaderPixelInputInfo custom_ps_info{};
+    custom_ps_info.input_num = 1;
+    custom_ps_info.ps_system_input_base = 2;
+    custom_ps_info.custom_interpolation_mask = 1;
+    custom_ps_info.ps_perspective_center_vgpr = 0;
+    SetIdentityInterpolatorSettings(&custom_ps_info);
+    custom_ps_info.interpolator_settings[0] = 0x00000420u;
+    const uint32_t barycentric_shader[] = {
+        EncodeVintrp(2, 12, 0, 3, 2),      EncodeVintrp(2, 13, 0, 3, 0),
+        EncodeVintrp(2, 14, 0, 3, 1),      EncodeVop2(0x03, 15, 12 + 256, 0),
+        EncodeVop2(0x03, 16, 13 + 256, 1), EncodeExp0(0x00, 0xf),
+        EncodeExp1(15, 16, 14, 12),        0xbf810000u,
+    };
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &custom_ps_info;
+    const auto with_support = RecompileForTest(barycentric_shader, options);
+    Check(SpirvContainsCapability(with_support.spirv, kCapabilityFragmentBarycentric),
+          "the default host features must keep fragment barycentrics");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    options.host_features = none;
+    ExpectFatal([&] { (void)RecompileForTest(barycentric_shader, options); },
+                "a barycentric shader compiled without host support");
+#endif
+
+    // A flat input does not need barycentrics.
+    ShaderPixelInputInfo flat_ps_info{};
+    flat_ps_info.input_num = 1;
+    flat_ps_info.interpolator_settings[0] = 0x00000400u;
+    const uint32_t flat_shader[] = {
+        EncodeVintrp(2, 12, 0, 3, 2),
+        EncodeExp0(0x00, 0x1),
+        EncodeExp1(12, 0, 0, 0),
+        0xbf810000u,
+    };
+    options.input_info.pixel = &flat_ps_info;
+    const auto flat = RecompileForTest(flat_shader, options);
+    CheckSpirvBinaryValidates(flat.spirv);
+    Check(!SpirvContainsCapability(flat.spirv, kCapabilityFragmentBarycentric),
+          "a flat input required fragment barycentric support");
+  }
+}
+
 void TestNewShaderRecompilerBranchConditionForms() {
   struct Case {
     uint32_t opcode;
@@ -14370,6 +14479,7 @@ int main() {
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
+  TestHostFeaturesGateUnavailableCapabilities();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();

@@ -16591,6 +16591,7 @@ private:
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     auto device_features12 = WindowContext::RequiredVulkan12Features();
+    device_features12.shaderBufferInt64Atomics = true;
     device_features12.shaderSharedInt64Atomics = true;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;

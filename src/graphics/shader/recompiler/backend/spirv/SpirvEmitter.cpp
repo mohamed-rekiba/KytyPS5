@@ -18,6 +18,44 @@ namespace {
 	std::abort();
 }
 
+// A capability the device does not enable must not reach SPIR-V: the driver would reject the
+// module later with a message that does not say which guest shader needed it.
+void ValidateHostFeatures(const IR::Program&                program,
+                          const Emitter::SpirvRequirements& requirements,
+                          const ShaderHostFeatures&         host_features) {
+	if (!host_features.buffer_int64_atomics && requirements.buffer_int64_atomics) {
+		Fail(program,
+		     "shader needs 64-bit buffer atomics (shaderBufferInt64Atomics), which the host GPU "
+		     "does not enable");
+	}
+	if (!host_features.shared_int64_atomics && requirements.shared_int64_atomics) {
+		Fail(program, "shader needs native 64-bit LDS atomics (shaderSharedInt64Atomics and "
+		              "workgroupMemoryExplicitLayout), which the host GPU does not enable");
+	}
+	if (!host_features.float64 && requirements.float64) {
+		Fail(program, "shader needs 64-bit floating point (shaderFloat64), which the host GPU "
+		              "does not enable");
+	}
+	if (!host_features.cull_distance &&
+	    std::ranges::any_of(program.info.outputs, [](const IR::StageOutput& output) {
+		    return output.kind == IR::StageOutputKind::CullDistance;
+	    })) {
+		Fail(program,
+		     "shader exports cull distances (shaderCullDistance), which the host GPU does not "
+		     "enable");
+	}
+	if (!host_features.fragment_shader_barycentric &&
+	    std::ranges::any_of(program.info.inputs, [](const IR::StageInput& input) {
+		    return input.per_vertex || input.kind == IR::StageInputKind::BaryCoordSmooth ||
+		           input.kind == IR::StageInputKind::BaryCoordSmoothCentroid ||
+		           input.kind == IR::StageInputKind::BaryCoordNoPerspective;
+	    })) {
+		Fail(program,
+		     "shader reads barycentrics or raw vertex attributes (fragmentShaderBarycentric), "
+		     "which the host GPU does not enable");
+	}
+}
+
 void ValidateNativeProgram(const IR::Program& program) {
 	using Kind                                             = IR::DescriptorBindingKind;
 	constexpr auto                               KindCount = static_cast<size_t>(Kind::Count);
@@ -320,8 +358,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	return requirements;
 }
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info) {
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  ShaderHostFeatures host_features) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -337,6 +375,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
+	ValidateHostFeatures(program, state.requirements, host_features);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

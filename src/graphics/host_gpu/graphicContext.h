@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
+#include "graphics/shader/shaderHostFeatures.h"
 
 #include <map>
 #include <mutex>
@@ -32,6 +33,11 @@ struct GraphicContext {
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	// What the device enabled, not only what it supports. Each stays false when the device lacks
+	// the capability; a guest shader or texture that needs it then stops with a message.
+	bool                                      image_view_min_lod_enabled = false;
+	bool                                      depth_bounds_enabled       = false;
+	ShaderHostFeatures                        shader_host_features;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
