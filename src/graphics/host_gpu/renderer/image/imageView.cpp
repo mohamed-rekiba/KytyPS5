@@ -357,6 +357,11 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     image.layers);
 	}
 
+	if (is_storage && !(image.usage & vk::ImageUsageFlagBits::eStorage)) {
+		EXIT("storage access to an image whose format the host GPU cannot use as storage: "
+		     "format=%d\n",
+		     static_cast<int>(image.format));
+	}
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = image.usage;
 	if (!is_storage) {

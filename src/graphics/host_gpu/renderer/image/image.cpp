@@ -88,7 +88,12 @@ namespace {
 		usage |= vk::ImageUsageFlagBits::eColorAttachment;
 	}
 	if (info.samples == 1) {
-		usage |= vk::ImageUsageFlagBits::eStorage;
+		const auto storage = usage | vk::ImageUsageFlagBits::eStorage;
+		if (graphics.GetImageFormatProperties(
+		        info.pixel_format, HostImageType(info.type), vk::ImageTiling::eOptimal, storage,
+		        ImageCreateFlags(graphics, info), nullptr) == vk::Result::eSuccess) {
+			usage = storage;
+		}
 	}
 	return usage;
 }
