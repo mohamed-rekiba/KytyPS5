@@ -9,6 +9,7 @@ namespace {
 constexpr const char* kMinLodExtension          = "VK_EXT_image_view_min_lod";
 constexpr const char* kBarycentricExtension     = "VK_KHR_fragment_shader_barycentric";
 constexpr const char* kWorkgroupLayoutExtension = "VK_KHR_workgroup_memory_explicit_layout";
+constexpr const char* kPushDescriptorExtension  = "VK_KHR_push_descriptor";
 
 bool HasExtension(const std::vector<std::string>& extensions, const std::string& name) {
 	return std::find(extensions.begin(), extensions.end(), name) != extensions.end();
@@ -97,6 +98,8 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	caps.fragment_shader_barycentric =
 	    facts.fragment_shader_barycentric && HasExtension(facts.extensions, kBarycentricExtension);
 	caps.depth_bounds = facts.depth_bounds;
+	caps.push_descriptors =
+	    HasExtension(facts.extensions, kPushDescriptorExtension) && !facts.driver_is_moltenvk;
 
 	const auto note = [&](bool available, const char* line) {
 		if (!available) {
@@ -120,6 +123,10 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	note(caps.depth_bounds,
 	     "depthBounds is unavailable: a draw that enables the depth bounds test stops the "
 	     "emulator");
+	// Not an error: the renderer uses regular descriptor sets instead.
+	note(caps.push_descriptors,
+	     "push descriptors are not used: MoltenVK binds no buffer sizes for them, so the "
+	     "renderer uses regular descriptor sets");
 
 	return decision;
 }

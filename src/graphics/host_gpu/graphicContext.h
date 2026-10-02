@@ -37,6 +37,7 @@ struct GraphicContext {
 	// the capability; a guest shader or texture that needs it then stops with a message.
 	bool                                      image_view_min_lod_enabled = false;
 	bool                                      depth_bounds_enabled       = false;
+	bool                                      push_descriptors_enabled   = false;
 	ShaderHostFeatures                        shader_host_features;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;

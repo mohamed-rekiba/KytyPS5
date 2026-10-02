@@ -13,6 +13,8 @@ namespace Libs::Graphics {
 // extension is listed in `extensions`.
 struct DeviceFacts {
 	std::vector<std::string> extensions;
+	// The driver is MoltenVK (VkPhysicalDeviceVulkan12Properties::driverID).
+	bool driver_is_moltenvk = false;
 
 	// Core 1.0 features.
 	bool depth_clamp                               = false;
@@ -78,6 +80,9 @@ struct DeviceCapabilities {
 	bool shader_shared_int64_atomics = false;
 	bool fragment_shader_barycentric = false;
 	bool depth_bounds                = false;
+	// Descriptors can be pushed with vkCmdPushDescriptorSet. MoltenVK binds no buffer sizes for
+	// them, so a shader that asks for a buffer length reads a null buffer.
+	bool push_descriptors = false;
 };
 
 struct DeviceDecision {

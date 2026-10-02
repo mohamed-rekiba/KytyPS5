@@ -95,6 +95,7 @@ DeviceFacts MoltenVkFacts() {
 	f.depth_clip_enable                = false;
 	f.image_view_min_lod               = false;
 	f.workgroup_memory_explicit_layout = false;
+	f.driver_is_moltenvk               = true;
 	return f;
 }
 
@@ -121,6 +122,10 @@ void TestMoltenVkLikeDeviceIsAccepted() {
 	Check(!decision.capabilities.depth_bounds, "depth bounds must be off");
 	Check(decision.capabilities.fragment_shader_barycentric,
 	      "barycentrics must be on: MoltenVK offers the extension and the feature");
+	Check(!decision.capabilities.push_descriptors,
+	      "push descriptors must be off on MoltenVK: it binds no buffer sizes for them");
+	Check(Contains(decision.unavailable, "push descriptors"),
+	      "turning push descriptors off must be reported");
 	Check(Contains(decision.unavailable, "image view minLod"),
 	      "an unavailable minLod must be reported");
 	Check(Contains(decision.unavailable, "shaderCullDistance"),
@@ -154,6 +159,24 @@ void TestEveryRejectionIsReported() {
 	      "a missing required extension must be listed");
 }
 
+void TestPushDescriptorsNeedTheExtensionAndAWorkingDriver() {
+	auto facts = FullFacts();
+	Check(EvaluateDeviceSuitability(facts, DeviceRequirements {}, kRequiredExtensions)
+	          .capabilities.push_descriptors,
+	      "push descriptors must be on for a driver that handles them");
+	facts.driver_is_moltenvk = true;
+	Check(!EvaluateDeviceSuitability(facts, DeviceRequirements {}, kRequiredExtensions)
+	           .capabilities.push_descriptors,
+	      "push descriptors must be off on MoltenVK");
+	facts.driver_is_moltenvk = false;
+	facts.extensions.erase(std::remove(facts.extensions.begin(), facts.extensions.end(),
+	                                   "VK_KHR_push_descriptor"),
+	                       facts.extensions.end());
+	Check(!EvaluateDeviceSuitability(facts, DeviceRequirements {}, {"VK_KHR_swapchain"})
+	           .capabilities.push_descriptors,
+	      "push descriptors must be off without the extension");
+}
+
 void TestFullDeviceKeepsEveryCapability() {
 	const auto decision =
 	    EvaluateDeviceSuitability(FullFacts(), DeviceRequirements {}, kRequiredExtensions);
@@ -161,7 +184,8 @@ void TestFullDeviceKeepsEveryCapability() {
 	Check(decision.unavailable.empty(), "a full-feature device has nothing unavailable");
 	const auto& c = decision.capabilities;
 	Check(c.image_view_min_lod && c.shader_cull_distance && c.shader_buffer_int64_atomics &&
-	          c.shader_shared_int64_atomics && c.fragment_shader_barycentric && c.depth_bounds,
+	          c.shader_shared_int64_atomics && c.fragment_shader_barycentric && c.depth_bounds &&
+	          c.push_descriptors,
 	      "every optional capability must stay enabled when the device has it");
 }
 
@@ -258,6 +282,7 @@ int main() {
 	TestMoltenVkLikeDeviceIsAccepted();
 	TestMissingRequiredFeatureIsRejectedByName();
 	TestEveryRejectionIsReported();
+	TestPushDescriptorsNeedTheExtensionAndAWorkingDriver();
 	TestFullDeviceKeepsEveryCapability();
 	TestIntelLikeDeviceIsAccepted();
 	TestPascalLikeDeviceIsAccepted();

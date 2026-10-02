@@ -181,8 +181,14 @@ static DeviceFacts QueryDeviceFacts(vk::PhysicalDevice                          
 	features2.pNext = chain;
 	device.getFeatures2(&features2);
 
+	vk::PhysicalDeviceVulkan12Properties properties12 {};
+	vk::PhysicalDeviceProperties2        properties2 {};
+	properties2.pNext = &properties12;
+	device.getProperties2(&properties2);
+
 	const auto& f = features2.features;
 	DeviceFacts facts;
+	facts.driver_is_moltenvk = properties12.driverID == vk::DriverId::eMoltenvk;
 	facts.extensions.reserve(available.size());
 	for (const auto& extension: available) {
 		facts.extensions.emplace_back(extension.extensionName.data());
@@ -607,6 +613,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 	// Record what the device enabled. A shader or texture that needs more stops with a message.
 	graphics.image_view_min_lod_enabled = capabilities.image_view_min_lod;
 	graphics.depth_bounds_enabled       = capabilities.depth_bounds;
+	graphics.push_descriptors_enabled   = capabilities.push_descriptors;
 	graphics.shader_host_features       = {
 	    .buffer_int64_atomics        = features12.shaderBufferInt64Atomics == VK_TRUE,
 	    .shared_int64_atomics        = capabilities.shader_shared_int64_atomics,
