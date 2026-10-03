@@ -80,6 +80,8 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	::printf("  --video-out-resolution <Uhd|Window>  Resolution reported to the game; Window "
+	         "renders at the window size.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
@@ -327,6 +329,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--video-out-resolution") {
+			if (!ParseEnum(value, options.config.video_out_resolution)) {
+				::printf("invalid video-out resolution (expected Uhd or Window): %s\n",
+				         value.c_str());
 				return false;
 			}
 		} else if (arg == "--gpu") {

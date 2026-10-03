@@ -1797,9 +1797,11 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	int32_t attribute3 = 0;
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
 	ctx->mutex.Lock();
-	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
-	status->resolution =
-	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	// Primary output reports 4K unless param.json Video-out Info enables resolution detection, or
+	// the configuration asks for the window's resolution.
+	const bool detect = (attribute3 & 4) != 0 ||
+	                    Config::GetVideoOutResolution() == Config::VideoOutResolution::Window;
+	status->resolution   = (detect && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
 	status->dynamicRange = 1;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

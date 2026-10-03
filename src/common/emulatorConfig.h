@@ -26,6 +26,10 @@ enum class ShaderOptimizationType { None, Size, Performance };
 enum class LogDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
+// What VideoOutGetResolutionStatus reports to the game. Uhd: 4K unless the game's param.json
+// enables resolution detection (the behaviour so far). Window: the window's size, so a game running
+// in a 1920x1080 window renders 1080p.
+enum class VideoOutResolution { Uhd, Window };
 
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
@@ -49,6 +53,7 @@ struct ConfigOptions {
 	std::string            audio_input_device;
 	std::optional<ControllerColor> controller_color;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	VideoOutResolution             video_out_resolution            = VideoOutResolution::Uhd;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   vr_enabled                  = false;
@@ -87,6 +92,7 @@ int32_t  GetUserId();
 const std::string& GetAudioInputDevice();
 const std::optional<ControllerColor>& GetControllerColor();
 PresentMode GetPresentMode();
+VideoOutResolution                    GetVideoOutResolution();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     VrEnabled();
