@@ -125,7 +125,7 @@ void CommandScheduler::Shutdown() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	m_master.WaitRetired(CurrentTick() - 1);
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -212,9 +212,24 @@ void CommandScheduler::PopPendingOperations() {
 	for (;;) {
 		PendingOperation operation;
 		{
-			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			std::unique_lock lock(m_operation_mutex);
+			if (m_pending_operations.empty()) {
+				return;
+			}
+			// Deferred operations destroy resources. MoltenVK keeps every resource in one
+			// residency set attached to the queue, so each submission that was committed while a
+			// resource was alive holds it until the submission completes, whether the commands use
+			// it or not. Destroying it earlier makes Metal report an invalid resource and lose the
+			// device. An operation therefore waits for every submission made so far, not only for
+			// the ones up to its own tick.
+			const auto last_submitted = m_master.CurrentTick() - 1;
+			if (m_pending_operations.size() > MaxPendingOperations) {
+				// The GPU never caught up: wait instead of holding resources without limit.
+				lock.unlock();
+				m_master.WaitRetired(last_submitted);
+				lock.lock();
+			}
+			if (!m_master.IsRetired(std::max(m_pending_operations.front().tick, last_submitted))) {
 				return;
 			}
 			operation = std::move(m_pending_operations.front());
@@ -281,9 +296,10 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
-		m_master.Wait(operation.tick);
+		m_master.WaitRetired(operation.tick);
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
+			RetireCallbackState(std::move(operation.callback));
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
@@ -292,6 +308,18 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		}
 		m_operation_available.notify_all();
 	}
+}
+
+void CommandScheduler::RetireCallbackState(Common::UniqueFunction<void>&& callback) {
+	// A callback may own resources, such as a download buffer. They are destroyed with the
+	// callback, so hand it to the deferred queue, which destroys resources only when no submission
+	// holds them.
+	std::lock_guard lock(m_operation_mutex);
+	if (m_operation_state == OperationState::Open) {
+		m_pending_operations.push(
+		    {[state = std::move(callback)]() mutable { state = {}; }, CurrentTick()});
+	}
+	// During shutdown every submission has retired, so the callback is destroyed in place.
 }
 
 void CommandScheduler::DrainPriorityOperations() {
@@ -376,7 +404,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		result = graphics.queue.submit(1, &submit_info, m_master.AcquireFence(tick));
 	}
 
 	if (result != vk::Result::eSuccess) {

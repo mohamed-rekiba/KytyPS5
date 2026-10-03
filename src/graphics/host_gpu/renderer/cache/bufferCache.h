@@ -10,8 +10,10 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/writeWatchSet.h"
 
 #include <map>
+#include <mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -83,6 +85,15 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Moves into `ranges` the guest ranges that gained bytes the GPU has not seen since the last
+	// call: CPU write faults and new buffers. False when the log overflowed or a full pass was
+	// requested; the caller must then synchronize every buffer.
+	[[nodiscard]] bool TakeCpuWrites(std::vector<GuestRange>& ranges);
+	void               RequestFullSynchronization();
+	// Every CPU or GPU write that touches a watched range gives it a new generation. Writers of
+	// guest memory that do not go through the buffer cache, such as image downloads, notify it
+	// themselves.
+	[[nodiscard]] WriteWatchSet& WriteWatches() noexcept { return m_write_watches; }
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
@@ -121,6 +132,9 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	static constexpr size_t  MaxCpuWriteLog = 4096;
+	// Records a range for TakeCpuWrites.
+	void RecordCpuWrite(uint64_t vaddr, uint64_t size);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 
@@ -135,6 +149,11 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	MemoryTracker                                     m_memory_tracker;
+	WriteWatchSet                                      m_write_watches;
+	// See TakeCpuWrites. Written by the fault thread and the GPU thread.
+	std::mutex                                        m_cpu_write_log_mutex;
+	std::vector<GuestRange>                           m_cpu_write_log;
+	bool                                              m_cpu_writes_need_full_pass = true;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

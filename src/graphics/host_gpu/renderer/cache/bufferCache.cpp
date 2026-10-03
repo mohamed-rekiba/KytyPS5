@@ -233,8 +233,11 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	m_write_watches.NotifyWrite(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	// After the dirty state is published: whoever takes this entry also sees the dirty bytes.
+	RecordCpuWrite(vaddr, size);
 }
 
 void BufferCache::InvalidateWrittenMemory(uint64_t fault_vaddr, bool window_is_mapped) {
@@ -364,6 +367,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
+
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
@@ -381,6 +385,8 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
+	// A new buffer starts with guest bytes the GPU has not seen: it counts as a CPU write.
+	RecordCpuWrite(overlap.begin, overlap.end - overlap.begin);
 	return id;
 }
 
@@ -466,7 +472,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE &&
+	// A read-only range the CPU wrote and the GPU has not: copy it into the stream buffer on the
+	// CPU instead of recording a GPU copy. A GPU copy costs a blit encoder in the Metal command
+	// stream and ends the current render pass. A draw-heavy frame can issue thousands of them,
+	// nearly all under 64 KiB.
+	constexpr uint64_t StreamUploadLimit = 4 * CACHING_PAGESIZE;
+	if (!is_written && size <= StreamUploadLimit &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
@@ -486,6 +497,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		m_write_watches.NotifyWrite(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -594,6 +606,37 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
 
+void BufferCache::RecordCpuWrite(uint64_t vaddr, uint64_t size) {
+	std::scoped_lock lock {m_cpu_write_log_mutex};
+	if (m_cpu_writes_need_full_pass) {
+		return;
+	}
+	if (m_cpu_write_log.size() >= MaxCpuWriteLog) {
+		m_cpu_write_log.clear();
+		m_cpu_writes_need_full_pass = true;
+		return;
+	}
+	m_cpu_write_log.push_back({vaddr, size});
+}
+
+bool BufferCache::TakeCpuWrites(std::vector<GuestRange>& ranges) {
+	ranges.clear();
+	std::scoped_lock lock {m_cpu_write_log_mutex};
+	if (m_cpu_writes_need_full_pass) {
+		m_cpu_writes_need_full_pass = false;
+		m_cpu_write_log.clear();
+		return false;
+	}
+	ranges.swap(m_cpu_write_log);
+	return true;
+}
+
+void BufferCache::RequestFullSynchronization() {
+	std::scoped_lock lock {m_cpu_write_log_mutex};
+	m_cpu_write_log.clear();
+	m_cpu_writes_need_full_pass = true;
+}
+
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
@@ -651,8 +694,7 @@ void BufferCache::RunGarbageCollector() {
 			EXIT("BufferCache: garbage collection retained GPU ownership\n");
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
-		Unregister(id);
-		m_slot_buffers.erase(id);
+		DeleteBuffer(id);
 	}
 }
 

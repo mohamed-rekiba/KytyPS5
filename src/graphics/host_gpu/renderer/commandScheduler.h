@@ -75,6 +75,9 @@ private:
 
 	enum class OperationState { Open, Draining, Closed };
 
+	// Pending operations hold resources; past this many the scheduler waits for the GPU.
+	static constexpr size_t MaxPendingOperations = 4096;
+
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
@@ -83,6 +86,7 @@ private:
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+	void RetireCallbackState(Common::UniqueFunction<void>&& callback);
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;

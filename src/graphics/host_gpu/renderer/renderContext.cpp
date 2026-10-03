@@ -92,6 +92,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_buffer_cache.RequestFullSynchronization();
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -110,6 +111,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_buffer_cache.RequestFullSynchronization();
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -120,16 +122,32 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
-void RenderContext::PrepareBda() {
+void RenderContext::PrepareBda(bool shader_writes_addresses) {
+	if (shader_writes_addresses) {
+		m_texture_cache.DropColorMetadataFills();
+	}
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
 	m_fault_process_pending = true;
+	// Shaders that read through device addresses can read any cached buffer, so every buffer must
+	// hold the CPU's latest bytes. Walking all of them before each dispatch is expensive with
+	// thousands of buffers; the buffer cache logs where the CPU wrote, and only those ranges are
+	// synchronized. A full walk runs when the log overflowed or the mapping changed.
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	if (!m_buffer_cache.TakeCpuWrites(m_bda_cpu_writes)) {
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+		return;
+	}
+	for (const auto& write: m_bda_cpu_writes) {
+		m_mapped_ranges.ForEachInRange(
+		    write.address, write.size, [this](uint64_t start, uint64_t end) {
+			    m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		    });
+	}
 }
 
 void RenderContext::RunGarbageCollector() {
