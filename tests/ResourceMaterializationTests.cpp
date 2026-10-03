@@ -269,6 +269,97 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
         "writable descriptor was evaluated twice or scalar EXEC suppressed its read");
 }
 
+// A repeated walk with the same plan and runtime may reuse its previous result. These cases are
+// the ones such reuse must not get wrong.
+void TestRepeatedWalkSeesChangedMemory() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  uint32_t dword = 1;
+  auto plan = SrtPlan(reinterpret_cast<uint64_t>(&dword));
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {}, snapshot, specialization) &&
+            snapshot.flattened_srt[0] == 1,
+        "first walk read the wrong value");
+  Check(MaterializeResources(plan, {}, snapshot, specialization) &&
+            snapshot.flattened_srt[0] == 1,
+        "an unchanged repeat changed the result");
+  dword = 2;
+  Check(MaterializeResources(plan, {}, snapshot, specialization) &&
+            snapshot.flattened_srt[0] == 2,
+        "a repeated walk missed a change in the memory it read");
+}
+
+void TestRepeatedWalkSeesChangedReaderResultAndUserData() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                     {Value(0x1000u), Value(0u)});
+  auto &offset = block.AppendNewInst(ValueOpcode::GetUserData,
+                                     {Value(static_cast<ScalarReg>(0))});
+  auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+      {Value(&handle), Value(&offset), Value(0u), Value(false)});
+  read.SetFlags(MemoryFlags{.index = 0});
+  DescriptorSource source;
+  source.dwords = {Value(&read), Value(0u), Value(4u), Value(0u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .written = true});
+  auto plan = ExtractResourcePlan(program);
+  // Guest memory as the strict reader sees it: one word at 0x1004 and one at 0x1008.
+  struct Memory { uint32_t at_1004 = 0x8000u; uint32_t at_1008 = 0xa000u; bool readable = true; } memory;
+  std::array<uint32_t, 1> user_data{4u};
+  const SrtRuntime runtime{
+      .user_data = user_data,
+      .userdata = &memory,
+      .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        const auto &memory = *static_cast<Memory *>(data);
+        if (!memory.readable) return false;
+        words[0] = address == 0x1004u ? memory.at_1004 : memory.at_1008;
+        return true;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers[0].dwords[0] == 0x8000u,
+        "first walk read the wrong word");
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers[0].dwords[0] == 0x8000u,
+        "an unchanged repeat changed the result");
+  memory.at_1004 = 0x9000u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers[0].dwords[0] == 0x9000u,
+        "a repeated walk missed a change in the word the reader returns");
+  user_data[0] = 8u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers[0].dwords[0] == 0xa000u,
+        "a repeated walk missed a change in the user data");
+  memory.readable = false;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "a repeated walk missed a read that now fails");
+  memory.readable = true;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers[0].dwords[0] == 0xa000u,
+        "a walk after a failed one returned the wrong word");
+}
+
+void TestRepeatedWalkIntoAnotherSnapshotFillsIt() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  uint32_t dword = 7;
+  auto plan = SrtPlan(reinterpret_cast<uint64_t>(&dword));
+  ResourceSnapshot first;
+  ResourceSnapshot second;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {}, first, specialization) &&
+            MaterializeResources(plan, {}, second, specialization) &&
+            second.flattened_srt.size() == 1 && second.flattened_srt[0] == 7,
+        "a walk into a fresh snapshot did not fill it");
+}
+
 void TestFailedMaterializationRejectsStage() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UserDataBufferPlan();
@@ -313,6 +404,9 @@ int main() {
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();
   TestWrittenDescriptorUsesStrictReaderOnce();
+  TestRepeatedWalkSeesChangedMemory();
+  TestRepeatedWalkSeesChangedReaderResultAndUserData();
+  TestRepeatedWalkIntoAnotherSnapshotFillsIt();
   TestFailedMaterializationRejectsStage();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
   std::puts("ResourceMaterializationTests: all cases passed");
