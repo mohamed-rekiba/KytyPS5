@@ -76,6 +76,14 @@ static void PrintUsage() {
 	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
 	::printf("  --gpu-debug-labels <true|false>      Name GPU objects and label GPU work for "
 	         "captures.\n");
+	::printf("  --gpu-capture <file>                 Record the guest GPU stream into a file.\n");
+	::printf("  --gpu-capture-frame <num>            First frame to record. Default: 0.\n");
+	::printf("  --gpu-capture-frames <num>           Number of frames to record. Default: 1.\n");
+	::printf("  --gpu-capture-trigger <file>         Start recording when this file appears, "
+	         "instead of at a frame number.\n");
+	::printf("  --gpu-replay <file>                  Replay a recorded guest GPU stream; no "
+	         "--game needed.\n");
+	::printf("  --gpu-replay-loops <num>             Times to replay the recording. Default: 1.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
@@ -398,6 +406,34 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu-capture") {
+			options.config.gpu_capture_file = Common::PathFromUtf8(value);
+		} else if (arg == "--gpu-capture-frame") {
+			if (!ParseUint32(value, options.config.gpu_capture_first_frame)) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-capture-trigger") {
+			options.config.gpu_capture_trigger_file = Common::PathFromUtf8(value);
+		} else if (arg == "--gpu-capture-frames") {
+			if (!ParseUint32(value, options.config.gpu_capture_frames) ||
+			    options.config.gpu_capture_frames == 0) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-replay") {
+			const auto path = Common::PathFromUtf8(value);
+			if (!Common::File::IsFileExisting(path)) {
+				::printf("--gpu-replay must point to an existing file: %s\n", value.c_str());
+				return false;
+			}
+			options.config.gpu_replay_file = path;
+		} else if (arg == "--gpu-replay-loops") {
+			if (!ParseUint32(value, options.config.gpu_replay_loops) ||
+			    options.config.gpu_replay_loops == 0) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--printf-direction") {
 			if (!ParseEnum(value, options.config.printf_direction)) {
 				::printf("invalid printf direction: %s\n", value.c_str());
@@ -430,6 +466,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 	if (options.config.gpu_assisted_validation_enabled) {
 		options.config.vulkan_validation_enabled = true;
+	}
+
+	if (!options.config.gpu_replay_file.empty()) {
+		if (!options.app0_dir.empty() || !options.config.gpu_capture_file.empty()) {
+			::printf("--gpu-replay cannot be combined with --game or --gpu-capture\n");
+			return false;
+		}
+		return true;
 	}
 
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());

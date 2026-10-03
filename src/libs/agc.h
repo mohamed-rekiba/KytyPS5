@@ -23,6 +23,10 @@ struct MemoryRange {
 void Initialize();
 void Shutdown();
 
+class RenderContext;
+// The renderer that `Initialize` created.
+[[nodiscard]] RenderContext& GetRenderContext();
+
 struct Lifecycle {
 	static constexpr const char* name       = "Graphics";
 	static constexpr auto        initialize = Libs::Graphics::Initialize;

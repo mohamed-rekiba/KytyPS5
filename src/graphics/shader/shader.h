@@ -317,6 +317,18 @@ struct ShaderMappedData {
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 
+// A shader registration as the capture of the guest GPU stream stores it. The hash is the one
+// taken at registration, so a restored entry needs no shader code to be read again.
+struct ShaderMapRecord {
+	uint64_t         address = 0;
+	ShaderMappedData data;
+	uint64_t         hash = 0;
+};
+// Changes whenever a shader is registered.
+[[nodiscard]] uint64_t ShaderMapGeneration();
+void                   ShaderMapSave(std::vector<ShaderMapRecord>& out);
+void                   ShaderMapRestore(const ShaderMapRecord& record);
+
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);

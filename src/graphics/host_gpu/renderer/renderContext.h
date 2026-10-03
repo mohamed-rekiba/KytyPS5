@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -51,6 +52,9 @@ public:
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// The GPU-visible guest ranges, and a number that changes with every map and unmap.
+	void                   GetMappedRanges(std::vector<GuestRange>& out) const;
+	[[nodiscard]] uint64_t MappingGeneration() const noexcept { return m_mapping_generation; }
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	// `shader_writes_addresses`: the shader about to run stores through device addresses, so it
@@ -80,6 +84,7 @@ private:
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	std::atomic<uint64_t>     m_mapping_generation {0};
 	std::vector<GuestRange>   m_bda_cpu_writes; // scratch for PrepareBda
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;

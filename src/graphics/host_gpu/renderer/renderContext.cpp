@@ -89,9 +89,16 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+void RenderContext::GetMappedRanges(std::vector<GuestRange>& out) const {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.ForEach(
+	    [&out](uint64_t begin, uint64_t end) { out.push_back({begin, end - begin}); });
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_mapping_generation.fetch_add(1);
 	m_buffer_cache.RequestFullSynchronization();
 }
 
@@ -111,6 +118,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_mapping_generation.fetch_add(1);
 		m_buffer_cache.RequestFullSynchronization();
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no

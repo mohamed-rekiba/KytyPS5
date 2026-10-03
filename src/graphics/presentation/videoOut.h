@@ -8,10 +8,14 @@
 #include "kernel/eventQueue.h"
 
 #include <memory>
+#include <vector>
 
 namespace Libs::Graphics {
 class CommandBuffer;
 class Presenter;
+namespace Capture {
+struct VideoOutCall;
+}
 } // namespace Libs::Graphics
 
 namespace Libs::VideoOut {
@@ -49,6 +53,14 @@ private:
 [[nodiscard]] VideoOutDriver& VideoOutInit(uint32_t width, uint32_t height,
                                            Graphics::Presenter& presenter);
 void                          VideoOutShutdown();
+
+// The configuration of every open port, as the calls that rebuild it in a fresh process. For the
+// capture of the guest GPU stream.
+void VideoOutSaveConfiguration(std::vector<Graphics::Capture::VideoOutCall>& out);
+// Makes one saved call. False when it fails or gives another handle than the live run had.
+[[nodiscard]] bool VideoOutRestoreCall(const Graphics::Capture::VideoOutCall& call);
+// Guest range of the pixel data of a registered display buffer. False when there is none.
+[[nodiscard]] bool VideoOutGetBufferRange(int handle, int index, uint64_t& address, uint64_t& size);
 
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);

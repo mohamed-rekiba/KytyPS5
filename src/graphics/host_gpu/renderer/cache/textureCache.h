@@ -77,6 +77,10 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Records the write-back of the picture the GPU holds for the image that starts at `address`,
+	// so guest memory has it once the GPU work is done. True when guest memory will be current;
+	// false when the GPU holds a picture that cannot be written back (compressed, multisampled).
+	[[nodiscard]] bool WriteBackImage(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
 
 private:

@@ -23,9 +23,49 @@ enum class ContextStateOperation : uint32_t {
 	PushClear = 3,
 };
 
+// Where a submission stands in its command stream while it is suspended between two slices.
+struct Pm4ExecutionState {
+	static constexpr uint32_t MaxDepth = 8;
+	struct Cursor {
+		uint64_t address   = 0;
+		uint64_t dwords    = 0;
+		uint32_t offset_dw = 0;
+		uint32_t reserved  = 0;
+	};
+	uint32_t depth    = 0;
+	uint32_t reserved = 0;
+	Cursor   cursors[MaxDepth] {};
+};
+
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// False when the position does not fit the state: nested deeper than `MaxDepth`, or in the
+	// middle of a jump to another buffer.
+	[[nodiscard]] bool Save(Pm4ExecutionState& state) const {
+		if (m_buffer_stack.size() > Pm4ExecutionState::MaxDepth || !m_next_buffer.empty()) {
+			return false;
+		}
+		state.depth = static_cast<uint32_t>(m_buffer_stack.size());
+		for (uint32_t i = 0; i < state.depth; i++) {
+			state.cursors[i] = {reinterpret_cast<uint64_t>(m_buffer_stack[i].commands.data()),
+			                    m_buffer_stack[i].commands.size(), m_buffer_stack[i].offset_dw, 0};
+		}
+		return true;
+	}
+	void Load(const Pm4ExecutionState& state) {
+		m_buffer_stack.clear();
+		for (uint32_t i = 0; i < state.depth && i < Pm4ExecutionState::MaxDepth; i++) {
+			const auto& cursor = state.cursors[i];
+			m_buffer_stack.push_back({{reinterpret_cast<const uint32_t*>(cursor.address),
+			                           static_cast<size_t>(cursor.dwords)},
+			                          cursor.offset_dw});
+		}
+		m_next_buffer   = {};
+		m_chain         = false;
+		m_suspended     = false;
+		m_made_progress = false;
+	}
 
 private:
 	friend class CommandProcessor;
@@ -40,6 +80,35 @@ private:
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+};
+
+// The register state a command processor keeps between submissions.
+struct CommandProcessorState {
+	HW::Context      ctx;
+	HW::Context      saved_ctx;
+	HW::UserConfig   ucfg;
+	HW::Shader       sh_ctx;
+	HW::UserSgprType user_data_marker                 = HW::UserSgprType::Unknown;
+	uint32_t         index_type_and_size              = 0;
+	uint32_t         index_buffer_size                = 0;
+	uint32_t         num_instances                    = 1;
+	uint64_t         index_base_addr                  = 0;
+	uint64_t         draw_indirect_args_base_addr     = 0;
+	uint64_t         dispatch_indirect_args_base_addr = 0;
+	uint64_t         synthetic_occlusion_counter      = 0;
+	bool             context_state_pushed             = false;
+	bool             predicate_skip                   = false;
+	// State of the submission the processor is in the middle of, if any.
+	bool     ce_complete          = false;
+	uint32_t de_count             = 0;
+	uint32_t ce_count             = 0;
+	int32_t  flip_handle          = 0;
+	int32_t  flip_index           = 0;
+	int32_t  flip_mode            = 0;
+	int64_t  flip_arg             = 0;
+	uint64_t submit_id            = 0;
+	uint64_t blocked_wait_address = 0;
+	uint32_t const_ram[0x3000]    = {0};
 };
 
 class CommandProcessor {
@@ -58,6 +127,8 @@ public:
 	KYTY_CLASS_NO_COPY(CommandProcessor);
 
 	void Reset();
+	void SaveState(CommandProcessorState& state) const;
+	void LoadState(const CommandProcessorState& state);
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
 	void            BufferInit();
@@ -177,6 +248,8 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	// Address of the memory wait this processor is blocked on, 0 when none.
+	uint64_t m_blocked_wait_address = 0;
 };
 
 } // namespace Libs::Graphics

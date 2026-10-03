@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/gpuObserver.h"
 
 #include <array>
 #include <atomic>
@@ -16,6 +17,8 @@
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -45,6 +48,34 @@ public:
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
+	// One observer at most; set it while no submission is queued. It must outlive the GPU thread.
+	void SetObserver(GuestGpuObserver* observer) noexcept { m_observer.store(observer); }
+	[[nodiscard]] GuestGpuObserver* Observer() const noexcept { return m_observer.load(); }
+	// A queued submission that has run a slice and is suspended in its command stream.
+	struct StartedSubmission {
+		uint32_t          compute                   = 0; // 0: graphics, 1: compute
+		uint32_t          queue_id                  = 0;
+		uint64_t          commands_address          = 0;
+		uint64_t          commands_dwords           = 0;
+		uint64_t          constant_commands_address = 0;
+		uint64_t          constant_commands_dwords  = 0;
+		uint32_t          command_complete          = 0;
+		uint32_t          constant_complete         = 0;
+		Pm4ExecutionState command_execution;
+		Pm4ExecutionState constant_execution;
+	};
+	// Every such submission, oldest queue first. False when one cannot be described.
+	[[nodiscard]] bool SaveStartedSubmissions(std::vector<StartedSubmission>& out);
+	// Puts a saved submission back at the head of its queue. Restore the processor state and
+	// the guest memory first: the GPU thread resumes it at once.
+	void RestoreStartedSubmission(const StartedSubmission& saved);
+	// Removes the suspended submissions from the queues. For a replay, whose last frame leaves
+	// submissions that wait for a frame it does not have. Not from the GPU thread.
+	void DropStartedSubmissions();
+	// Register state of every command processor that exists, as (queue index, state). GPU thread.
+	void SaveProcessorStates(std::vector<std::pair<uint32_t, CommandProcessorState>>& out);
+	void LoadProcessorState(uint32_t queue_index, const CommandProcessorState& state);
+
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
@@ -66,6 +97,7 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		uint32_t                  frame_id          = 0; // suspend point only
 	};
 
 	void              Enqueue(Submission submission);
@@ -97,6 +129,7 @@ private:
 
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
+	std::atomic<GuestGpuObserver*> m_observer {nullptr};
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;

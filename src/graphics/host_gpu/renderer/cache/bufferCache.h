@@ -74,6 +74,12 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
+	// The GDS bytes, for the capture of the guest GPU stream. GPU thread, with no GPU work
+	// pending. `RestoreGds` takes exactly `SaveGds().size()` bytes.
+	[[nodiscard]] std::span<const uint8_t> SaveGds() const noexcept {
+		return m_gds_buffer.Mapped();
+	}
+	void                  RestoreGds(std::span<const uint8_t> bytes);
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);

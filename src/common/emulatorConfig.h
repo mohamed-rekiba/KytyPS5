@@ -71,6 +71,17 @@ struct ConfigOptions {
 	// Name Vulkan objects and label passes, draws, dispatches and copies, so a GPU capture reads
 	// as the emulator's work and not as anonymous commands.
 	bool                   gpu_debug_labels_enabled        = false;
+	// Record the guest GPU stream into this file: `gpu_capture_frames` frames, starting at the
+	// first frame boundary at or after frame `gpu_capture_first_frame`.
+	std::filesystem::path gpu_capture_file;
+	uint32_t              gpu_capture_first_frame = 0;
+	uint32_t              gpu_capture_frames      = 1;
+	// When set, recording starts at the first frame boundary after this file appears, and
+	// `gpu_capture_first_frame` is not used. Lets a script start the capture in a chosen scene.
+	std::filesystem::path gpu_capture_trigger_file;
+	// Replay a recorded guest GPU stream instead of running a game, this many times.
+	std::filesystem::path  gpu_replay_file;
+	uint32_t               gpu_replay_loops                = 1;
 	LogDirection           printf_direction            = LogDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
@@ -114,6 +125,12 @@ std::filesystem::path GetCommandBufferDumpFolder();
 
 bool GraphicsDebugDumpEnabled();
 bool GpuDebugLabelsEnabled();
+std::filesystem::path GetGpuCaptureFile();
+uint32_t              GetGpuCaptureFirstFrame();
+uint32_t              GetGpuCaptureFrames();
+std::filesystem::path GetGpuCaptureTriggerFile();
+std::filesystem::path GetGpuReplayFile();
+uint32_t              GetGpuReplayLoops();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();

@@ -119,6 +119,30 @@ bool GpuDebugLabelsEnabled() {
 	return g_config->gpu_debug_labels_enabled;
 }
 
+std::filesystem::path GetGpuCaptureFile() {
+	return g_config->gpu_capture_file;
+}
+
+uint32_t GetGpuCaptureFirstFrame() {
+	return g_config->gpu_capture_first_frame;
+}
+
+uint32_t GetGpuCaptureFrames() {
+	return g_config->gpu_capture_frames;
+}
+
+std::filesystem::path GetGpuCaptureTriggerFile() {
+	return g_config->gpu_capture_trigger_file;
+}
+
+std::filesystem::path GetGpuReplayFile() {
+	return g_config->gpu_replay_file;
+}
+
+uint32_t GetGpuReplayLoops() {
+	return g_config->gpu_replay_loops;
+}
+
 LogDirection GetPrintfDirection() {
 	return g_config->printf_direction;
 }

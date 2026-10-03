@@ -203,6 +203,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/capture/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/capture/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/command_processor/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/command_processor/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/*.cpp"
@@ -557,6 +559,10 @@ add_executable(fence_retirement_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/FenceRetirementTests.cpp"
 )
 target_include_directories(fence_retirement_tests PRIVATE ${inc_headers})
+add_executable(gpu_capture_file_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GpuCaptureFileTests.cpp"
+)
+target_include_directories(gpu_capture_file_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
@@ -611,6 +617,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME metadata_fill COMMAND $<TARGET_FILE:metadata_fill_tests>)
 	add_test(NAME fence_retirement COMMAND $<TARGET_FILE:fence_retirement_tests>)
+	add_test(NAME gpu_capture_file COMMAND $<TARGET_FILE:gpu_capture_file_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
@@ -688,6 +695,7 @@ if(BUILD_TESTING)
 		image_page_table_tests
 		metadata_fill_tests
 		fence_retirement_tests
+		gpu_capture_file_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests

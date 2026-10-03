@@ -2147,6 +2147,23 @@ void TextureCache::RunGarbageCollector() {
 	}
 }
 
+bool TextureCache::WriteBackImage(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	bool             current = true;
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr || owner->info.data.address != address || !owner->IsGpuModified()) {
+			continue;
+		}
+		current = DownloadImageMemory(id);
+		break;
+	}
+	return current;
+}
+
 void TextureCache::ProcessDownloadImages() {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {

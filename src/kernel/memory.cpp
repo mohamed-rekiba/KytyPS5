@@ -880,6 +880,11 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+bool TryGetBackingPointer(uint64_t vaddr, uint64_t size, const uint8_t** out) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryGetBackingPointer(vaddr, size, out);
+}
+
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread() ||
@@ -921,6 +926,16 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
+}
+
+bool TryQueryCpuReadable(uint64_t vaddr, bool& readable) {
+	std::unique_lock<std::recursive_mutex> lock(g_memory_operation_mutex, std::try_to_lock);
+	if (!lock.owns_lock()) {
+		return false;
+	}
+	VirtualRanges::Range range {};
+	readable = g_virtual_ranges->Query(vaddr, 0, &range) && (range.protection & PROT_CPU_READ) != 0;
+	return true;
 }
 
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {

@@ -9,6 +9,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/guest_gpu/capture/captureFile.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
@@ -268,6 +269,7 @@ public:
 	VideoOutConfig* Get(int handle, uint64_t& generation);
 	bool            IsOpened(int handle);
 	int             SetFlipMaster(int slave_handle, int master_handle);
+	void            SaveConfiguration(std::vector<Graphics::Capture::VideoOutCall>& out);
 
 	void                     Init(uint32_t width, uint32_t height);
 	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
@@ -813,6 +815,77 @@ int VideoOutDriver::Impl::SetFlipMaster(int slave_handle, int master_handle) {
 	return OK;
 }
 
+void VideoOutDriver::Impl::SaveConfiguration(std::vector<Graphics::Capture::VideoOutCall>& out) {
+	using Graphics::Capture::VideoOutCall;
+	using Graphics::Capture::VideoOutCallKind;
+	static_assert(sizeof(VideoOutBufferAttribute2) <= sizeof(VideoOutCall::attribute));
+	static_assert(VIDEO_OUT_BUFFER_NUM_MAX <= Graphics::Capture::MaxVideoOutBuffers);
+
+	Common::LockGuard         lock(m_mutex);
+	std::vector<VideoOutCall> masters;
+	for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; handle++) {
+		auto& config = m_video_out_ctx[handle];
+		if (!config.opened) {
+			continue;
+		}
+		Common::LockGuard config_lock(config.mutex);
+
+		VideoOutCall open;
+		open.kind     = static_cast<uint32_t>(VideoOutCallKind::Open);
+		open.handle   = handle;
+		open.bus_type = config.bus;
+		out.push_back(open);
+
+		for (int set_index = 0; set_index < VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX; set_index++) {
+			const auto& group = config.groups[set_index];
+			if (!group.occupied) {
+				continue;
+			}
+			VideoOutCall call;
+			call.kind      = static_cast<uint32_t>(VideoOutCallKind::RegisterBuffers);
+			call.handle    = handle;
+			call.set_index = set_index;
+			call.category  = group.category;
+			std::memcpy(call.attribute.data(), &group.attribute, sizeof(group.attribute));
+			call.buffer_index_start = -1;
+			for (int index = 0; index < VIDEO_OUT_BUFFER_NUM_MAX; index++) {
+				const auto& buffer = config.buffers[index];
+				if (buffer.group_index != set_index) {
+					continue;
+				}
+				if (call.buffer_index_start < 0) {
+					call.buffer_index_start = index;
+				}
+				// One registration call gives a group a run of indices with no gap.
+				EXIT_IF(index != call.buffer_index_start + call.buffer_num);
+				call.buffer_data[static_cast<size_t>(call.buffer_num)] = buffer.data_address;
+				call.buffer_metadata[static_cast<size_t>(call.buffer_num)] =
+				    buffer.metadata_address;
+				call.buffer_num++;
+			}
+			if (call.buffer_num != 0) {
+				out.push_back(call);
+			}
+		}
+
+		VideoOutCall rate;
+		rate.kind   = static_cast<uint32_t>(VideoOutCallKind::SetFlipRate);
+		rate.handle = handle;
+		rate.rate   = config.flip_rate;
+		out.push_back(rate);
+
+		if (config.master != nullptr) {
+			VideoOutCall master;
+			master.kind          = static_cast<uint32_t>(VideoOutCallKind::SetFlipMaster);
+			master.handle        = handle;
+			master.master_handle = static_cast<int32_t>(config.master - m_video_out_ctx);
+			masters.push_back(master);
+		}
+	}
+	// A master link needs both ports open.
+	out.insert(out.end(), masters.begin(), masters.end());
+}
+
 void VideoOutDriver::Impl::VblankBegin() {
 	Common::LockGuard lock(m_mutex);
 
@@ -1294,6 +1367,55 @@ void FlipQueue::GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out) {
 	Common::LockGuard lock(cfg.mutex);
 
 	out = cfg.flip_status;
+}
+
+void VideoOutSaveConfiguration(std::vector<Graphics::Capture::VideoOutCall>& out) {
+	DriverState().SaveConfiguration(out);
+}
+
+bool VideoOutGetBufferRange(int handle, int index, uint64_t& address, uint64_t& size) {
+	auto* config = DriverState().Get(handle);
+	if (config == nullptr || index < 0 || index >= VIDEO_OUT_BUFFER_NUM_MAX) {
+		return false;
+	}
+	Common::LockGuard lock(config->mutex);
+	const auto&       buffer = config->buffers[index];
+	if (!buffer.Occupied() || !config->groups[buffer.group_index].occupied) {
+		return false;
+	}
+	const auto info = config->groups[buffer.group_index].ImageInfo(buffer);
+	address         = info.data.address;
+	size            = info.data.size;
+	return true;
+}
+
+bool VideoOutRestoreCall(const Graphics::Capture::VideoOutCall& call) {
+	using Graphics::Capture::VideoOutCallKind;
+	switch (static_cast<VideoOutCallKind>(call.kind)) {
+		case VideoOutCallKind::Open:
+			return VideoOutOpen(255, call.bus_type, call.open_index, nullptr) == call.handle;
+		case VideoOutCallKind::RegisterBuffers: {
+			if (call.buffer_num < 1 || call.buffer_num > VIDEO_OUT_BUFFER_NUM_MAX) {
+				return false;
+			}
+			VideoOutBufferAttribute2 attribute {};
+			std::memcpy(&attribute, call.attribute.data(), sizeof(attribute));
+			std::array<VideoOutBuffers, VIDEO_OUT_BUFFER_NUM_MAX> buffers {};
+			for (int i = 0; i < call.buffer_num; i++) {
+				const auto slot        = static_cast<size_t>(i);
+				buffers[slot].data     = reinterpret_cast<const void*>(call.buffer_data[slot]);
+				buffers[slot].metadata = reinterpret_cast<const void*>(call.buffer_metadata[slot]);
+			}
+			return VideoOutRegisterBuffers2(call.handle, call.set_index, call.buffer_index_start,
+			                                buffers.data(), call.buffer_num, &attribute,
+			                                call.category, nullptr) == OK;
+		}
+		case VideoOutCallKind::SetFlipRate:
+			return VideoOutSetFlipRate(call.handle, call.rate) == OK;
+		case VideoOutCallKind::SetFlipMaster:
+			return VideoOutSetFlipMaster(call.handle, call.master_handle) == OK;
+	}
+	return false;
 }
 
 KYTY_SYSV_ABI int VideoOutSetFlipMaster(int slave_handle, int master_handle) {

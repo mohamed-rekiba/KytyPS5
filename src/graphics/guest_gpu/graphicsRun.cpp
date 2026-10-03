@@ -38,6 +38,8 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 
+static GuestGpuObserver* CurrentObserver();
+
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
 	uint32_t instance_count;
@@ -174,9 +176,107 @@ void GuestGpu::SuspendPoint() {
 	// finish the preceding graphics frame. The first point returns immediately.
 	m_suspend_point_ready->acquire();
 	Submission submission;
-	submission.type = SubmissionType::SuspendPoint;
+	submission.type     = SubmissionType::SuspendPoint;
+	submission.frame_id = static_cast<uint32_t>(++m_done_num);
 	Enqueue(std::move(submission));
-	m_done_num++;
+}
+
+bool GuestGpu::SaveStartedSubmissions(std::vector<StartedSubmission>& out) {
+	Common::LockGuard lock(m_queue_mutex);
+	for (const auto& queue: m_queues) {
+		for (const auto& submission: queue) {
+			if (!submission.started) {
+				continue;
+			}
+			if (submission.type != SubmissionType::Graphics &&
+			    submission.type != SubmissionType::Compute) {
+				return false;
+			}
+			StartedSubmission saved;
+			saved.compute          = submission.type == SubmissionType::Compute ? 1 : 0;
+			saved.queue_id         = submission.queue_id;
+			saved.commands_address = reinterpret_cast<uint64_t>(submission.commands.data());
+			saved.commands_dwords  = submission.commands.size();
+			saved.constant_commands_address =
+			    reinterpret_cast<uint64_t>(submission.constant_commands.data());
+			saved.constant_commands_dwords = submission.constant_commands.size();
+			saved.command_complete         = submission.command_complete ? 1 : 0;
+			saved.constant_complete        = submission.constant_complete ? 1 : 0;
+			if (!submission.command_execution.Save(saved.command_execution) ||
+			    !submission.constant_execution.Save(saved.constant_execution)) {
+				return false;
+			}
+			out.push_back(saved);
+		}
+	}
+	return true;
+}
+
+void GuestGpu::RestoreStartedSubmission(const StartedSubmission& saved) {
+	EXIT_IF(saved.queue_id >= QueueCount);
+	Submission submission;
+	submission.type     = saved.compute != 0 ? SubmissionType::Compute : SubmissionType::Graphics;
+	submission.queue_id = saved.queue_id;
+	submission.commands = {reinterpret_cast<const uint32_t*>(saved.commands_address),
+	                       static_cast<size_t>(saved.commands_dwords)};
+	submission.constant_commands = {
+	    reinterpret_cast<const uint32_t*>(saved.constant_commands_address),
+	    static_cast<size_t>(saved.constant_commands_dwords)};
+	submission.started           = true;
+	submission.command_complete  = saved.command_complete != 0;
+	submission.constant_complete = saved.constant_complete != 0;
+	submission.command_execution.Load(saved.command_execution);
+	submission.constant_execution.Load(saved.constant_execution);
+
+	Common::LockGuard lock(m_queue_mutex);
+	EXIT_IF(!m_accepting);
+	// A started submission is the oldest of its queue.
+	m_queues[submission.queue_id].push_front(std::move(submission));
+	m_submission_count++;
+	m_work_available.Signal();
+}
+
+void GuestGpu::DropStartedSubmissions() {
+	EXIT_IF(IsGpuThread());
+	for (;;) {
+		{
+			Common::LockGuard lock(m_queue_mutex);
+			// While the GPU thread runs a slice, that submission is in no queue.
+			if (!m_processing) {
+				for (auto& queue: m_queues) {
+					const auto removed = std::erase_if(
+					    queue, [](const Submission& submission) { return submission.started; });
+					m_submission_count -= static_cast<uint32_t>(removed);
+				}
+				return;
+			}
+		}
+		Common::Thread::SleepMicro(100);
+	}
+}
+
+void GuestGpu::SaveProcessorStates(std::vector<std::pair<uint32_t, CommandProcessorState>>& out) {
+	EXIT_IF(!IsGpuThread());
+	const auto save = [&out](uint32_t queue_index, const CommandProcessor& processor) {
+		out.emplace_back();
+		out.back().first = queue_index;
+		processor.SaveState(out.back().second);
+	};
+	save(0, *m_gfx_cp);
+	for (uint32_t i = 0; i < ComputeQueueCount; i++) {
+		if (m_compute_cp[i] != nullptr) {
+			save(1 + i, *m_compute_cp[i]);
+		}
+	}
+}
+
+void GuestGpu::LoadProcessorState(uint32_t queue_index, const CommandProcessorState& state) {
+	EXIT_IF(!IsGpuThread());
+	GetProcessor(queue_index).LoadState(state);
+}
+
+static GuestGpuObserver* CurrentObserver() {
+	return g_gpu_state != nullptr ? g_gpu_state->Observer() : nullptr;
 }
 
 int GuestGpu::GetFrameNum() const {
@@ -211,6 +311,59 @@ void CommandProcessor::Reset() {
 	m_dispatch_indirect_args_base_addr = 0;
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
+}
+
+static_assert(std::is_trivially_copyable_v<CommandProcessorState>);
+
+void CommandProcessor::SaveState(CommandProcessorState& state) const {
+	state.ctx                              = m_ctx;
+	state.saved_ctx                        = m_saved_ctx;
+	state.ucfg                             = m_ucfg;
+	state.sh_ctx                           = m_sh_ctx;
+	state.user_data_marker                 = m_user_data_marker;
+	state.index_type_and_size              = m_index_type_and_size;
+	state.index_buffer_size                = m_index_buffer_size;
+	state.num_instances                    = m_num_instances;
+	state.index_base_addr                  = m_index_base_addr;
+	state.draw_indirect_args_base_addr     = m_draw_indirect_args_base_addr;
+	state.dispatch_indirect_args_base_addr = m_dispatch_indirect_args_base_addr;
+	state.synthetic_occlusion_counter      = m_synthetic_occlusion_counter;
+	state.context_state_pushed             = m_context_state_pushed;
+	state.predicate_skip                   = m_predicate_skip;
+	state.ce_complete                      = m_ce_complete;
+	state.de_count                         = m_de_count;
+	state.ce_count                         = m_ce_count;
+	state.flip_handle                      = m_flip.handle;
+	state.flip_index                       = m_flip.index;
+	state.flip_mode                        = m_flip.flip_mode;
+	state.flip_arg                         = m_flip.flip_arg;
+	state.submit_id                        = m_submit_id;
+	state.blocked_wait_address             = m_blocked_wait_address;
+	std::memcpy(state.const_ram, m_const_ram, sizeof(m_const_ram));
+}
+
+void CommandProcessor::LoadState(const CommandProcessorState& state) {
+	m_ctx                              = state.ctx;
+	m_saved_ctx                        = state.saved_ctx;
+	m_ucfg                             = state.ucfg;
+	m_sh_ctx                           = state.sh_ctx;
+	m_user_data_marker                 = state.user_data_marker;
+	m_index_type_and_size              = state.index_type_and_size;
+	m_index_buffer_size                = state.index_buffer_size;
+	m_num_instances                    = state.num_instances;
+	m_index_base_addr                  = state.index_base_addr;
+	m_draw_indirect_args_base_addr     = state.draw_indirect_args_base_addr;
+	m_dispatch_indirect_args_base_addr = state.dispatch_indirect_args_base_addr;
+	m_synthetic_occlusion_counter      = state.synthetic_occlusion_counter;
+	m_context_state_pushed             = state.context_state_pushed;
+	m_predicate_skip                   = state.predicate_skip;
+	m_ce_complete                      = state.ce_complete;
+	m_de_count                         = state.de_count;
+	m_ce_count                         = state.ce_count;
+	m_flip                 = {state.flip_handle, state.flip_index, state.flip_mode, state.flip_arg};
+	m_submit_id            = state.submit_id;
+	m_blocked_wait_address = state.blocked_wait_address;
+	std::memcpy(m_const_ram, state.const_ram, sizeof(m_const_ram));
 }
 
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
@@ -271,6 +424,9 @@ void CommandProcessor::WaitDeDiff(uint32_t diff) {
 
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
+		if (auto* observer = CurrentObserver(); observer != nullptr) {
+			observer->OnOtherBlock("rewind");
+		}
 		SuspendPm4();
 	}
 }
@@ -315,8 +471,25 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
+	auto*      observer = CurrentObserver();
+	const auto address  = reinterpret_cast<uint64_t>(addr);
+	if (observer != nullptr) {
+		observer->OnBeforeWait(address, sizeof(T));
+	}
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+		m_blocked_wait_address = address;
+		if (observer != nullptr) {
+			observer->OnWaitBlocked(address, sizeof(T));
+		}
 		SuspendPm4();
+	} else {
+		const bool had_blocked = m_blocked_wait_address == address;
+		if (had_blocked) {
+			m_blocked_wait_address = 0;
+		}
+		if (observer != nullptr) {
+			observer->OnWaitPassed(address, sizeof(T), had_blocked);
+		}
 	}
 }
 
@@ -545,6 +718,24 @@ bool GuestGpu::Process(Submission& submission) {
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
+		if (auto* observer = Observer(); observer != nullptr) {
+			using Kind = GuestGpuObserver::SubmissionKind;
+			switch (submission.type) {
+				case SubmissionType::Graphics:
+					observer->OnSubmissionStart(Kind::Graphics, 0, submission.commands,
+					                            submission.constant_commands);
+					break;
+				case SubmissionType::Compute:
+					observer->OnSubmissionStart(Kind::Compute,
+					                            ComputeQueueBase + submission.queue_id - 1,
+					                            submission.commands, {});
+					break;
+				case SubmissionType::FlipPreparation:
+					observer->OnSubmissionStart(Kind::CpuFlip, 0, {}, {});
+					break;
+				case SubmissionType::SuspendPoint: break;
+			}
+		}
 	}
 
 	cp.BufferInit();
@@ -621,6 +812,9 @@ bool GuestGpu::Process(Submission& submission) {
 			    [ready = m_suspend_point_ready] { ready->release(); });
 			cp.BufferFlush();
 			cp.Reset();
+			if (auto* observer = Observer(); observer != nullptr) {
+				observer->OnSuspendPoint(submission.frame_id);
+			}
 			break;
 	}
 
@@ -816,6 +1010,9 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const auto end   = results[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
 					if (wait_op == 0) {
+						if (auto* observer = CurrentObserver(); observer != nullptr) {
+							observer->OnOtherBlock("predication");
+						}
 						SuspendPm4();
 					} else {
 						m_predicate_skip = false;
@@ -1369,6 +1566,9 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 }
 
 void CommandProcessor::Flip() {
+	if (auto* observer = CurrentObserver(); observer != nullptr) {
+		observer->OnFlip(m_flip.handle, m_flip.index);
+	}
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
@@ -1382,6 +1582,9 @@ void CommandProcessor::Flip() {
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
+	if (auto* observer = CurrentObserver(); observer != nullptr) {
+		observer->OnFlip(m_flip.handle, m_flip.index);
+	}
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {
@@ -1402,6 +1605,9 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 
 void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action,
                                          void* dst_gpu_addr, uint32_t value) {
+	if (auto* observer = CurrentObserver(); observer != nullptr) {
+		observer->OnFlip(m_flip.handle, m_flip.index);
+	}
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {

@@ -187,6 +187,26 @@ public:
 		    });
 	}
 
+	// Host address of the alias bytes behind the guest range. The alias is one view that lives
+	// as long as the process, so the address stays readable after the guest unmaps the range.
+	// False when the range is not backed, or not by one mapping.
+	bool TryGetBackingPointer(uint64_t vaddr, uint64_t size, const uint8_t** out) {
+		if (!IsAvailable() || out == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		MapEntry        entry {};
+		if (!FindContainingUnlocked(vaddr, 1, &entry) || vaddr + size > entry.vaddr + entry.size) {
+			return false;
+		}
+		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+		if (!RangeOk(offset, size)) {
+			return false;
+		}
+		*out = m_backing_base + offset;
+		return true;
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -735,6 +755,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	bool TryGetBackingPointer(uint64_t vaddr, uint64_t size, const uint8_t** out) {
+		return m_backing->TryGetBackingPointer(vaddr, size, out);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {

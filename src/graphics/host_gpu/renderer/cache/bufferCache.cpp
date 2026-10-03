@@ -231,6 +231,14 @@ BufferCache::~BufferCache() {
 	m_buffers.clear();
 }
 
+void BufferCache::RestoreGds(std::span<const uint8_t> bytes) {
+	if (bytes.size() != m_gds_buffer.Size()) {
+		EXIT("BufferCache: GDS restore size mismatch\n");
+	}
+	std::memcpy(m_gds_buffer.Mapped().data(), bytes.data(), bytes.size());
+	m_gds_buffer.Flush(0, m_gds_buffer.Size());
+}
+
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");

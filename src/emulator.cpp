@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -11,6 +12,8 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/capture/gpuPlayer.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -180,7 +183,55 @@ static void Execute(const std::filesystem::path& game_patch) {
 	std::quick_exit(0);
 }
 
+// The renderer protects guest pages it tracks and expects the fault to come back to it. With a
+// game loaded, the runtime linker's handler does that; the replay has no runtime linker.
+static bool GpuReplayFaultHandler(const Common::HostException::ExceptionInfo& info) {
+	if (info.type != Common::HostException::ExceptionType::AccessViolation) {
+		return false;
+	}
+	using HostAccess = Common::HostException::AccessViolationType;
+	using GpuAccess  = Libs::Graphics::PageFaultAccess;
+	GpuAccess access;
+	switch (info.access_violation_type) {
+		case HostAccess::Read: access = GpuAccess::Read; break;
+		case HostAccess::Write: access = GpuAccess::Write; break;
+		default: return false;
+	}
+	return Libs::LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+}
+
+// Replays a capture of the guest GPU stream. No game is loaded and no guest code runs.
+static void RunGpuReplay(const RunOptions& options) {
+	Common::Subsystems subsystems(true);
+	Init(options.config, {}, subsystems);
+	PrintSystemInfo();
+	if (!Common::HostException::InstallHandler(GpuReplayFaultHandler)) {
+		EXIT("cannot install the page fault handler\n");
+	}
+
+	int ok = atexit(KytyClose);
+	EXIT_NOT_IMPLEMENTED(ok != 0);
+	ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);
+	EXIT_NOT_IMPLEMENTED(ok != 0);
+
+	Common::Thread player_thread(
+	    [](void* /*param*/) {
+		    const bool played = Libs::Graphics::Capture::Play(Libs::Graphics::GetRenderContext(),
+		                                                      Config::GetGpuReplayFile(),
+		                                                      Config::GetGpuReplayLoops());
+		    std::quick_exit(played ? 0 : 1);
+	    },
+	    nullptr);
+	Libs::Graphics::WindowRun();
+	std::quick_exit(0);
+}
+
 void Run(const RunOptions& options) {
+	if (!options.config.gpu_replay_file.empty()) {
+		RunGpuReplay(options);
+		return;
+	}
+
 	if (options.app0_dir.empty()) {
 		EXIT("app0 directory is required\n");
 	}

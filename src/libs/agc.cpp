@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/capture/gpuRecorder.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -65,10 +66,24 @@ void Initialize() {
 	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
 	ShaderInit();
+
+	if (const auto capture_file = Config::GetGpuCaptureFile(); !capture_file.empty()) {
+		// Never destroyed: the GPU thread can still call it while the process exits.
+		auto* recorder = new Capture::Recorder(
+		    *g_renderer, capture_file, Config::GetGpuCaptureFirstFrame(),
+		    Config::GetGpuCaptureFrames(), Config::GetGpuCaptureTriggerFile());
+		g_renderer->GetGpu().SetObserver(recorder);
+	}
+}
+
+RenderContext& GetRenderContext() {
+	EXIT_IF(g_renderer == nullptr);
+	return *g_renderer;
 }
 
 void Shutdown() {
 	EXIT_IF(g_renderer == nullptr);
+	g_renderer->GetGpu().SetObserver(nullptr);
 	g_renderer->ShutdownGpu();
 	VideoOut::VideoOutShutdown();
 	WindowShutdown();
