@@ -136,6 +136,13 @@ void RenderContext::PrepareBda(bool shader_writes_addresses) {
 	// thousands of buffers; the buffer cache logs where the CPU wrote, and only those ranges are
 	// synchronized. A full walk runs when the log overflowed or the mapping changed.
 	std::shared_lock lock(m_mapped_ranges_mutex);
+	struct UploadBatch {
+		BufferCache& cache;
+		explicit UploadBatch(BufferCache& buffer_cache): cache(buffer_cache) {
+			cache.BeginUploadBatch();
+		}
+		~UploadBatch() { cache.EndUploadBatch(); }
+	} upload_batch {m_buffer_cache};
 	if (!m_buffer_cache.TakeCpuWrites(m_bda_cpu_writes)) {
 		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);

@@ -68,6 +68,9 @@ struct ConfigOptions {
 	bool                   command_buffer_dump_enabled = false;
 	std::filesystem::path  command_buffer_dump_folder  = "_Buffers";
 	bool                   graphics_debug_dump_enabled = false;
+	// Name Vulkan objects and label passes, draws, dispatches and copies, so a GPU capture reads
+	// as the emulator's work and not as anonymous commands.
+	bool                   gpu_debug_labels_enabled        = false;
 	LogDirection           printf_direction            = LogDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
@@ -110,6 +113,7 @@ bool                  CommandBufferDumpEnabled();
 std::filesystem::path GetCommandBufferDumpFolder();
 
 bool GraphicsDebugDumpEnabled();
+bool GpuDebugLabelsEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();

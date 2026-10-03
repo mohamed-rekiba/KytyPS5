@@ -67,6 +67,8 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
+	InsertDebugLabel(m_buffer, "Pass {}x{} layers={} colors={}", state.width, state.height,
+	                 state.num_layers, state.num_color_attachments);
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
@@ -115,6 +117,27 @@ void CommandBuffer::EndRendering() const {
 	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
+	if (m_global_barrier_pending) {
+		m_global_barrier_pending = false;
+		RequestGlobalBarrier();
+	}
+}
+
+void CommandBuffer::RequestGlobalBarrier() const {
+	if (m_rendering) {
+		m_global_barrier_pending = true;
+		return;
+	}
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	Handle().pipelineBarrier2(dependency);
 }
 
 } // namespace Libs::Graphics

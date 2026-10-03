@@ -115,6 +115,10 @@ bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
 }
 
+bool GpuDebugLabelsEnabled() {
+	return g_config->gpu_debug_labels_enabled;
+}
+
 LogDirection GetPrintfDirection() {
 	return g_config->printf_direction;
 }

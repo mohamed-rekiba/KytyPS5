@@ -95,6 +95,12 @@ public:
 	// themselves.
 	[[nodiscard]] WriteWatchSet& WriteWatches() noexcept { return m_write_watches; }
 	void               ProcessFaultBuffer();
+	// Between Begin and End, uploads share one barrier before the first copy and one after the
+	// last. A barrier between two copies makes the Metal backend start a new blit encoder for
+	// each copy; a run of copies with nothing in between shares one. No draw or dispatch may be
+	// recorded inside a batch.
+	void               BeginUploadBatch();
+	void               EndUploadBatch();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
@@ -151,6 +157,8 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	WriteWatchSet                                      m_write_watches;
 	// See TakeCpuWrites. Written by the fault thread and the GPU thread.
+	bool                                              m_upload_batch_open    = false;
+	bool                                              m_upload_batch_started = false;
 	std::mutex                                        m_cpu_write_log_mutex;
 	std::vector<GuestRange>                           m_cpu_write_log;
 	bool                                              m_cpu_writes_need_full_pass = true;

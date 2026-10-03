@@ -146,6 +146,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
 	const auto              native = command.Handle();
+	InsertDebugLabel(native, "Download {} ranges, {} bytes, from buffer 0x{:x}+0x{:x}",
+	                 copies.size(), total_size, buffer_address, buffer.Size());
 	vk::BufferMemoryBarrier before {};
 	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
@@ -406,32 +408,73 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
-		vk::BufferMemoryBarrier before {};
-		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
-		                       vk::AccessFlagBits::eTransferRead |
-		                       vk::AccessFlagBits::eTransferWrite;
-		before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
-		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.buffer              = buffer.Handle();
-		before.offset              = 0;
-		before.size                = buffer.Size();
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::PipelineStageFlagBits::eTransfer,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
-		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
-		auto after          = before;
-		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                       vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		InsertDebugLabel(native, "Upload {} ranges, {} bytes, to buffer 0x{:x}+0x{:x}",
+		                 copies.size(), total_size, buffer.CpuAddress(), buffer.Size());
+		if (m_upload_batch_open) {
+			if (!m_upload_batch_started) {
+				m_upload_batch_started = true;
+				vk::MemoryBarrier before_all {};
+				before_all.srcAccessMask =
+				    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+				    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+				before_all.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+				native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+				                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before_all, 0,
+				                       nullptr, 0, nullptr);
+			}
+			native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+			                  copies.data());
+		} else {
+			vk::BufferMemoryBarrier before {};
+			before.srcAccessMask =
+			    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+			    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+			before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+			before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			before.buffer              = buffer.Handle();
+			before.offset              = 0;
+			before.size                = buffer.Size();
+			native.pipelineBarrier(
+			    vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+			    vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
+			native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+			                  copies.data());
+			auto after          = before;
+			after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			after.dstAccessMask =
+			    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+			native.pipelineBarrier(
+			    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+			    vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		}
 	}
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	return false;
+}
+
+void BufferCache::BeginUploadBatch() {
+	EXIT_IF(m_upload_batch_open);
+	m_upload_batch_open    = true;
+	m_upload_batch_started = false;
+}
+
+void BufferCache::EndUploadBatch() {
+	EXIT_IF(!m_upload_batch_open);
+	m_upload_batch_open = false;
+	if (!m_upload_batch_started) {
+		return;
+	}
+	// A wrap of the staging buffer can submit in the middle of a batch. A barrier orders all
+	// earlier commands of the queue, so the one recorded here still covers the copies before it.
+	vk::MemoryBarrier after_all {};
+	after_all.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after_all.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                                               vk::PipelineStageFlagBits::eAllCommands, {}, 1,
+	                                               &after_all, 0, nullptr, 0, nullptr);
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
