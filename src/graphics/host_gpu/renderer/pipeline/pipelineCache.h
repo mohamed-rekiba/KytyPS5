@@ -4,14 +4,22 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/waitBudget.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 
@@ -115,6 +123,8 @@ public:
 	void Save();
 
 	struct Pipeline {
+		// False while a worker thread is still building it.
+		std::atomic<bool>       ready {true};
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
@@ -144,7 +154,13 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	// Null when the pipeline is still being built and the draw has to be left out for now. A
+	// pipeline that is not known yet is built on a worker thread. The caller waits for it within
+	// a small budget: with warm driver caches a build takes about a millisecond and nothing is
+	// left out. When builds are slow (nothing cached yet) the budget runs out, and the draw is
+	// skipped until its pipeline is ready, so the picture keeps moving. With --pipeline-wait,
+	// and while a GPU stream is recorded or replayed, the caller always waits.
+	Pipeline* GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
@@ -189,7 +205,30 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
-	void InitializeDriverCache();
+	// What a worker needs to build one graphics pipeline, copied from the draw.
+	struct PipelineJob {
+		Pipeline*                            target = nullptr;
+		PipelineRenderingState               rendering;
+		PipelineVertexInputState             vertex_input;
+		std::array<ShaderVertexInputInfo, 3> vertex_info;
+		uint32_t                             vertex_count = 0;
+		std::optional<ShaderPixelInputInfo>  pixel;
+		GraphicsPrograms                     programs;
+		PipelineStaticParameters             static_params;
+	};
+	std::mutex                  m_jobs_mutex;
+	std::condition_variable_any m_job_added;
+	std::condition_variable     m_job_done;
+	std::deque<PipelineJob>     m_jobs;
+	std::vector<std::jthread>   m_builders;
+	bool                        m_wait_for_pipelines = false;
+	Common::WaitBudget m_wait_budget {std::chrono::milliseconds(8), std::chrono::milliseconds(100)};
+	uint64_t           m_skipped_draws   = 0;
+	uint64_t           m_recent_build_us = 0; // under m_jobs_mutex
+
+	void                    InitializeDriverCache();
+	void                    BuildPipelines(std::stop_token stop);
+	[[nodiscard]] Pipeline* WhenReady(Pipeline& pipeline);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

@@ -139,6 +139,10 @@ uint32_t GetGpuCaptureChecks() {
 	return g_config->gpu_capture_checks;
 }
 
+bool PipelineWaitEnabled() {
+	return g_config->pipeline_wait_enabled;
+}
+
 std::filesystem::path GetGpuReplayFile() {
 	return g_config->gpu_replay_file;
 }

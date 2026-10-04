@@ -83,6 +83,8 @@ static void PrintUsage() {
 	         "instead of at a frame number.\n");
 	::printf("  --gpu-capture-checks <num>           Also record a hash of every image the GPU "
 	         "wrote, every <num> draws; a replay then names the first image that differs.\n");
+	::printf("  --pipeline-wait <true|false>         A draw waits until its pipeline is built. "
+	         "Default: false, the draw is skipped until then and the game does not stop.\n");
 	::printf("  --gpu-replay <file>                  Replay a recorded guest GPU stream; no "
 	         "--game needed.\n");
 	::printf("  --gpu-replay-loops <num>             Times to replay the recording. Default: 1.\n");
@@ -420,6 +422,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--gpu-capture-checks") {
 			if (!ParseUint32(value, options.config.gpu_capture_checks)) {
 				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--pipeline-wait") {
+			if (!ParseBool(value, options.config.pipeline_wait_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
 		} else if (arg == "--gpu-capture-frames") {

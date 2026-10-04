@@ -82,6 +82,9 @@ struct ConfigOptions {
 	// Store a hash of every image the host GPU wrote, each time this many draws and dispatches
 	// have passed. A replay then names the first image that differs. 0: no such checks.
 	uint32_t gpu_capture_checks = 0;
+	// A draw whose pipeline is not built yet waits for it, whatever that takes. Off: the draw
+	// waits only a moment and is skipped until the pipeline is ready, so the game does not stop.
+	bool pipeline_wait_enabled = false;
 	// Replay a recorded guest GPU stream instead of running a game, this many times.
 	std::filesystem::path  gpu_replay_file;
 	uint32_t               gpu_replay_loops                = 1;
@@ -133,6 +136,7 @@ uint32_t              GetGpuCaptureFirstFrame();
 uint32_t              GetGpuCaptureFrames();
 std::filesystem::path GetGpuCaptureTriggerFile();
 uint32_t              GetGpuCaptureChecks();
+bool                  PipelineWaitEnabled();
 std::filesystem::path GetGpuReplayFile();
 uint32_t              GetGpuReplayLoops();
 

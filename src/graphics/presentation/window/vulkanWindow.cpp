@@ -878,10 +878,15 @@ void WindowContext::CreateVulkan() {
 	// is submitted, by default on the thread that submits. That thread is the GPU thread, which
 	// has the next frame to record. Let MoltenVK do it on its own queue thread instead. The
 	// setting is addressed to MoltenVK by name; any other driver ignores it.
-	static const vk::Bool32   synchronous_queue_submits = VK_FALSE;
-	const vk::LayerSettingEXT layer_settings[]          = {
+	// Pipelines are built on several worker threads. By default Metal compiles one shader at a
+	// time for the whole process; this lets it compile as many at once as it has cores for.
+	static const vk::Bool32   synchronous_queue_submits   = VK_FALSE;
+	static const vk::Bool32   maximize_concurrent_compile = VK_TRUE;
+	const vk::LayerSettingEXT layer_settings[]            = {
 	    {"MoltenVK", "MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", vk::LayerSettingTypeEXT::eBool32, 1,
 	     &synchronous_queue_submits},
+	    {"MoltenVK", "MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION",
+	     vk::LayerSettingTypeEXT::eBool32, 1, &maximize_concurrent_compile},
 	};
 	vk::LayerSettingsCreateInfoEXT layer_settings_info {};
 	if (HasExtension(r.available_extensions, VK_EXT_LAYER_SETTINGS_EXTENSION_NAME)) {
