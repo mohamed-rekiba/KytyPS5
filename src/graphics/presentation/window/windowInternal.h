@@ -42,6 +42,9 @@ struct WindowContext {
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
 	void                                                    UpdateTitle();
+	// Main thread, when no frame is presented any more: a title that was not shown yet is
+	// dropped, so nothing refers to the window after it is destroyed.
+	void                                                    ForgetTitle();
 	void                                                    Resize(uint32_t width, uint32_t height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);

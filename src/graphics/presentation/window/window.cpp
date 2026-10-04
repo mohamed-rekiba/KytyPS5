@@ -1,17 +1,16 @@
 #include "graphics/presentation/window.h"
 
-#include <SDL3/SDL.h>
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/latestValue.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
-#include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -24,13 +23,14 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <SDL3/SDL.h>
 #include <cstdlib>
+#include <filesystem>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
-#include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
@@ -905,6 +905,13 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
+// The newest window title and its window, until the main thread has shown it.
+static Common::LatestValue<std::pair<SDL_Window*, std::string>> g_window_title;
+
+void WindowContext::ForgetTitle() {
+	(void)g_window_title.Take();
+}
+
 void WindowContext::UpdateTitle() {
 	static char title[128];
 	static char title_id[12];
@@ -946,16 +953,20 @@ void WindowContext::UpdateTitle() {
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
-	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+	// The title is set on the main thread, and the caller is the thread that presents frames.
+	// It must not wait for the main thread: a wake-up of the main thread's event wait can get
+	// lost, and then that thread only runs the request at its next periodic wake-up, seconds
+	// later. Waiting here held up every thread that waits for a flip. So the newest title is
+	// left for the main thread to show when it gets to it.
+	if (g_window_title.Put({window, std::move(text)})) {
+		EXIT_IF(!SDL_RunOnMainThread(
+		    [](void*) {
+			    if (const auto title = g_window_title.Take()) {
+				    SDL_SetWindowTitle(title->first, title->second.c_str());
+			    }
+		    },
+		    nullptr, false));
+	}
 }
 
 } // namespace Libs::Graphics

@@ -1059,6 +1059,7 @@ void WindowContext::RecreateSurface() {
 WindowContext::~WindowContext() {
 	ShutdownSystemOverlayInput();
 	presenter.reset();
+	ForgetTitle();
 	LibKernel::Memory::InstallGpuResources(nullptr);
 	render_context.reset();
 
