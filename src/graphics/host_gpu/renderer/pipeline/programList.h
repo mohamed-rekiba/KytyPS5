@@ -77,7 +77,9 @@ public:
 			return false;
 		}
 		values.resize(count);
-		std::memcpy(values.data(), m_bytes.data(), count * sizeof(T));
+		if (count != 0) {
+			std::memcpy(values.data(), m_bytes.data(), count * sizeof(T));
+		}
 		m_bytes = m_bytes.subspan(count * sizeof(T));
 		return true;
 	}
@@ -134,7 +136,8 @@ inline std::vector<ProgramRecord> ReadProgramRecords(std::span<const uint8_t> by
 	for (;;) {
 		ProgramListDetail::In file(bytes);
 		uint32_t              size = 0;
-		if (!file.Value(size) || bytes.size() - sizeof(size) < size + sizeof(uint64_t)) {
+		if (!file.Value(size) || bytes.size() - sizeof(size) < sizeof(uint64_t) ||
+		    bytes.size() - sizeof(size) - sizeof(uint64_t) < size) {
 			break;
 		}
 		const auto body     = bytes.subspan(sizeof(size), size);

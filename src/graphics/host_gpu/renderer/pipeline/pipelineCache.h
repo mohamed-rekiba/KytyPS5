@@ -114,7 +114,8 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
-// The owning renderer serializes access, including saves while the GPU is running.
+// The owning renderer serializes access, including saves while the GPU is running. Its own
+// worker threads build programs and pipelines; see the members they use.
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);
@@ -159,13 +160,14 @@ public:
 	// a small budget: with warm driver caches a build takes about a millisecond and nothing is
 	// left out. When builds are slow (nothing cached yet) the budget runs out, and the draw is
 	// skipped until its pipeline is ready, so the picture keeps moving. With --pipeline-wait,
-	// and while a GPU stream is recorded or replayed, the caller always waits.
+	// while a GPU stream is recorded or replayed, and with `must_wait` (a draw that does more
+	// than colour pixels: it writes buffers or clears its target), the caller always waits.
 	Pipeline* GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs);
+	                              const GraphicsPrograms& programs, bool must_wait);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -228,7 +230,7 @@ private:
 
 	void                    InitializeDriverCache();
 	void                    BuildPipelines(std::stop_token stop);
-	[[nodiscard]] Pipeline* WhenReady(Pipeline& pipeline);
+	[[nodiscard]] Pipeline* WhenReady(Pipeline& pipeline, bool must_wait);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

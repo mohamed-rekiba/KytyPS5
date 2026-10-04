@@ -1162,10 +1162,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	// A draw that writes buffers from a shader, or clears its depth target, changes more than
+	// the picture of this frame: it is never left out.
+	bool must_wait = state.depth_info.depth_clear_enable ||
+	                 (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage));
+	for (const auto& stage: vertex_stages) {
+		must_wait = must_wait || HasShaderBufferWrites(stage.stage);
+	}
 	auto* const pipeline_or_none = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	    state.programs, must_wait);
 	if (pipeline_or_none == nullptr) {
 		return;
 	}

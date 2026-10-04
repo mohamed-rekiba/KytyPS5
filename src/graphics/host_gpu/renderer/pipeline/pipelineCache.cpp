@@ -252,7 +252,8 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
 
-	// Translated IR to SPIR-V, checked. Has no state of its own: a worker thread can run it.
+	// Translated IR to SPIR-V, checked. Shares nothing but the counter of the dump files, which
+	// is atomic: a worker thread can run it.
 	static ShaderRecompiler::CompileResult
 	CompileChecked(const char* stage_name, const ShaderRecompiler::CompileOptions& options,
 	               ShaderRecompiler::TranslateResult                   translated,
@@ -415,11 +416,13 @@ struct PipelineCache::ProgramCache {
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 		}
-		Remember(stage, params, input_info, entry->second.specialization, push_data_cursor);
 		entry->second.permutations.push_back(
 		    MakePermutation(CompileChecked(stage_name, options, std::move(translated),
 		                                   entry->second.specialization, push_data_cursor),
 		                    entry->second.specialization));
+		// After it compiled: a shader the translator stops on must not be on the list, or the
+		// next start would stop on it too.
+		Remember(stage, params, input_info, entry->second.specialization, push_data_cursor);
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -496,10 +499,21 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	// Raise when a field of the stage input infos is added, removed or moved: a record stores
+	// their bytes.
+	static constexpr uint32_t ListLayoutVersion = 1;
+
 	std::string ListSignature() const {
-		return fmt::format("KytyPL1:{}:{}:{}:{:016x}\n", sizeof(ShaderVertexInputInfo),
-		                   sizeof(ShaderPixelInputInfo), sizeof(ShaderComputeInputInfo),
-		                   XXH3_64bits(&host_features, sizeof(host_features)));
+		return fmt::format("KytyPL{}:{}:{}:{}:{}{}{}{}{}{}:{:08x}\n", ListLayoutVersion,
+		                   sizeof(ShaderVertexInputInfo), sizeof(ShaderPixelInputInfo),
+		                   sizeof(ShaderComputeInputInfo),
+		                   static_cast<int>(host_features.buffer_int64_atomics),
+		                   static_cast<int>(host_features.shared_int64_atomics),
+		                   static_cast<int>(host_features.cull_distance),
+		                   static_cast<int>(host_features.fragment_shader_barycentric),
+		                   static_cast<int>(host_features.float64),
+		                   static_cast<int>(host_features.centroid_barycentric),
+		                   host_features.subgroup_supported_stages);
 	}
 
 	// Worker thread. Builds what the live path builds for the same inputs.
@@ -514,10 +528,19 @@ struct PipelineCache::ProgramCache {
 		out.key.user_data_count = record.user_data_count;
 		out.key.code_size       = static_cast<uint32_t>(record.code.size());
 		BuildStageStaticKey(info, out.key.static_state);
+		if (record.user_data_count > std::tuple_size_v<decltype(ShaderParams::user_data)>) {
+			return false;
+		}
 		const std::vector<uint32_t> user_data(record.user_data_count, 0u);
 		const auto                  options =
 		    MakeOptions(record.stage, record.hash, user_data, record.back_code, info);
-		auto translated    = ShaderRecompiler::TranslateProgram(record.code, options);
+		auto translated = ShaderRecompiler::TranslateProgram(record.code, options);
+		// The variant was chosen for the resources the translator found when the record was
+		// made. A newer translator can find others: then the record is of no use.
+		if (translated.program.info.buffers.size() != record.specialization.buffers.size() ||
+		    translated.program.info.images.size() > record.specialization.images.size()) {
+			return false;
+		}
 		out.plan           = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 		out.specialization = record.specialization;
 		out.result =
@@ -567,20 +590,31 @@ struct PipelineCache::ProgramCache {
 		}
 		std::error_code error;
 		std::filesystem::create_directories(path.parent_path(), error);
-		// A list from another layout or device is started again; a damaged tail is cut off.
-		m_list_file = std::fopen(Common::PathToString(path).c_str(), "wb");
-		if (m_list_file == nullptr) {
-			PipelineCacheLog("Program list: cannot write {}", Common::PathToString(path));
-			m_records.clear();
-			return;
-		}
-		std::fwrite(signature.data(), 1, signature.size(), m_list_file);
-		std::vector<uint8_t> kept;
+		// The list is written again without what was dropped (another layout or device, a
+		// damaged tail), into a temporary file that then takes the list's place: a stop in
+		// between leaves the old list. New records are appended to it.
+		auto temp_path = path;
+		temp_path += ".tmp";
+		std::vector<uint8_t> kept(signature.begin(), signature.end());
 		for (const auto& record: m_records) {
 			AppendProgramRecord(kept, record);
 		}
-		std::fwrite(kept.data(), 1, kept.size(), m_list_file);
-		std::fflush(m_list_file);
+		bool written = false;
+		if (std::FILE* file = std::fopen(Common::PathToString(temp_path).c_str(), "wb")) {
+			written = std::fwrite(kept.data(), 1, kept.size(), file) == kept.size();
+			written = std::fclose(file) == 0 && written;
+		}
+		if (written) {
+			std::filesystem::rename(temp_path, path, error);
+			written = !error;
+		}
+		if (written) {
+			m_list_file = std::fopen(Common::PathToString(path).c_str(), "ab");
+		}
+		if (m_list_file == nullptr) {
+			// The programs that were read are still built ahead; new ones are not remembered.
+			PipelineCacheLog("Program list: cannot write {}", Common::PathToString(path));
+		}
 		PipelineCacheLog("Program list: {} program(s) to build ahead from {}", m_records.size(),
 		                 Common::PathToString(path));
 		if (m_records.empty()) {
@@ -615,8 +649,7 @@ struct PipelineCache::ProgramCache {
 	}
 
 	// Renderer thread, before the programs of a draw or dispatch are looked up. Takes over what
-	// the workers have finished. Not later in a draw: adding a permutation can move the ones a
-	// stage of the same draw already points to.
+	// the workers have finished.
 	void Adopt() {
 		if (!m_built_waiting.load(std::memory_order_acquire)) {
 			return;
@@ -638,7 +671,6 @@ struct PipelineCache::ProgramCache {
 			}
 			entry->second.permutations.push_back(
 			    MakePermutation(std::move(item.result), std::move(item.specialization)));
-			m_adopted++;
 		}
 	}
 
@@ -706,7 +738,6 @@ struct PipelineCache::ProgramCache {
 	std::atomic<uint32_t>                                       m_workers_running {0};
 	std::unordered_set<uint64_t>                                m_listed;
 	std::FILE*                                                  m_list_file = nullptr;
-	uint64_t                                                    m_adopted   = 0;
 	vk::Device                                                  device;
 	ShaderHostFeatures                                          host_features;
 	uint64_t                                                    next_shader_id = 0;
@@ -811,9 +842,8 @@ void PipelineCache::InitializeDriverCache() {
 			    payload_read != initial_data.size() || cached_signature != signature ||
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
-				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
-				    path);
+				PipelineCacheLog("Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
+				                 path);
 			}
 		} else {
 			file.Close();
@@ -900,8 +930,8 @@ void PipelineCache::Save() {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	// The cache object stays: worker threads may be building pipelines with it. The destructor
+	// destroys it, after they have stopped.
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -1112,13 +1142,13 @@ void PipelineCache::BuildPipelines(std::stop_token stop) {
 	}
 }
 
-PipelineCache::Pipeline* PipelineCache::WhenReady(Pipeline& pipeline) {
+PipelineCache::Pipeline* PipelineCache::WhenReady(Pipeline& pipeline, bool must_wait) {
 	if (pipeline.ready.load(std::memory_order_acquire)) {
 		return &pipeline;
 	}
 	const auto       ready = [&pipeline] { return pipeline.ready.load(std::memory_order_acquire); };
 	std::unique_lock lock(m_jobs_mutex);
-	if (m_wait_for_pipelines) {
+	if (m_wait_for_pipelines || must_wait) {
 		m_job_done.wait(lock, ready);
 		return &pipeline;
 	}
@@ -1126,10 +1156,13 @@ PipelineCache::Pipeline* PipelineCache::WhenReady(Pipeline& pipeline) {
 	// millisecond and keeps the picture exact, so the draw waits. Only when builds are slow is
 	// the wait cut short by the budget.
 	constexpr uint64_t                     QuickBuildUs = 4000;
-	constexpr Common::WaitBudget::Duration QuickWait    = std::chrono::milliseconds(50);
+	constexpr Common::WaitBudget::Duration QuickWait    = std::chrono::milliseconds(20);
 	const auto                             begin        = Common::WaitBudget::Clock::now();
 	if (m_recent_build_us < QuickBuildUs) {
-		(void)m_job_done.wait_for(lock, QuickWait, ready);
+		if (!m_job_done.wait_for(lock, QuickWait, ready)) {
+			// This build is not quick. The draws behind it must not each wait as long.
+			m_recent_build_us = QuickBuildUs;
+		}
 	} else {
 		(void)m_job_done.wait_for(lock, m_wait_budget.Left(begin), ready);
 		const auto end = Common::WaitBudget::Clock::now();
@@ -1149,7 +1182,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs, bool must_wait) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -1310,7 +1343,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return WhenReady(*iter->second);
+		return WhenReady(*iter->second, must_wait);
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1346,7 +1379,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	}
 	m_job_added.notify_one();
 
-	return WhenReady(*iter->second);
+	return WhenReady(*iter->second, must_wait);
 }
 
 PipelineCache::Pipeline&
