@@ -118,6 +118,13 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 // readable for the life of the process. For bulk readers that must not copy under a lock.
 [[nodiscard]] bool     TryGetBackingPointer(uint64_t vaddr, uint64_t size, const uint8_t** out);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// For the renderer's reads of guest bytes that a shader can produce, at this point of the
+// command stream. A page with a few such bytes does not fault while their value is on its way
+// from the host GPU, so the read has to ask: this waits until guest memory has the value.
+// Does nothing on other threads.
+void WaitForGpuBytes(uint64_t vaddr, uint64_t size);
+// The same, then copies the bytes.
+void                   ReadForGpu(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;

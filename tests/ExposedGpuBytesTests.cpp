@@ -159,9 +159,34 @@ void TestPartOfARangeIsForgotten() {
 	Check(guest.UploadParts(0x1000, 0x1000) == WholePage, "a cleared set leaves nothing out");
 }
 
+void TestPageAfterADispatch() {
+	using Range = ExposedGpuBytes::Range;
+	constexpr uint64_t Page = 0x1000;
+	const std::vector<Range> written {{0x1100, 0x1104}, {0x1800, 0x2000}};
+	Check(ExposedGpuBytes::DispatchLeavesPage(std::vector<Range> {{0x1100, 0x1104}}, written,
+	                                          Page),
+	      "a page with only bytes the dispatch wrote goes back to the guest");
+	Check(ExposedGpuBytes::DispatchLeavesPage(
+	          std::vector<Range> {{0x1100, 0x1104}, {0x1800, 0x2000}}, written, Page),
+	      "two ranges of the dispatch in one page go back together");
+	Check(!ExposedGpuBytes::DispatchLeavesPage(
+	          std::vector<Range> {{0x1100, 0x1104}, {0x1200, 0x1208}}, written, Page),
+	      "a range from an older GPU write keeps the page with the GPU");
+	// The dispatch wrote next to an older range: the two are one held range.
+	Check(!ExposedGpuBytes::DispatchLeavesPage(std::vector<Range> {{0x10f0, 0x1104}}, written,
+	                                           Page),
+	      "a range that reaches outside what the dispatch wrote keeps the page with the GPU");
+	Check(!ExposedGpuBytes::DispatchLeavesPage(std::vector<Range> {{0x1000, 0x2000}},
+	                                           std::vector<Range> {{0x1000, 0x2000}}, Page),
+	      "a page that is all the GPU's stays with the GPU");
+	Check(!ExposedGpuBytes::DispatchLeavesPage({}, written, Page),
+	      "a page without GPU bytes needs nothing");
+}
+
 } // namespace
 
 int main() {
+	TestPageAfterADispatch();
 	TestNothingExposed();
 	TestUploadLeavesExposedBytesOut();
 	TestGuestWriteAfterTheValueArrived();

@@ -72,6 +72,15 @@ public:
 	[[nodiscard]] std::vector<GuestRange> SaveBufferRanges() const;
 	void                                  EnsureBuffers(std::span<const GuestRange> ranges);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// Around the recording of one dispatch. A dispatch can write a few bytes into a page that
+	// also holds the guest's own data, or commands the renderer reads next. Taking the page
+	// from the guest until someone faults on it makes that reader wait for the host GPU.
+	// So the small ranges the dispatch writes are fetched right after it: their pages go back
+	// to the guest at once, and the GPU's value is copied to guest memory when the host GPU
+	// has run the dispatch. See `ExposedGpuBytes` for what protects the bytes until then.
+	// GPU thread.
+	void                                       BeginGpuWrites();
+	void                                       ExposeGpuWrites();
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -103,6 +112,9 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// True when guest memory does not have the current value of some byte of the range yet:
+	// the host GPU holds it, or it is on its way. `ReadMemory` brings it. GPU thread.
+	[[nodiscard]] bool AwaitsGpuValue(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Moves into `ranges` the guest ranges that gained bytes the GPU has not seen since the last
@@ -174,11 +186,9 @@ private:
 	// True when the host GPU holds bytes of the range that guest memory may not have: through
 	// a page it took from the guest, or as exposed bytes.
 	[[nodiscard]] bool HasGpuBytes(uint64_t vaddr, uint64_t size);
-	// The guest touched `size` bytes at `vaddr`, in a page the GPU owns. When the GPU's bytes in
-	// that page are few and the guest touched none of them, gives the page back to the guest
-	// without waiting for the GPU: see `ExposedGpuBytes`. False when the page has to be read
-	// back the usual way.
-	[[nodiscard]] bool TryExposePage(uint64_t vaddr, uint64_t size);
+	// Gives `page` back to the guest when every byte the GPU holds in it comes from the
+	// dispatch that was just recorded, and the page has other bytes too: see `ExposeGpuWrites`.
+	void ExposePage(uint64_t page);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -191,6 +201,9 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	ExposedGpuBytes                                    m_exposed;
+	// Small ranges the dispatch that is being recorded writes.
+	std::vector<ExposedGpuBytes::Range>                m_dispatch_writes;
+	bool                                               m_collect_dispatch_writes = false;
 	MemoryTracker                                     m_memory_tracker;
 	WriteWatchSet                                      m_write_watches;
 	// See TakeCpuWrites. Written by the fault thread and the GPU thread.

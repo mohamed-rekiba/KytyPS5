@@ -133,36 +133,51 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
-bool BufferCache::TryExposePage(uint64_t vaddr, uint64_t size) {
-	// More GPU bytes than this in the page: the guest most likely wants them, and reads them
-	// after the GPU is done. Then the page is read back the usual way.
-	constexpr uint64_t MaxExposedBytes = 256;
-	// A fault names the first byte of an access, not its width. The widest load is 64 bytes.
-	constexpr uint64_t MaxAccessBytes = 64;
-	const auto         page           = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-	if (size == 0 || size > TRACKER_PAGE_SIZE || vaddr - page > TRACKER_PAGE_SIZE - size ||
-	    m_gpu_modified_ranges.Intersects(vaddr, std::max(size, MaxAccessBytes)) ||
-	    !m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
-		return false;
+void BufferCache::BeginGpuWrites() {
+	m_dispatch_writes.clear();
+	m_collect_dispatch_writes = true;
+}
+
+void BufferCache::ExposeGpuWrites() {
+	m_collect_dispatch_writes = false;
+	uint64_t last_page        = UINT64_MAX;
+	for (const auto& [begin, end]: m_dispatch_writes) {
+		for (auto page = Common::AlignDown(begin, TRACKER_PAGE_SIZE); page < end;
+		     page += TRACKER_PAGE_SIZE) {
+			if (page != last_page) {
+				ExposePage(page);
+				last_page = page;
+			}
+		}
+	}
+	m_dispatch_writes.clear();
+}
+
+void BufferCache::ExposePage(uint64_t page) {
+	if (!m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+		return;
 	}
 	const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
 	if (owner == nullptr || !*owner) {
-		return false;
+		return;
 	}
-	auto&                       buffer = m_slot_buffers[*owner];
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size = 0;
-	uint64_t                    gpu_bytes  = 0;
-	bool                        in_buffer  = true;
+	auto&                               buffer = m_slot_buffers[*owner];
+	std::vector<ExposedGpuBytes::Range> held;
+	bool                                in_buffer = true;
 	m_gpu_modified_ranges.ForEachInRange(
 	    page, TRACKER_PAGE_SIZE, [&](uint64_t start, uint64_t end) {
 		    in_buffer = in_buffer && buffer.IsInBounds(start, end - start);
-		    gpu_bytes += end - start;
-		    copies.emplace_back(start - buffer.CpuAddress(), total_size, end - start);
-		    total_size += Common::AlignUp(end - start, 64);
+		    held.emplace_back(start, end);
 	    });
-	if (copies.empty() || gpu_bytes > MaxExposedBytes || !in_buffer) {
-		return false;
+	if (!in_buffer ||
+	    !ExposedGpuBytes::DispatchLeavesPage(held, m_dispatch_writes, TRACKER_PAGE_SIZE)) {
+		return;
+	}
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size = 0;
+	for (const auto& [start, end]: held) {
+		copies.emplace_back(start - buffer.CpuAddress(), total_size, end - start);
+		total_size += Common::AlignUp(end - start, 64);
 	}
 	// The page goes back to the guest first: its bytes can be read after that.
 	m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
@@ -175,8 +190,12 @@ bool BufferCache::TryExposePage(uint64_t vaddr, uint64_t size) {
 		                                     {reinterpret_cast<const uint8_t*>(address), copy.size},
 		                                     m_scheduler.CurrentTick()));
 	}
+	const auto ids = exposures;
 	RecordDownload(buffer, std::move(copies), total_size, std::move(exposures));
-	return true;
+	// Recording the copy can submit the commands so far: the copy is in the work after them.
+	for (const auto id: ids) {
+		m_exposed.SetTick(id, m_scheduler.CurrentTick());
+	}
 }
 
 void BufferCache::RecordDownload(Buffer& buffer, std::vector<vk::BufferCopy> copies,
@@ -377,13 +396,6 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
-			return;
-		}
-		// The guest touched a neighbour of a few GPU-owned bytes: no need to wait for the GPU.
-		if (TryExposePage(vaddr, size)) {
-			if (is_write) {
-				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-			}
 			return;
 		}
 		// The caller wants guest memory to be current. For exposed bytes that means their
@@ -681,7 +693,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_write_watches.NotifyWrite(vaddr, size);
+		// Bytes an older command wrote and the guest never got: the guest may know that
+		// command has finished, so they stay with the GPU until someone reads them.
+		const bool held_before = m_gpu_modified_ranges.Intersects(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
+		if (m_collect_dispatch_writes && !held_before && size <= TRACKER_PAGE_SIZE) {
+			m_dispatch_writes.emplace_back(vaddr, vaddr + size);
+		}
 		// These bytes are the GPU's in the usual way again: their pages are taken from the
 		// guest. Exposed bytes next to them stay exposed.
 		m_exposed.Forget(vaddr, size);
@@ -826,6 +844,11 @@ void BufferCache::RequestFullSynchronization() {
 	std::scoped_lock lock {m_cpu_write_log_mutex};
 	m_cpu_write_log.clear();
 	m_cpu_writes_need_full_pass = true;
+}
+
+bool BufferCache::AwaitsGpuValue(uint64_t vaddr, uint64_t size) {
+	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	       m_exposed.PendingTick(vaddr, size).has_value();
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {

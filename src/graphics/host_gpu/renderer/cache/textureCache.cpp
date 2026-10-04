@@ -1188,7 +1188,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	bool read_back = !known || validate;
-	if (read_back && m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+	if (read_back && m_buffer_cache.AwaitsGpuValue(range.address, range.size)) {
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
@@ -1256,7 +1256,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				if (!kept) {
 					// The record is void: the remaining slices are decided from the real bytes.
 					known.reset();
-					if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+					if (m_buffer_cache.AwaitsGpuValue(range.address, range.size)) {
 						m_buffer_cache.ReadMemory(range.address, range.size, false);
 					}
 					read_back = true;

@@ -896,6 +896,19 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+void WaitForGpuBytes(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	    IsGpuAddressRange(vaddr, size) &&
+	    GetGpuResources().GetBufferCache().AwaitsGpuValue(vaddr, size)) {
+		GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);
+	}
+}
+
+void ReadForGpu(uint64_t vaddr, void* data, uint64_t size) {
+	WaitForGpuBytes(vaddr, size);
+	std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

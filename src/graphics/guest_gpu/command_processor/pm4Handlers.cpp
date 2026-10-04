@@ -1442,6 +1442,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
+	LibKernel::Memory::WaitForGpuBytes(addr, sizeof(uint32_t));
 	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
 		return payload_dw + exec_count;
 	}
@@ -1460,6 +1461,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 
 	auto* compare_addr = reinterpret_cast<const volatile uint64_t*>(
 	    (buffer[1] & 0xfffffff8u) | (static_cast<uint64_t>(buffer[2]) << 32u));
+	LibKernel::Memory::WaitForGpuBytes(reinterpret_cast<uint64_t>(compare_addr), sizeof(uint64_t));
 	uint64_t mask        = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
 	uint64_t reference   = buffer[5] | (static_cast<uint64_t>(buffer[6]) << 32u);
 	uint32_t mode        = buffer[0] & 0x3u;

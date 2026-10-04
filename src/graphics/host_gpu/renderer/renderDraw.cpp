@@ -844,6 +844,7 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	// Keep restart off in that case; fail if we actually find the value.
 	// Scan before preparing draw resources: readback can restart the command buffer.
 	EXIT_NOT_IMPLEMENTED(source.address == 0);
+	LibKernel::Memory::WaitForGpuBytes(source.address, source.size);
 	const auto* indices = reinterpret_cast<const uint8_t*>(source.address);
 	for (uint64_t offset = 0; offset < source.size; offset += element_size) {
 		uint32_t index = 0;

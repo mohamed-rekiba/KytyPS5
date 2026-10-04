@@ -18,12 +18,23 @@ namespace Libs::Graphics {
 //
 // The usual way to keep such bytes safe is to take the whole page away from the guest: its next
 // access faults, and the fault waits until the GPU's bytes are back in guest memory. That is right
-// when the guest wants those bytes. It is costly when a shader writes a counter of a few bytes
-// into a page of the guest's own variables: every read of a neighbour then waits for the GPU.
+// when the guest wants those bytes. It is costly when a shader writes a few bytes into a page of
+// the guest's own variables, or of commands the renderer reads next: every read of a neighbour
+// then waits for the GPU.
 //
-// So a few GPU-owned bytes can be exposed instead. The page goes back to the guest. The GPU's
-// value is copied to guest memory when the GPU has produced it, without anyone waiting, as on the
-// real machine. Until the GPU writes the bytes again, two rules keep both sides right:
+// So the small ranges a dispatch writes are exposed right after it. The page goes back to the
+// guest. The GPU's value is copied to guest memory when the host GPU has run the dispatch,
+// without anyone waiting. It is exposed at that point and not later, at the first fault: once
+// the guest knows a dispatch has finished, it can use the memory for something else, and a
+// value fetched after that would arrive on top of the guest's new bytes.
+// The renderer's own reads of bytes a shader can produce wait for a value that is on its way.
+//
+// Known gap: a label that the guest polls is written when its command is processed, not when
+// the host GPU has finished the commands before it. A guest that polls such a label and then
+// reads an exposed result can read the old value. Holding the label back until the host GPU is
+// there, or waiting for the values before each label, closes the gap, and both were measured to
+// cost far more frame time than exposing saves, because games pace themselves on these labels.
+// Until the GPU writes the bytes again, two rules keep both sides right:
 // - an upload of the page to the GPU leaves the exposed bytes out, so the GPU's value stays;
 // - when guest memory holds something else than it would without a guest write, the guest wrote
 //   the bytes itself: they are the guest's again, the upload takes them, and a GPU value that is
@@ -32,6 +43,29 @@ namespace Libs::Graphics {
 // `Land` may come from any thread; everything else is called on the GPU thread.
 class ExposedGpuBytes final {
 public:
+	// A range of guest bytes: [begin, end).
+	using Range = std::pair<uint64_t, uint64_t>;
+
+	// Whether a page can go back to the guest right after a dispatch. `held`: the parts of the
+	// page whose value only the host GPU has. `written`: the ranges the dispatch wrote.
+	// Yes when the dispatch wrote all of `held`, and the page has other bytes too. A part from
+	// an older GPU write keeps the page with the GPU: the guest may know that write has
+	// finished, so its value has to be in guest memory before the guest gets the page.
+	[[nodiscard]] static bool DispatchLeavesPage(std::span<const Range> held,
+	                                             std::span<const Range> written,
+	                                             uint64_t               page_size) {
+		uint64_t held_bytes = 0;
+		for (const auto& [begin, end]: held) {
+			if (!std::ranges::any_of(written, [&](const Range& range) {
+				    return begin >= range.first && end <= range.second;
+			    })) {
+				return false;
+			}
+			held_bytes += end - begin;
+		}
+		return held_bytes != 0 && held_bytes < page_size;
+	}
+
 	// The host GPU owns the bytes at `address`, and the guest can reach them without a fault.
 	// `guest_now` is what guest memory holds there at this moment. `tick` names the host work
 	// after which the GPU's value is copied to guest memory. Returns the name of this exposure,
@@ -47,6 +81,16 @@ public:
 		                      .reference = {guest_now.begin(), guest_now.end()}};
 		m_count.store(m_entries.size(), std::memory_order_relaxed);
 		return id;
+	}
+
+	// The copy of exposure `id` ended up in later host work than `Expose` was told.
+	void SetTick(uint64_t id, uint64_t tick) {
+		std::lock_guard lock(m_mutex);
+		for (auto& [address, entry]: m_entries) {
+			if (entry.id == id) {
+				entry.tick = tick;
+			}
+		}
 	}
 
 	// The bytes in the range are not exposed any more: the page was taken from the guest again,

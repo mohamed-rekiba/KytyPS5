@@ -364,6 +364,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	m_context.GetBufferCache().BeginGpuWrites();
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda(program.has_address_writes);
@@ -399,6 +400,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	m_context.GetBufferCache().ExposeGpuWrites();
 
 	// A uniform fill of a colour metadata block is the guest's fast clear. Record the code so the
 	// first draw on that target needs no GPU read-back to find it.
@@ -433,6 +435,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	m_context.GetBufferCache().BeginGpuWrites();
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
@@ -471,6 +474,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	m_context.GetBufferCache().ExposeGpuWrites();
 }
 
 } // namespace Libs::Graphics
