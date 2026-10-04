@@ -367,6 +367,8 @@ static int audioout2_field_handle(AudioOut2ContextHandle ctx) {
 	return state != nullptr ? state->field_handle : 0;
 }
 
+static constexpr size_t FieldOutputChannels = 8;
+
 static bool audioout2_port_carries_field(const AudioOut2PortStateEntry& state) {
 	return state.field_channel >= 0 && state.audio_format == AudioInternal::Format::FloatMono &&
 	       !state.pcm_data.empty();
@@ -399,6 +401,7 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	const int                        field_handle = audioout2_field_handle(ctx);
 	std::vector<Ambisonics::Channel> field;
 	std::vector<float>               stereo;
+	std::vector<float>               bed;
 	size_t                           frames = 0;
 
 	Common::LockGuard lock(g_audioout2_port_mutex);
@@ -421,7 +424,15 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	if (!field.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
 		stereo.resize(frames * 2);
 		Ambisonics::DecodeToStereo(field, frames, stereo.data());
-		params.push_back(AudioInternal::OutputParam {field_handle, stereo.data()});
+		// The field goes out as the front pair of an 8-channel stream, like the game's own
+		// 8-channel bed. The host scales 8 channels down for the speakers that are there; a
+		// plain stereo stream would skip that step and come out much louder than the bed.
+		bed.assign(frames * FieldOutputChannels, 0.0f);
+		for (size_t i = 0; i < frames; i++) {
+			bed[i * FieldOutputChannels]     = stereo[i * 2];
+			bed[i * FieldOutputChannels + 1] = stereo[i * 2 + 1];
+		}
+		params.push_back(AudioInternal::OutputParam {field_handle, bed.data()});
 	}
 
 	if (!params.empty()) {
@@ -689,7 +700,7 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	    audioout2_port_type_is_object(params->port_type) && audioout2_field_handle(ctx) == 0) {
 		int field_handle =
 		    AudioInternal::AudioOutOpen(AUDIO_OUT_PORT_TYPE_MAIN, samples_num,
-		                                params->sampling_freq, AudioInternal::Format::FloatStereo);
+		                                params->sampling_freq, AudioInternal::Format::Float8ChStd);
 		g_audioout2_context_mutex.Lock();
 		if (auto* state = audioout2_find_context_locked(ctx);
 		    state != nullptr && state->field_handle == 0) {

@@ -458,16 +458,19 @@ void TestAmbisonicPortsAreDecodedToStereo() {
 		      "setting ambisonic attributes failed");
 	}
 
-	const auto stereo_bytes = 512 * 2 * sizeof(float);
-	CaptureOutputPcm(stereo_bytes);
+	// The decoded field is the front pair of an 8-channel stream, like the game's own bed.
+	const auto bed_bytes = 512 * 8 * sizeof(float);
+	CaptureOutputPcm(bed_bytes);
 	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "ambisonic push failed");
 	const auto output = OutputPcm();
 	Check(output.size() == 1, "the ambisonic field did not reach the device as one stream");
-	std::vector<float> stereo(512 * 2);
-	std::memcpy(stereo.data(), output[0].data(), stereo_bytes);
+	std::vector<float> bed(512 * 8);
+	std::memcpy(bed.data(), output[0].data(), bed_bytes);
 	// left = gain * (W + Y) / 2, right = gain * (W - Y) / 2
-	Check(stereo[0] == 0.25f && stereo[1] == 0.0f && stereo[1022] == 0.25f && stereo[1023] == 0.0f,
-	      "a sound on the left was not decoded to the left output");
+	Check(bed[0] == 0.25f && bed[1] == 0.0f && bed[511 * 8] == 0.25f && bed[511 * 8 + 1] == 0.0f,
+	      "a sound on the left was not decoded to the front left channel");
+	Check(std::all_of(bed.begin() + 2, bed.begin() + 8, [](float v) { return v == 0.0f; }),
+	      "the decoded field leaked into the other channels");
 
 	CaptureOutputPcm(0);
 	for (const auto port: ports) {
