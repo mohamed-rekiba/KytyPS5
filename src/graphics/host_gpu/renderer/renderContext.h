@@ -27,6 +27,7 @@ class VideoOutDriver;
 namespace Libs::Graphics {
 
 class GuestGpu;
+class GuestGpuObserver;
 
 class RenderContext {
 public:
@@ -51,6 +52,10 @@ public:
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Attaches whoever observes the guest GPU, or nobody. The renderer keeps its own pointer:
+	// its threads call the observer while the guest GPU is being shut down.
+	void                            SetObserver(GuestGpuObserver* observer) noexcept;
+	[[nodiscard]] GuestGpuObserver* Observer() const noexcept { return m_observer.load(); }
 	// A draw or a dispatch was handed to the host GPU: tells whoever observes the guest GPU.
 	void               NoteHostWork();
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
@@ -88,7 +93,8 @@ private:
 	RangeSet                  m_mapped_ranges;
 	std::atomic<uint64_t>     m_mapping_generation {0};
 	std::vector<GuestRange>   m_bda_cpu_writes; // scratch for PrepareBda
-	std::unique_ptr<GuestGpu> m_gpu;
+	std::unique_ptr<GuestGpu>      m_gpu;
+	std::atomic<GuestGpuObserver*> m_observer {nullptr};
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;

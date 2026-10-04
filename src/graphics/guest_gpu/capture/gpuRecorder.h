@@ -90,7 +90,7 @@ private:
 	// ranges can be read by now.
 	void FollowMapping();
 	// Stores the pages whose bytes differ from the last stored ones. `initial`: every page that
-	// is not zero is stored, and bytes the GPU holds are read back first.
+	// is not zero is stored.
 	// False when the capture was abandoned: nothing more may be written.
 	[[nodiscard]] bool WriteChangedPages(bool initial);
 	void ScanPages(const Segment& segment, uint64_t offset, uint64_t bytes, bool initial,
@@ -122,6 +122,7 @@ private:
 	uint32_t                                 m_skips = 0;
 	uint32_t                            m_scans = 0;
 	uint32_t                                 m_read_points = 0;
+	uint64_t                                 m_page_records = 0; // page records written so far
 	std::chrono::steady_clock::duration m_scan_time {};
 	std::mutex                          m_writer_mutex; // page records come from several threads
 	// Guest threads queue their writes here; the GPU thread stores them at the next scan.

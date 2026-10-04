@@ -965,7 +965,9 @@ bool Play(RenderContext& renderer, const std::filesystem::path& path, uint32_t l
 	for (size_t i = 0, frame = 0; i < frames.size(); i++) {
 		const auto& item = frames[i];
 		bool        ok   = true;
-		if (item.type == RecordType::WaitBytes) {
+		if (frame >= frame_count) {
+			ok = false; // a record after the last frame end
+		} else if (item.type == RecordType::WaitBytes) {
 			PlayerObserver::RecordedWait wait;
 			ok          = Reader::Bytes(item, wait.address, wait.bytes, wait.had_blocked);
 			wait.update = &updates[i];
@@ -1001,7 +1003,7 @@ bool Play(RenderContext& renderer, const std::filesystem::path& path, uint32_t l
 	auto& observer =
 	    *new PlayerObserver(renderer, mapping, std::move(waits), std::move(cached_buffers),
 	                        recorded_pictures, std::move(image_checks));
-	gpu.SetObserver(&observer);
+	renderer.SetObserver(&observer);
 	Report(fmt::format("{} frame(s), {} pass(es)", frame_count, loops));
 	if (frame_count == 1) {
 		Report("the capture has one frame, so its time includes the upload of every picture the "
@@ -1185,7 +1187,7 @@ bool Play(RenderContext& renderer, const std::filesystem::path& path, uint32_t l
 			                   same_as_first, compared));
 		}
 	}
-	gpu.SetObserver(nullptr);
+	renderer.SetObserver(nullptr);
 	return true;
 }
 

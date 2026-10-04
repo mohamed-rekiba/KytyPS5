@@ -73,7 +73,7 @@ void Initialize() {
 		    new Capture::Recorder(*g_renderer, capture_file, Config::GetGpuCaptureFirstFrame(),
 		                          Config::GetGpuCaptureFrames(), Config::GetGpuCaptureTriggerFile(),
 		                          Config::GetGpuCaptureChecks());
-		g_renderer->GetGpu().SetObserver(recorder);
+		g_renderer->SetObserver(recorder);
 	}
 }
 
@@ -84,7 +84,7 @@ RenderContext& GetRenderContext() {
 
 void Shutdown() {
 	EXIT_IF(g_renderer == nullptr);
-	g_renderer->GetGpu().SetObserver(nullptr);
+	g_renderer->SetObserver(nullptr);
 	g_renderer->ShutdownGpu();
 	VideoOut::VideoOutShutdown();
 	WindowShutdown();

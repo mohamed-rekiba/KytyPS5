@@ -267,13 +267,13 @@ GuestRange BufferCache::InvalidateWrittenMemory(uint64_t fault_vaddr, bool windo
 }
 
 void BufferCache::NoteHostWrite(uint64_t vaddr, uint64_t size) {
-	if (auto* observer = m_scheduler.Context().GetGpu().Observer()) {
+	if (auto* observer = m_scheduler.Context().Observer()) {
 		observer->OnGuestWrite(GuestGpuObserver::WriteTarget::Host, vaddr, size);
 	}
 }
 
 void BufferCache::NoteGuestRead(uint64_t vaddr, uint64_t size) {
-	if (auto* observer = m_scheduler.Context().GetGpu().Observer()) {
+	if (auto* observer = m_scheduler.Context().Observer()) {
 		observer->OnGuestRead(vaddr, size);
 	}
 }
@@ -620,6 +620,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
+	NoteGuestRead(vaddr, size);
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
 	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");

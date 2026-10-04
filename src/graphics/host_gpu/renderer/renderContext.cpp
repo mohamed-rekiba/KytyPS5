@@ -66,7 +66,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		const auto         written = m_buffer_cache.InvalidateWrittenMemory(
 		    fault_vaddr, IsMapped(Common::AlignDown(fault_vaddr, window), window));
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-		if (auto* observer = m_gpu != nullptr ? m_gpu->Observer() : nullptr) {
+		if (auto* observer = Observer()) {
 			observer->OnGuestWrite(GuestGpuObserver::WriteTarget::Buffers, written.address,
 			                       written.size);
 			observer->OnGuestWrite(GuestGpuObserver::WriteTarget::Images, fault_vaddr, fault_size);
@@ -83,14 +83,19 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
-	if (auto* observer = m_gpu != nullptr ? m_gpu->Observer() : nullptr) {
+	if (auto* observer = Observer()) {
 		observer->OnGuestWrite(GuestGpuObserver::WriteTarget::Both, vaddr, size);
 	}
 	return true;
 }
 
+void RenderContext::SetObserver(GuestGpuObserver* observer) noexcept {
+	m_observer.store(observer);
+	GetGpu().SetObserver(observer);
+}
+
 void RenderContext::NoteHostWork() {
-	if (auto* observer = m_gpu != nullptr ? m_gpu->Observer() : nullptr) {
+	if (auto* observer = Observer()) {
 		observer->OnHostWork();
 	}
 }

@@ -346,6 +346,7 @@ void Recorder::FlushPages(std::vector<uint64_t>& addresses, std::vector<uint8_t>
 	const auto      packed = Writer::PackPages(addresses, data);
 	std::lock_guard lock(m_writer_mutex);
 	m_writer.WritePacked(packed);
+	m_page_records++;
 	addresses.clear();
 	data.clear();
 }
@@ -531,6 +532,7 @@ void Recorder::OnGuestRead(uint64_t address, uint64_t size) {
 	// the player can give the same draw the same bytes.
 	std::vector<uint64_t> addresses;
 	std::vector<uint8_t>  data;
+	const uint64_t        records_before = m_page_records;
 	const uint64_t        begin   = address & ~(PageSize - 1);
 	const uint64_t        end     = (address + size + PageSize - 1) & ~(PageSize - 1);
 	auto                  segment = std::upper_bound(
@@ -541,11 +543,11 @@ void Recorder::OnGuestRead(uint64_t address, uint64_t size) {
 		const uint64_t to   = std::min(end, segment->address + segment->size);
 		ScanPages(*segment, from - segment->address, to - from, false, addresses, data);
 	}
-	if (addresses.empty()) {
+	FlushPages(addresses, data);
+	if (m_page_records == records_before) {
 		return;
 	}
 	const auto position = g_work.Position() - m_scan_position.load(std::memory_order_relaxed);
-	FlushPages(addresses, data);
 	if (!WriteGuestWrites()) {
 		Abandon("more guest writes between two scans than the recorder can hold");
 		return;
