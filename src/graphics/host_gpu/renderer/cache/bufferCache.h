@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "graphics/host_gpu/exposedGpuBytes.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -164,6 +165,16 @@ private:
 	void NoteGuestRead(uint64_t vaddr, uint64_t size);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// Records the copy of `copies` from `buffer` to guest memory. The bytes arrive when the host
+	// GPU has finished the commands recorded so far; nobody waits here. `exposed`: the ranges
+	// are exposed GPU bytes, which need to know the value that arrived.
+	void RecordDownload(Buffer& buffer, std::vector<vk::BufferCopy> copies, uint64_t total_size,
+	                    bool exposed);
+	// The guest touched `size` bytes at `vaddr`, in a page the GPU owns. When the GPU's bytes in
+	// that page are few and the guest touched none of them, gives the page back to the guest
+	// without waiting for the GPU: see `ExposedGpuBytes`. False when the page has to be read
+	// back the usual way.
+	[[nodiscard]] bool TryExposePage(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -175,6 +186,7 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	ExposedGpuBytes                                    m_exposed;
 	MemoryTracker                                     m_memory_tracker;
 	WriteWatchSet                                      m_write_watches;
 	// See TakeCpuWrites. Written by the fault thread and the GPU thread.

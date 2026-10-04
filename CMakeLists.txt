@@ -557,6 +557,11 @@ add_executable(metadata_fill_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/MetadataFillTests.cpp"
 )
 target_include_directories(metadata_fill_tests PRIVATE ${inc_headers})
+add_executable(exposed_gpu_bytes_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ExposedGpuBytesTests.cpp"
+)
+target_link_libraries(exposed_gpu_bytes_tests common)
+target_include_directories(exposed_gpu_bytes_tests PRIVATE ${inc_headers})
 add_executable(fence_retirement_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/FenceRetirementTests.cpp"
 )
@@ -624,6 +629,7 @@ if(BUILD_TESTING)
 	add_test(NAME device_suitability COMMAND $<TARGET_FILE:device_suitability_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME metadata_fill COMMAND $<TARGET_FILE:metadata_fill_tests>)
+	add_test(NAME exposed_gpu_bytes COMMAND $<TARGET_FILE:exposed_gpu_bytes_tests>)
 	add_test(NAME fence_retirement COMMAND $<TARGET_FILE:fence_retirement_tests>)
 	add_test(NAME gpu_capture_file COMMAND $<TARGET_FILE:gpu_capture_file_tests>)
 	add_test(NAME gpu_replay_logic COMMAND $<TARGET_FILE:gpu_replay_logic_tests>)
@@ -703,6 +709,7 @@ if(BUILD_TESTING)
 		device_suitability_tests
 		image_page_table_tests
 		metadata_fill_tests
+		exposed_gpu_bytes_tests
 		fence_retirement_tests
 		gpu_capture_file_tests
 		gpu_replay_logic_tests

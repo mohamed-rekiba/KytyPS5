@@ -103,6 +103,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
 	}
+	// The GPU's value of exposed bytes goes with the buffer. Guest memory has the copy.
+	m_exposed.Forget(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size());
 	Unregister(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
@@ -129,8 +131,53 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	RecordDownload(buffer, std::move(copies), total_size, false);
+	return true;
+}
 
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+bool BufferCache::TryExposePage(uint64_t vaddr, uint64_t size) {
+	// More GPU bytes than this in the page: the guest most likely wants them, and reads them
+	// after the GPU is done. Then the page is read back the usual way.
+	constexpr uint64_t MaxExposedBytes = 256;
+	const auto         page            = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	if (size == 0 || size > TRACKER_PAGE_SIZE || vaddr - page > TRACKER_PAGE_SIZE - size ||
+	    m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	    !m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		return false;
+	}
+	auto&                       buffer = m_slot_buffers[*owner];
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size = 0;
+	uint64_t                    gpu_bytes  = 0;
+	bool                        in_buffer  = true;
+	m_gpu_modified_ranges.ForEachInRange(
+	    page, TRACKER_PAGE_SIZE, [&](uint64_t start, uint64_t end) {
+		    in_buffer = in_buffer && buffer.IsInBounds(start, end - start);
+		    gpu_bytes += end - start;
+		    copies.emplace_back(start - buffer.CpuAddress(), total_size, end - start);
+		    total_size += Common::AlignUp(end - start, 64);
+	    });
+	if (copies.empty() || gpu_bytes > MaxExposedBytes || !in_buffer) {
+		return false;
+	}
+	for (const auto& copy: copies) {
+		const auto address = buffer.CpuAddress() + copy.srcOffset;
+		m_gpu_modified_ranges.Subtract(address, copy.size);
+		m_exposed.Expose(address, copy.size);
+	}
+	RecordDownload(buffer, std::move(copies), total_size, true);
+	m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+	return true;
+}
+
+void BufferCache::RecordDownload(Buffer& buffer, std::vector<vk::BufferCopy> copies,
+                                 uint64_t total_size, bool exposed) {
+	const auto buffer_address = buffer.CpuAddress();
+	auto [mapped, offset]     = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
 		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
@@ -173,16 +220,19 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
+	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address, exposed,
 	                                    copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			const auto* bytes = mapped + (copy.dstOffset - offset);
+			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset, bytes,
+			                                      copy.size);
 			NoteHostWrite(buffer_address + copy.srcOffset, copy.size);
+			if (exposed) {
+				m_exposed.Landed(buffer_address + copy.srcOffset, {bytes, copy.size});
+			}
 		}
 	});
-	return true;
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -304,6 +354,7 @@ void BufferCache::DiscardGpuWrites() {
 		m_memory_tracker.MarkRegionAsCpuModified(range.address, range.size);
 		m_gpu_modified_ranges.Subtract(range.address, range.size);
 	}
+	m_exposed.Clear();
 	RequestFullSynchronization();
 }
 
@@ -315,6 +366,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
+			return;
+		}
+		// The guest touched a neighbour of a few GPU-owned bytes: no need to wait for the GPU.
+		if (TryExposePage(vaddr, size)) {
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
@@ -452,8 +510,16 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
+		    // Exposed GPU bytes are newer in the buffer than in guest memory: leave them out.
+		    m_exposed.ForEachUploadPart(
+		        address, bytes,
+		        [](uint64_t from, std::span<uint8_t> out) {
+			        std::memcpy(out.data(), reinterpret_cast<const void*>(from), out.size());
+		        },
+		        [&](uint64_t from, uint64_t count) {
+			        copies.emplace_back(total_size, buffer.Offset(from), count);
+			        total_size += count;
+		        });
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
@@ -577,7 +643,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	// nearly all under 64 KiB.
 	constexpr uint64_t StreamUploadLimit = 4 * CACHING_PAGESIZE;
 	if (!is_written && size <= StreamUploadLimit &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
+	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) && !m_exposed.Intersects(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
@@ -599,6 +665,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_write_watches.NotifyWrite(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
+		// The page is the GPU's again, and so are these bytes in the usual way.
+		m_exposed.Forget(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -704,7 +772,7 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
-	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+	return m_memory_tracker.IsRegionGpuModified(vaddr, size) || m_exposed.Intersects(vaddr, size);
 }
 
 void BufferCache::RecordCpuWrite(uint64_t vaddr, uint64_t size) {
