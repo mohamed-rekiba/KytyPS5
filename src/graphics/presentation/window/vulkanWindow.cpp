@@ -874,6 +874,26 @@ void WindowContext::CreateVulkan() {
 		LOGF("Vulkan instance: enabled %s\n", VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 	}
 #endif
+	// MoltenVK turns the Vulkan commands of a command buffer into Metal commands when the buffer
+	// is submitted, by default on the thread that submits. That thread is the GPU thread, which
+	// has the next frame to record. Let MoltenVK do it on its own queue thread instead. The
+	// setting is addressed to MoltenVK by name; any other driver ignores it.
+	static const vk::Bool32   synchronous_queue_submits = VK_FALSE;
+	const vk::LayerSettingEXT layer_settings[]          = {
+	    {"MoltenVK", "MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", vk::LayerSettingTypeEXT::eBool32, 1,
+	     &synchronous_queue_submits},
+	};
+	vk::LayerSettingsCreateInfoEXT layer_settings_info {};
+	if (HasExtension(r.available_extensions, VK_EXT_LAYER_SETTINGS_EXTENSION_NAME)) {
+		if (!HasExtension(r.required_extensions, VK_EXT_LAYER_SETTINGS_EXTENSION_NAME)) {
+			r.required_extensions.push_back(VK_EXT_LAYER_SETTINGS_EXTENSION_NAME);
+		}
+		layer_settings_info.settingCount = static_cast<uint32_t>(std::size(layer_settings));
+		layer_settings_info.pSettings    = layer_settings;
+		layer_settings_info.pNext        = inst_info.pNext;
+		inst_info.pNext                  = &layer_settings_info;
+		LOGF("Vulkan instance: enabled %s\n", VK_EXT_LAYER_SETTINGS_EXTENSION_NAME);
+	}
 	inst_info.pApplicationInfo        = &app_info;
 	inst_info.enabledExtensionCount   = static_cast<uint32_t>(r.required_extensions.size());
 	inst_info.ppEnabledExtensionNames = r.required_extensions.data();
