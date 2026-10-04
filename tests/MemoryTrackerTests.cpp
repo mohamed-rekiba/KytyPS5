@@ -29,6 +29,7 @@
 #include <csignal>
 #include <limits.h>
 #include <map>
+#include <set>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -125,10 +126,26 @@ std::map<void *, size_t> &AllocationSizes() {
   return sizes;
 }
 
+#if defined(__APPLE__)
+// Allocations that replaced a part of the linked reservation of guest ranges.
+std::set<void *> &FixedAllocations() {
+  static std::set<void *> fixed;
+  return fixed;
+}
+#endif
+
 void *VirtualAlloc(void *address, size_t size, DWORD, uint32_t protection) {
 #if defined(__APPLE__)
   mach_vm_address_t raw_address = reinterpret_cast<mach_vm_address_t>(address);
-  const auto flags = address != nullptr ? VM_FLAGS_FIXED : VM_FLAGS_ANYWHERE;
+  // The fixed test addresses lie in the guest ranges. When the binary owns
+  // them from load (the linker reserves them, so the system loader cannot land
+  // there), a fixed allocation replaces a part of that reservation.
+#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
+  const int fixed = VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE;
+#else
+  const int fixed = VM_FLAGS_FIXED;
+#endif
+  const auto flags = address != nullptr ? fixed : VM_FLAGS_ANYWHERE;
   if (mach_vm_allocate(mach_task_self(), &raw_address, size, flags) !=
       KERN_SUCCESS) {
     return nullptr;
@@ -141,6 +158,11 @@ void *VirtualAlloc(void *address, size_t size, DWORD, uint32_t protection) {
   }
   void *raw = reinterpret_cast<void *>(raw_address);
   AllocationSizes()[raw] = size;
+#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
+  if (address != nullptr) {
+    FixedAllocations().insert(raw);
+  }
+#endif
   return raw;
 #else
   const int extra = address != nullptr ? MAP_FIXED_NOREPLACE : 0;
@@ -161,11 +183,21 @@ int VirtualFree(void *address, size_t, DWORD) {
     return 0;
   }
 #if defined(__APPLE__)
-  const int ok = mach_vm_deallocate(mach_task_self(),
-                                    reinterpret_cast<mach_vm_address_t>(address),
-                                    it->second) == KERN_SUCCESS
-                     ? 1
-                     : 0;
+  int ok = 0;
+  if (FixedAllocations().erase(address) != 0) {
+    // Give the range back to the reservation. A hole would be free for the
+    // system to use, for a thread stack for example.
+    ok = ::mmap(address, it->second, PROT_NONE,
+                MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == address
+             ? 1
+             : 0;
+  } else {
+    ok = mach_vm_deallocate(mach_task_self(),
+                            reinterpret_cast<mach_vm_address_t>(address),
+                            it->second) == KERN_SUCCESS
+             ? 1
+             : 0;
+  }
 #else
   const int ok = ::munmap(address, it->second) == 0 ? 1 : 0;
 #endif

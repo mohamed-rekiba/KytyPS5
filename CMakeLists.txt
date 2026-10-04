@@ -416,6 +416,8 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
+# The test maps fixed guest addresses: the binary must own those ranges from load.
+configure_macos_guest_address_space(page_manager_tests)
 
 add_executable(archive_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ArchiveFileTests.cpp"
@@ -451,6 +453,8 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
+# The test maps fixed guest addresses: the binary must own those ranges from load.
+configure_macos_guest_address_space(memory_tracker_tests)
 
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"

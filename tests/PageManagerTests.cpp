@@ -120,7 +120,15 @@ int VirtualFree(void *address, size_t, DWORD) {
   if (it == sizes.end()) {
     return 0;
   }
-#if defined(__APPLE__)
+#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
+  // Give the range back to the reservation. A hole would be free for the
+  // system to use, for a thread stack for example.
+  const int ok = ::mmap(address, it->second, PROT_NONE,
+                        MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1,
+                        0) == address
+                     ? 1
+                     : 0;
+#elif defined(__APPLE__)
   const int ok = mach_vm_deallocate(mach_task_self(),
                                     reinterpret_cast<mach_vm_address_t>(address),
                                     it->second) == KERN_SUCCESS
@@ -183,6 +191,19 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
                         &old_protection) != 0;
 }
 
+#if defined(__APPLE__)
+// The test addresses lie in the guest ranges. When the binary owns them from
+// load (the linker reserves them, so the system loader cannot land there), a
+// fixed allocation replaces a part of that reservation.
+int FixedFlags() {
+#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
+  return VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE;
+#else
+  return VM_FLAGS_FIXED;
+#endif
+}
+#endif
+
 uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE,
                   uintptr_t test_address = 0x0000000200010000ull) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -193,7 +214,7 @@ uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE,
         "fixed low VirtualAlloc failed");
 #elif defined(__APPLE__)
   mach_vm_address_t raw = test_address;
-  Check(mach_vm_allocate(mach_task_self(), &raw, size, VM_FLAGS_FIXED) ==
+  Check(mach_vm_allocate(mach_task_self(), &raw, size, FixedFlags()) ==
             KERN_SUCCESS &&
             mach_vm_protect(mach_task_self(), raw, size, false,
                             static_cast<vm_prot_t>(ToHostProt(protection))) ==
