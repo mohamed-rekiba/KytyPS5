@@ -563,7 +563,7 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 			// Keep the stream alive against close and volume changes.
 			Common::LockGuard lock(m_mutex);
 			controller_queued_us = Controller::DualSenseHaptics::Queue(
-			    port.haptics, Controller::GetActiveControllerId(), params[i].data, port.samples_num,
+			    port.haptics, Controller::GetGamepadOfPlayerOne(), params[i].data, port.samples_num,
 			    static_cast<uint32_t>(port.channels_num), FormatIsFloat(port.format), port.volume);
 		}
 		if (controller_queued_us == 0) {

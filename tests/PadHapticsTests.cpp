@@ -209,7 +209,7 @@ bool SendGamepadEffect(SDL_Gamepad* pad, const void* data, int size) {
 #undef SDL_GetGamepadConnectionState
 
 namespace Libs::Controller {
-int GetActiveControllerId() {
+int GetGamepadOfPlayerOne() {
 	return active_controller;
 }
 } // namespace Libs::Controller
