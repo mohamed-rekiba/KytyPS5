@@ -166,10 +166,14 @@ private:
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Records the copy of `copies` from `buffer` to guest memory. The bytes arrive when the host
-	// GPU has finished the commands recorded so far; nobody waits here. `exposed`: the ranges
-	// are exposed GPU bytes, which need to know the value that arrived.
+	// GPU has finished the commands recorded so far; nobody waits here. `exposures`: empty, or
+	// for each copy the exposure of its bytes; such a copy only arrives where that exposure
+	// still stands.
 	void RecordDownload(Buffer& buffer, std::vector<vk::BufferCopy> copies, uint64_t total_size,
-	                    bool exposed);
+	                    std::vector<uint64_t> exposures);
+	// True when the host GPU holds bytes of the range that guest memory may not have: through
+	// a page it took from the guest, or as exposed bytes.
+	[[nodiscard]] bool HasGpuBytes(uint64_t vaddr, uint64_t size);
 	// The guest touched `size` bytes at `vaddr`, in a page the GPU owns. When the GPU's bytes in
 	// that page are few and the guest touched none of them, gives the page back to the guest
 	// without waiting for the GPU: see `ExposedGpuBytes`. False when the page has to be read

@@ -103,8 +103,6 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
 	}
-	// The GPU's value of exposed bytes goes with the buffer. Guest memory has the copy.
-	m_exposed.Forget(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size());
 	Unregister(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
@@ -131,7 +129,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
-	RecordDownload(buffer, std::move(copies), total_size, false);
+	RecordDownload(buffer, std::move(copies), total_size, {});
 	return true;
 }
 
@@ -139,9 +137,11 @@ bool BufferCache::TryExposePage(uint64_t vaddr, uint64_t size) {
 	// More GPU bytes than this in the page: the guest most likely wants them, and reads them
 	// after the GPU is done. Then the page is read back the usual way.
 	constexpr uint64_t MaxExposedBytes = 256;
-	const auto         page            = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	// A fault names the first byte of an access, not its width. The widest load is 64 bytes.
+	constexpr uint64_t MaxAccessBytes = 64;
+	const auto         page           = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	if (size == 0 || size > TRACKER_PAGE_SIZE || vaddr - page > TRACKER_PAGE_SIZE - size ||
-	    m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	    m_gpu_modified_ranges.Intersects(vaddr, std::max(size, MaxAccessBytes)) ||
 	    !m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
 		return false;
 	}
@@ -164,18 +164,23 @@ bool BufferCache::TryExposePage(uint64_t vaddr, uint64_t size) {
 	if (copies.empty() || gpu_bytes > MaxExposedBytes || !in_buffer) {
 		return false;
 	}
+	// The page goes back to the guest first: its bytes can be read after that.
+	m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+	std::vector<uint64_t> exposures;
+	exposures.reserve(copies.size());
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.srcOffset;
 		m_gpu_modified_ranges.Subtract(address, copy.size);
-		m_exposed.Expose(address, copy.size);
+		exposures.push_back(m_exposed.Expose(address,
+		                                     {reinterpret_cast<const uint8_t*>(address), copy.size},
+		                                     m_scheduler.CurrentTick()));
 	}
-	RecordDownload(buffer, std::move(copies), total_size, true);
-	m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+	RecordDownload(buffer, std::move(copies), total_size, std::move(exposures));
 	return true;
 }
 
 void BufferCache::RecordDownload(Buffer& buffer, std::vector<vk::BufferCopy> copies,
-                                 uint64_t total_size, bool exposed) {
+                                 uint64_t total_size, std::vector<uint64_t> exposures) {
 	const auto buffer_address = buffer.CpuAddress();
 	auto [mapped, offset]     = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -220,16 +225,22 @@ void BufferCache::RecordDownload(Buffer& buffer, std::vector<vk::BufferCopy> cop
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address, exposed,
+	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
+	                                    exposures = std::move(exposures),
 	                                    copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
-		for (const auto& copy: copies) {
-			const auto* bytes = mapped + (copy.dstOffset - offset);
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset, bytes,
-			                                      copy.size);
-			NoteHostWrite(buffer_address + copy.srcOffset, copy.size);
-			if (exposed) {
-				m_exposed.Landed(buffer_address + copy.srcOffset, {bytes, copy.size});
+		const auto write = [this](uint64_t address, std::span<const uint8_t> bytes) {
+			Libs::LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			NoteHostWrite(address, bytes.size());
+		};
+		for (size_t i = 0; i < copies.size(); i++) {
+			const auto&                    copy    = copies[i];
+			const auto                     address = buffer_address + copy.srcOffset;
+			const std::span<const uint8_t> bytes {mapped + (copy.dstOffset - offset), copy.size};
+			if (exposures.empty()) {
+				write(address, bytes);
+			} else {
+				m_exposed.Land(exposures[i], address, bytes, write);
 			}
 		}
 	});
@@ -374,6 +385,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			}
 			return;
+		}
+		// The caller wants guest memory to be current. For exposed bytes that means their
+		// value has arrived.
+		if (const auto tick = m_exposed.PendingTick(vaddr, size)) {
+			m_scheduler.Wait(*tick);
+			m_scheduler.WaitPriorityOperations(*tick);
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
@@ -665,7 +682,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_write_watches.NotifyWrite(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
-		// The page is the GPU's again, and so are these bytes in the usual way.
+		// These bytes are the GPU's in the usual way again: their pages are taken from the
+		// guest. Exposed bytes next to them stay exposed.
 		m_exposed.Forget(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -684,7 +702,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 			return {&buffer, buffer.Offset(vaddr)};
 		}
 	}
-	if (IsRegionGpuModified(vaddr, size)) {
+	if (HasGpuBytes(vaddr, size)) {
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
@@ -712,7 +730,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
-	if (!IsRegionGpuModified(vaddr, size)) {
+	if (!HasGpuBytes(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
@@ -737,8 +755,8 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
-	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
-	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+	if (src_memory && dst_memory && !HasGpuBytes(dst_vaddr, size) &&
+	    !HasGpuBytes(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;
@@ -772,6 +790,10 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
+	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+bool BufferCache::HasGpuBytes(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size) || m_exposed.Intersects(vaddr, size);
 }
 
@@ -807,7 +829,7 @@ void BufferCache::RequestFullSynchronization() {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	return m_gpu_modified_ranges.Intersects(vaddr, size) || m_exposed.Intersects(vaddr, size);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -834,6 +856,10 @@ void BufferCache::RunGarbageCollector() {
 		EXIT_IF(buffer.is_deleted);
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
+		// A buffer with exposed bytes is the only holder of their value: it stays.
+		if (m_exposed.Intersects(buffer.CpuAddress(), buffer.Size())) {
+			return false;
+		}
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty && !aggressive) {
 			return false;
