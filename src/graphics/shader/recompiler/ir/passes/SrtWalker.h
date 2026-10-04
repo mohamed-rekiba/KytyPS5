@@ -21,6 +21,11 @@ struct SrtRuntime {
 
 enum class RuntimeValueType { Any, Integer };
 
+// What ResourcePlan::active_sources says about a descriptor source after a walk.
+inline constexpr uint8_t SourceInactive = 0; // its block is not reached
+inline constexpr uint8_t SourceMaybe    = 1; // reached only past a branch with an unknown condition
+inline constexpr uint8_t SourceCertain  = 2;
+
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 // Uses the strict reader for values that affect shader specialization.

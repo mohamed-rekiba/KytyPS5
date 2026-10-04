@@ -2868,9 +2868,13 @@ void TestGuardedScalarDescriptorReads() {
         Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 0 &&
                   std::ranges::all_of(snapshot.flattened_srt, [](auto word) { return word == 0; }),
               "disabled feature speculatively dereferenced its null BVH table");
+        // The feature is on, but whether the block runs still depends on a value only the
+        // shader has. Its table cannot be read: that is not an error, since the game may never
+        // take the branch. The read is tried, and the block's values stay zero.
         memory.data.words[7] = 1;
-        Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 1,
-              "active feature accepted an unreadable BVH table");
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads != 0 &&
+                  std::ranges::none_of(snapshot.flattened_srt, [](auto word) { return word == 0x2000u; }),
+              "an unreadable BVH table behind a branch that may not run stopped the shader");
       }
       memory.data.words[0x40 / 4] = 0x1080u;
       memory.data.watched_address = 0x10a8u;
@@ -2885,7 +2889,9 @@ void TestGuardedScalarDescriptorReads() {
       if (!shared) {
         memory.data.words[7] = 0;
         memory.data.words[0x40 / 4] = 0;
-        Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 1 &&
+        const auto reads_before = memory.null_reads;
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  memory.null_reads == reads_before &&
                   std::ranges::all_of(snapshot.flattened_srt, [](auto word) { return word == 0; }),
               "cached plan retained reads after the feature was disabled");
       }

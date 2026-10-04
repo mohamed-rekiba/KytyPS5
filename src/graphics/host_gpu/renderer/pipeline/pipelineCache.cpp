@@ -110,6 +110,18 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
 }
 
+// An ordinary read of the resource walk. Nothing is ever mapped in the first pages of the
+// address space: a read there is through a null table pointer and cannot be done. The walk
+// decides what that means; see SrtWalker::RefreshFlatBuffer.
+bool ReadShaderMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	constexpr uint64_t NullPagesEnd = 0x10000;
+	if (address < NullPagesEnd) {
+		return false;
+	}
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -382,6 +394,7 @@ struct PipelineCache::ProgramCache {
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {

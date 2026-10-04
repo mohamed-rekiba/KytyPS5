@@ -1000,8 +1000,15 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		if (source >= program.descriptor_sources.size()) {
 			return false;
 		}
-		if (active.empty() || active[source]) {
-			return (written ? clean : walker).EvaluateDescriptor(source, value);
+		if (active.empty() || active[source] != SourceInactive) {
+			if ((written ? clean : walker).EvaluateDescriptor(source, value)) {
+				return true;
+			}
+			// Behind a branch that may not be taken, a descriptor that cannot be read is not
+			// an error: the null descriptor stands in for it.
+			if (active.empty() || active[source] != SourceMaybe) {
+				return false;
+			}
 		}
 		value = {};
 		value.dword_count = program.descriptor_sources[source].dword_count;
@@ -1046,6 +1053,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			    !clean.EvaluateDescriptor(indirect.table_source, table) ||
 			    !MaterializeIndirectImage(program, indirect, material, table, i, observed, clean, snapshot,
 			                              specialization)) {
+				if (!active.empty() && active[image.source] == SourceMaybe) {
+					snapshot.images[i] = {.dword_count = 8u};
+					continue;
+				}
 				return false;
 			}
 		} else {

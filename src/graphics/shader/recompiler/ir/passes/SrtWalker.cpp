@@ -874,32 +874,50 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		return true;
 	}
 	flat.assign(m_program.srt_reads.size(), 0u);
-	active.assign(m_program.descriptor_sources.size(), 1u);
+	active.assign(m_program.descriptor_sources.size(), SourceCertain);
 	for (const auto& block: m_program.control_flow) {
-		for (const auto source: block.sources) active.at(source) = 0u;
+		for (const auto source: block.sources)
+			active.at(source) = SourceInactive;
 	}
+	// A block is certain when every branch on the way to it had a known condition. Behind a
+	// branch whose condition is not known here (it depends on what the shader computes), a
+	// block may never run. The shader is allowed to guard a read with such a branch: a table
+	// pointer the game left null is only followed where the branch says it is set. So a read
+	// that cannot be done in such a block is not an error. Its slot stays zero, and a
+	// descriptor of the block that cannot be evaluated is the null descriptor.
+	constexpr uint32_t CertainBit = 0x80000000u;
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
-	visited.assign(m_program.control_flow.size(), 0u);
+	visited.assign(m_program.control_flow.size(), SourceInactive);
 	pending.clear();
-	pending.push_back(0u);
+	pending.push_back(0u | CertainBit);
 	while (!pending.empty()) {
-		const auto index = pending.back();
+		const auto entry = pending.back();
 		pending.pop_back();
-		if (visited.at(index)) continue;
-		visited[index] = 1u;
+		const auto    index   = entry & ~CertainBit;
+		const bool    certain = (entry & CertainBit) != 0u;
+		const uint8_t level   = certain ? SourceCertain : SourceMaybe;
+		if (visited.at(index) >= level) continue;
+		visited[index]    = level;
 		const auto& block = m_program.control_flow[index];
-		for (const auto source: block.sources) active[source] = 1u;
+		for (const auto source: block.sources)
+			active[source] = std::max(active[source], level);
 		for (const auto slot: block.srt_reads) {
-			if (!refresh(slot)) return false;
+			if (!refresh(slot)) {
+				if (certain) return false;
+				flat[m_program.srt_reads[slot].flat_offset] = 0u;
+			}
 		}
 		uint32_t condition = 0;
 		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
 		    predicate.Evaluate(block.condition, condition)) {
-			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+			pending.push_back(block.successors[condition != 0u ? 0u : 1u] | (entry & CertainBit));
 		} else {
-			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+			// One way on: as certain as this block. Several: which one runs is not known.
+			const auto next = block.successors.size() == 1 ? entry & CertainBit : 0u;
+			for (const auto successor: block.successors)
+				pending.push_back(successor | next);
 		}
 	}
 	return true;
