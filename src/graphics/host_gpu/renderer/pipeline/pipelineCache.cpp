@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/programList.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -24,13 +25,18 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -245,11 +251,12 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
 
-	Permutation CompilePermutation(const char*                                  stage_name,
-	                               const ShaderRecompiler::CompileOptions&      options,
-	                               ShaderRecompiler::TranslateResult            translated,
-	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+	// Translated IR to SPIR-V, checked. Has no state of its own: a worker thread can run it.
+	static ShaderRecompiler::CompileResult
+	CompileChecked(const char* stage_name, const ShaderRecompiler::CompileOptions& options,
+	               ShaderRecompiler::TranslateResult                   translated,
+	               const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	               uint32_t                                            push_data_start_dword) {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
@@ -258,10 +265,6 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
-
-		const auto module = CompileSPV(result.spirv, device);
-		EXIT_IF(module == nullptr);
-		vk::ShaderModule mesh_vertex_module = nullptr;
 		if (!result.mesh_vertex_spirv.empty()) {
 			if (!ValidateShaderSpirv(options.dump_label, options.shader_hash,
 			                         result.mesh_vertex_spirv)) {
@@ -270,12 +273,23 @@ struct PipelineCache::ProgramCache {
 				     options.dump_label, options.shader_hash);
 			}
 			DumpShaderSpirv("mesh_vs", options.shader_hash, result.mesh_vertex_spirv);
-			mesh_vertex_module = CompileSPV(result.mesh_vertex_spirv, device);
-			EXIT_IF(mesh_vertex_module == nullptr);
 		}
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
+		}
+		return result;
+	}
+
+	// Renderer thread: the host shader modules and the handle of a compiled program.
+	Permutation MakePermutation(ShaderRecompiler::CompileResult              result,
+	                            ShaderRecompiler::IR::ResourceSpecialization specialization) {
+		const auto module = CompileSPV(result.spirv, device);
+		EXIT_IF(module == nullptr);
+		vk::ShaderModule mesh_vertex_module = nullptr;
+		if (!result.mesh_vertex_spirv.empty()) {
+			mesh_vertex_module = CompileSPV(result.mesh_vertex_spirv, device);
+			EXIT_IF(mesh_vertex_module == nullptr);
 		}
 		return {
 		    .specialization = std::move(specialization),
@@ -285,6 +299,62 @@ struct PipelineCache::ProgramCache {
 		                       .mesh_vertex_module = mesh_vertex_module,
 		                       .mesh_slot_words    = result.mesh_slot_words},
 		};
+	}
+
+	struct StageNames {
+		const char* label      = nullptr;
+		const char* stage_name = nullptr;
+	};
+
+	static StageNames NamesOf(ShaderType stage) {
+		switch (stage) {
+			case ShaderType::Vertex: return {"ShaderRecompiler VS", "vs"};
+			case ShaderType::Mesh: return {"ShaderRecompiler MS", "ms"};
+			case ShaderType::Local: return {"ShaderRecompiler LS", "ls"};
+			case ShaderType::TessellationControl: return {"ShaderRecompiler HS", "hs"};
+			case ShaderType::TessellationEvaluation: return {"ShaderRecompiler DS", "ds"};
+			case ShaderType::Pixel: return {"ShaderRecompiler PS", "ps"};
+			case ShaderType::Compute: return {"ShaderRecompiler CS", "cs"};
+			default: EXIT("invalid pipeline shader stage\n");
+		}
+	}
+
+	// The translator's options for one stage. `user_data`: only its size matters here; the
+	// values select the specialization, which the caller passes on its own.
+	template <typename InputInfo>
+	ShaderRecompiler::CompileOptions
+	MakeOptions(ShaderType stage, uint64_t hash, std::span<const uint32_t> user_data,
+	            std::span<const uint32_t> back_code, InputInfo& input_info) const {
+		ShaderStageInputInfo stage_input {};
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			stage_input.vertex = &input_info;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			stage_input.pixel = &input_info;
+		} else {
+			stage_input.compute = &input_info;
+		}
+		ShaderRecompiler::CompileOptions options;
+		options.stage         = stage;
+		options.shader_hash   = hash;
+		options.user_data     = user_data;
+		options.back_code     = back_code;
+		options.dump_ir       = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		options.early_dump    = options.dump_ir;
+		options.dump_label    = NamesOf(stage).label;
+		options.input_info    = stage_input;
+		options.host_features = host_features;
+
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			options.user_data_base = 8;
+			options.wave_size      = input_info.wave_size;
+			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
+				options.user_data_base = 0;
+				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
+			}
+		} else {
+			options.wave_size = input_info.wave_size;
+		}
+		return options;
 	}
 
 	template <typename InputInfo>
@@ -332,47 +402,9 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
-		ShaderStageInputInfo stage_input {};
-		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			stage_input.vertex = &input_info;
-		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-			stage_input.pixel = &input_info;
-		} else {
-			stage_input.compute = &input_info;
-		}
-		const char* label = nullptr;
-		const char* stage_name = nullptr;
-		switch (stage) {
-			case ShaderType::Vertex: label = "ShaderRecompiler VS"; stage_name = "vs"; break;
-			case ShaderType::Mesh: label = "ShaderRecompiler MS"; stage_name = "ms"; break;
-			case ShaderType::Local: label = "ShaderRecompiler LS"; stage_name = "ls"; break;
-			case ShaderType::TessellationControl: label = "ShaderRecompiler HS"; stage_name = "hs"; break;
-			case ShaderType::TessellationEvaluation: label = "ShaderRecompiler DS"; stage_name = "ds"; break;
-			case ShaderType::Pixel: label = "ShaderRecompiler PS"; stage_name = "ps"; break;
-			case ShaderType::Compute: label = "ShaderRecompiler CS"; stage_name = "cs"; break;
-			default: EXIT("invalid pipeline shader stage\n");
-		}
-		ShaderRecompiler::CompileOptions options;
-		options.stage       = stage;
-		options.shader_hash = params.hash;
-		options.user_data   = user_data;
-		options.back_code      = params.back_code;
-		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-		options.early_dump  = options.dump_ir;
-		options.dump_label  = label;
-		options.input_info  = stage_input;
-		options.host_features  = host_features;
-
-		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			options.user_data_base = 8;
-			options.wave_size = input_info.wave_size;
-			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
-				options.user_data_base = 0;
-				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
-			}
-		} else {
-			options.wave_size = input_info.wave_size;
-		}
+		const auto options =
+		    MakeOptions(stage, params.hash, user_data, params.back_code, input_info);
+		const char* stage_name = NamesOf(stage).stage_name;
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
@@ -382,8 +414,11 @@ struct PipelineCache::ProgramCache {
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 		}
-		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		Remember(stage, params, input_info, entry->second.specialization, push_data_cursor);
+		entry->second.permutations.push_back(
+		    MakePermutation(CompileChecked(stage_name, options, std::move(translated),
+		                                   entry->second.specialization, push_data_cursor),
+		                    entry->second.specialization));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -404,11 +439,250 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
+	// ---- The program list: what each program was translated from, kept on disk for a game.
+	// At the next start worker threads translate the listed programs again, so a draw finds its
+	// program ready and the renderer does not stop to translate it.
+
+	// A program a worker built from a record. It has no host objects yet.
+	struct Prebuilt {
+		ProgramKey                                   key;
+		ShaderRecompiler::IR::ResourcePlan           plan;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		ShaderRecompiler::CompileResult              result;
+	};
+
+	template <typename InputInfo>
+	static bool ReadInputInfo(const ProgramRecord& record, InputInfo& info) {
+		static_assert(std::is_trivially_copyable_v<InputInfo>);
+		if (record.input_info.size() != sizeof(InputInfo)) {
+			return false;
+		}
+		std::memcpy(static_cast<void*>(&info), record.input_info.data(), sizeof(InputInfo));
+		info.stage = {};
+		return true;
+	}
+
+	// Names a record for "is it on the list already". The input info is left out for its key
+	// words: its raw bytes have padding, and equal inputs must give an equal name.
+	static uint64_t Identity(const ProgramRecord& record, std::span<const uint32_t> static_state) {
+		ProgramRecord named = record;
+		named.code          = {static_cast<uint32_t>(record.code.size())};
+		named.input_info.assign(reinterpret_cast<const uint8_t*>(static_state.data()),
+		                        reinterpret_cast<const uint8_t*>(static_state.data()) +
+		                            static_state.size_bytes());
+		std::vector<uint8_t> bytes;
+		AppendProgramRecord(bytes, named);
+		return XXH3_64bits(bytes.data(), bytes.size());
+	}
+
+	bool StaticStateOf(const ProgramRecord& record, std::vector<uint32_t>& static_state) const {
+		const auto build = [&]<typename InputInfo>(InputInfo info) {
+			if (!ReadInputInfo(record, info)) {
+				return false;
+			}
+			BuildStageStaticKey(info, static_state);
+			return true;
+		};
+		switch (record.stage) {
+			case ShaderType::Vertex:
+			case ShaderType::Mesh:
+			case ShaderType::Local:
+			case ShaderType::TessellationControl:
+			case ShaderType::TessellationEvaluation: return build(ShaderVertexInputInfo {});
+			case ShaderType::Pixel: return build(ShaderPixelInputInfo {});
+			case ShaderType::Compute: return build(ShaderComputeInputInfo {});
+			default: return false;
+		}
+	}
+
+	std::string ListSignature() const {
+		return fmt::format("KytyPL1:{}:{}:{}:{:016x}\n", sizeof(ShaderVertexInputInfo),
+		                   sizeof(ShaderPixelInputInfo), sizeof(ShaderComputeInputInfo),
+		                   XXH3_64bits(&host_features, sizeof(host_features)));
+	}
+
+	// Worker thread. Builds what the live path builds for the same inputs.
+	template <typename InputInfo>
+	bool Prebuild(const ProgramRecord& record, Prebuilt& out) const {
+		InputInfo info;
+		if (!ReadInputInfo(record, info)) {
+			return false;
+		}
+		out.key.stage           = record.stage;
+		out.key.hash            = record.hash;
+		out.key.user_data_count = record.user_data_count;
+		out.key.code_size       = static_cast<uint32_t>(record.code.size());
+		BuildStageStaticKey(info, out.key.static_state);
+		const std::vector<uint32_t> user_data(record.user_data_count, 0u);
+		const auto                  options =
+		    MakeOptions(record.stage, record.hash, user_data, record.back_code, info);
+		auto translated    = ShaderRecompiler::TranslateProgram(record.code, options);
+		out.plan           = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		out.specialization = record.specialization;
+		out.result =
+		    CompileChecked(NamesOf(record.stage).stage_name, options, std::move(translated),
+		                   record.specialization, record.push_data_start);
+		return true;
+	}
+
+	bool Prebuild(const ProgramRecord& record, Prebuilt& out) const {
+		switch (record.stage) {
+			case ShaderType::Vertex:
+			case ShaderType::Mesh:
+			case ShaderType::Local:
+			case ShaderType::TessellationControl:
+			case ShaderType::TessellationEvaluation:
+				return Prebuild<ShaderVertexInputInfo>(record, out);
+			case ShaderType::Pixel: return Prebuild<ShaderPixelInputInfo>(record, out);
+			case ShaderType::Compute: return Prebuild<ShaderComputeInputInfo>(record, out);
+			default: return false;
+		}
+	}
+
+	// Main thread, once. Reads the list of the game and starts the workers on it.
+	void OpenProgramList(const std::filesystem::path& path) {
+		const auto           signature = ListSignature();
+		std::vector<uint8_t> bytes;
+		if (std::FILE* file = std::fopen(Common::PathToString(path).c_str(), "rb")) {
+			std::fseek(file, 0, SEEK_END);
+			const auto size = std::ftell(file);
+			std::fseek(file, 0, SEEK_SET);
+			bytes.resize(size > 0 ? static_cast<size_t>(size) : 0);
+			if (std::fread(bytes.data(), 1, bytes.size(), file) != bytes.size()) {
+				bytes.clear();
+			}
+			std::fclose(file);
+		}
+		const bool current = bytes.size() >= signature.size() &&
+		                     std::memcmp(bytes.data(), signature.data(), signature.size()) == 0;
+		if (current) {
+			std::vector<uint32_t> static_state;
+			for (auto& record: ReadProgramRecords(std::span(bytes).subspan(signature.size()))) {
+				if (StaticStateOf(record, static_state) &&
+				    m_listed.insert(Identity(record, static_state)).second) {
+					m_records.push_back(std::move(record));
+				}
+			}
+		}
+		std::error_code error;
+		std::filesystem::create_directories(path.parent_path(), error);
+		// A list from another layout or device is started again; a damaged tail is cut off.
+		m_list_file = std::fopen(Common::PathToString(path).c_str(), "wb");
+		if (m_list_file == nullptr) {
+			PipelineCacheLog("Program list: cannot write {}", Common::PathToString(path));
+			m_records.clear();
+			return;
+		}
+		std::fwrite(signature.data(), 1, signature.size(), m_list_file);
+		std::vector<uint8_t> kept;
+		for (const auto& record: m_records) {
+			AppendProgramRecord(kept, record);
+		}
+		std::fwrite(kept.data(), 1, kept.size(), m_list_file);
+		std::fflush(m_list_file);
+		PipelineCacheLog("Program list: {} program(s) to build ahead from {}", m_records.size(),
+		                 Common::PathToString(path));
+		if (m_records.empty()) {
+			return;
+		}
+		const auto threads = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
+		m_workers_running  = threads;
+		for (uint32_t i = 0; i < threads; i++) {
+			m_workers.emplace_back([this, started = std::chrono::steady_clock::now()](
+			                           std::stop_token stop) {
+				for (;;) {
+					const auto index = m_next_record.fetch_add(1);
+					if (stop.stop_requested() || index >= m_records.size()) {
+						if (m_workers_running.fetch_sub(1) == 1 && !stop.stop_requested()) {
+							PipelineCacheLog("Program list: {} program(s) built ahead in {} ms",
+							                 m_records.size(),
+							                 std::chrono::duration_cast<std::chrono::milliseconds>(
+							                     std::chrono::steady_clock::now() - started)
+							                     .count());
+						}
+						return;
+					}
+					Prebuilt built;
+					if (Prebuild(m_records[index], built)) {
+						std::lock_guard lock(m_built_mutex);
+						m_built.push_back(std::move(built));
+						m_built_waiting.store(true, std::memory_order_release);
+					}
+				}
+			});
+		}
+	}
+
+	// Renderer thread, before the programs of a draw or dispatch are looked up. Takes over what
+	// the workers have finished. Not later in a draw: adding a permutation can move the ones a
+	// stage of the same draw already points to.
+	void Adopt() {
+		if (!m_built_waiting.load(std::memory_order_acquire)) {
+			return;
+		}
+		std::vector<Prebuilt> built;
+		{
+			std::lock_guard lock(m_built_mutex);
+			built.swap(m_built);
+			m_built_waiting.store(false, std::memory_order_release);
+		}
+		for (auto& item: built) {
+			auto entry = programs.try_emplace(std::move(item.key), std::move(item.plan)).first;
+			const auto start = item.result.program.bindings.push_data_start_dword;
+			if (std::ranges::any_of(entry->second.permutations, [&](const Permutation& known) {
+				    return known.program.bindings.push_data_start_dword == start &&
+				           known.specialization == item.specialization;
+			    })) {
+				continue; // a draw needed it before the worker was done
+			}
+			entry->second.permutations.push_back(
+			    MakePermutation(std::move(item.result), std::move(item.specialization)));
+			m_adopted++;
+		}
+	}
+
+	// Renderer thread: a program was translated for a draw. Puts it on the list, once.
+	template <typename InputInfo>
+	void Remember(ShaderType stage, const ShaderParams& params, const InputInfo& input_info,
+	              const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	              uint32_t                                            push_data_cursor) {
+		static_assert(std::is_trivially_copyable_v<InputInfo>);
+		if (m_list_file == nullptr) {
+			return;
+		}
+		ProgramRecord record;
+		record.stage           = stage;
+		record.hash            = params.hash;
+		record.user_data_count = params.user_data_count;
+		record.push_data_start = push_data_cursor;
+		record.code.assign(params.code.begin(), params.code.end());
+		record.back_code.assign(params.back_code.begin(), params.back_code.end());
+		record.specialization = specialization;
+		InputInfo plain       = input_info;
+		plain.stage           = {};
+		record.input_info.resize(sizeof(InputInfo));
+		std::memcpy(record.input_info.data(), static_cast<const void*>(&plain), sizeof(InputInfo));
+		if (!m_listed.insert(Identity(record, lookup_key.static_state)).second) {
+			return; // on the list, and built here before its worker was done
+		}
+		std::vector<uint8_t> bytes;
+		AppendProgramRecord(bytes, record);
+		std::fwrite(bytes.data(), 1, bytes.size(), m_list_file);
+		std::fflush(m_list_file);
+	}
+
 	ProgramCache(vk::Device device, const ShaderHostFeatures& host_features)
 	    : device(device), host_features(host_features) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
+		for (auto& worker: m_workers) {
+			worker.request_stop();
+		}
+		m_workers.clear();
+		if (m_list_file != nullptr) {
+			std::fclose(m_list_file);
+		}
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
@@ -422,6 +696,16 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
+	std::vector<ProgramRecord>                                  m_records;
+	std::atomic<size_t>                                         m_next_record {0};
+	std::vector<std::jthread>                                   m_workers;
+	std::mutex                                                  m_built_mutex;
+	std::vector<Prebuilt>                                       m_built;
+	std::atomic<bool>                                           m_built_waiting {false};
+	std::atomic<uint32_t>                                       m_workers_running {0};
+	std::unordered_set<uint64_t>                                m_listed;
+	std::FILE*                                                  m_list_file = nullptr;
+	uint64_t                                                    m_adopted   = 0;
 	vk::Device                                                  device;
 	ShaderHostFeatures                                          host_features;
 	uint64_t                                                    next_shader_id = 0;
@@ -432,6 +716,10 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
                                 graphics.device, graphics.shader_host_features)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	if (const auto title_id = PipelineCacheTitleId(); !title_id.empty()) {
+		m_program_cache->OpenProgramList(std::filesystem::path("_PipelineCache") /
+		                                 (title_id + ".programs"));
+	}
 }
 
 PipelineCache::~PipelineCache() {
@@ -604,6 +892,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	m_program_cache->Adopt();
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -733,6 +1022,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
+	m_program_cache->Adopt();
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	uint32_t          push_data_cursor = 0;

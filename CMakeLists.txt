@@ -444,6 +444,12 @@ add_executable(latest_value_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(latest_value_tests PRIVATE ${inc_headers})
 
+add_executable(program_list_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ProgramListTests.cpp"
+)
+target_link_libraries(program_list_tests fmt::fmt)
+target_include_directories(program_list_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -649,6 +655,7 @@ if(BUILD_TESTING)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME latest_value COMMAND $<TARGET_FILE:latest_value_tests>)
+	add_test(NAME program_list COMMAND $<TARGET_FILE:program_list_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -730,6 +737,7 @@ if(BUILD_TESTING)
 		bit_array_tests
 		lru_cache_tests
 		latest_value_tests
+		program_list_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
