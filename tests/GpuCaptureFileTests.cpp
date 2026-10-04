@@ -57,7 +57,7 @@ void TestRecordsComeBackInOrder() {
 	}
 
 	Reader reader;
-	Check(reader.Open(path), "the reader accepts the file");
+	Check(reader.Open(path) == Reader::OpenResult::Ok, "the reader accepts the file");
 	Reader::Record record;
 
 	Check(reader.Next(record) && record.type == RecordType::MapRange, "first record: map");
@@ -116,8 +116,10 @@ void TestForeignFileIsRejected() {
 		}
 	}
 	Reader reader;
-	Check(!reader.Open(path), "a file with another magic is rejected");
-	Check(!reader.Open(TempFile("kyty_gpu_capture_missing.bin")), "a missing file is rejected");
+	Check(reader.Open(path) == Reader::OpenResult::NotACapture,
+	      "a file with another magic is rejected");
+	Check(reader.Open(TempFile("kyty_gpu_capture_missing.bin")) == Reader::OpenResult::Missing,
+	      "a missing file is rejected");
 	std::filesystem::remove(path);
 }
 
@@ -131,11 +133,11 @@ void TestCutFileIsReportedAsTruncated() {
 		writer.WritePages(addresses, PageFilledWith(0x33));
 		Check(writer.Close(), "the writer closes");
 	}
-	// Cut the file in the middle of the page.
-	std::filesystem::resize_file(path, std::filesystem::file_size(path) - PageSize / 2);
+	// Cut the file in the middle of the page record.
+	std::filesystem::resize_file(path, std::filesystem::file_size(path) - 8);
 
 	Reader reader;
-	Check(reader.Open(path), "the header of a cut file is still valid");
+	Check(reader.Open(path) == Reader::OpenResult::Ok, "the header of a cut file is still valid");
 	Reader::Record record;
 	Check(reader.Next(record) && record.type == RecordType::FrameBegin, "the whole record is read");
 	Check(!reader.Next(record), "the cut record is not returned");
@@ -161,9 +163,148 @@ void TestPagesWithWrongSizeFailTheCapture() {
 	      "a pages record that is not a whole number of pages is rejected");
 }
 
+void TestCaptureOfAnotherBuildIsRefused() {
+	const auto        path = TempFile("kyty_gpu_capture_layout.bin");
+	const StateLayout written {
+	    .version = 3, .processor_state_size = 1000, .started_submission_size = 200};
+	{
+		Writer writer;
+		Check(writer.Open(path, written), "the writer opens a new file");
+		writer.Write(RecordType::End);
+		Check(writer.Close(), "the writer closes");
+	}
+	Reader reader;
+	Check(reader.Open(path, written) == Reader::OpenResult::Ok,
+	      "a build with the same layout reads the capture");
+	auto other                 = written;
+	other.processor_state_size = 1008;
+	Check(reader.Open(path, other) == Reader::OpenResult::OtherLayout,
+	      "a build whose processor state has another size refuses it");
+	other = written;
+	other.started_submission_size++;
+	Check(reader.Open(path, other) == Reader::OpenResult::OtherLayout,
+	      "a build whose suspended submission has another size refuses it");
+	other = written;
+	other.version++;
+	Check(reader.Open(path, other) == Reader::OpenResult::OtherLayout,
+	      "a build with another layout version refuses it");
+	Reader::Record record;
+	Check(!reader.Next(record), "a refused capture gives no record");
+
+	// A capture of an older file format version is told apart from a foreign file.
+	{
+		std::FILE* file = std::fopen(path.string().c_str(), "r+b");
+		Check(file != nullptr, "the test can reopen the file");
+		if (file != nullptr) {
+			const uint32_t old_version = FileVersion - 1;
+			(void)std::fseek(file, sizeof(FileMagic), SEEK_SET);
+			(void)std::fwrite(&old_version, 1, sizeof(old_version), file);
+			(void)std::fclose(file);
+		}
+	}
+	Check(reader.Open(path, written) == Reader::OpenResult::OtherVersion,
+	      "a capture of another file version is reported as such");
+	std::filesystem::remove(path);
+}
+
+void TestPagesAreStoredSmallerAndComeBackWhole() {
+	const auto path = TempFile("kyty_gpu_capture_packed.bin");
+	// Pages as guest memory has them: long stretches of one value, and one page of noise.
+	std::vector<uint64_t> addresses;
+	std::vector<uint8_t>  data;
+	for (uint64_t i = 0; i < 64; i++) {
+		addresses.push_back(0x200000000 + i * PageSize);
+		auto page = PageFilledWith(static_cast<uint8_t>(i));
+		if (i == 5) {
+			uint32_t state = 12345;
+			for (auto& byte: page) {
+				state = state * 1664525u + 1013904223u;
+				byte  = static_cast<uint8_t>(state >> 24u);
+			}
+		}
+		data.insert(data.end(), page.begin(), page.end());
+	}
+	{
+		Writer writer;
+		Check(writer.Open(path), "the writer opens a new file");
+		// Packed away from the writer, as the scanning threads do.
+		writer.WritePacked(Writer::PackPages(addresses, data));
+		Check(writer.Close(), "the writer closes");
+	}
+	Check(std::filesystem::file_size(path) < data.size() / 4,
+	      "the file is much smaller than the pages");
+
+	Reader reader;
+	Check(reader.Open(path) == Reader::OpenResult::Ok, "the reader accepts the file");
+	Reader::Record record;
+	Check(reader.Next(record) && record.type == RecordType::Pages,
+	      "the reader hands out a plain pages record");
+	std::vector<uint64_t> seen;
+	std::vector<uint8_t>  bytes_back;
+	Check(Reader::ForEachPage(record,
+	                          [&](uint64_t address, std::span<const uint8_t> bytes) {
+		                          seen.push_back(address);
+		                          bytes_back.insert(bytes_back.end(), bytes.begin(), bytes.end());
+	                          }),
+	      "the record splits into pages");
+	Check(seen == addresses && bytes_back == data, "addresses and bytes are unchanged");
+	reader.Close();
+
+	// A flipped byte inside the compressed data must not be replayed.
+	{
+		std::FILE* file = std::fopen(path.string().c_str(), "r+b");
+		Check(file != nullptr, "the test can reopen the file");
+		if (file != nullptr) {
+			(void)std::fseek(file, -20, SEEK_END);
+			const uint8_t garbage[8] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+			(void)std::fwrite(garbage, 1, sizeof(garbage), file);
+			(void)std::fclose(file);
+		}
+	}
+	Check(reader.Open(path) == Reader::OpenResult::Ok, "the header is still valid");
+	Check(!reader.Next(record) && reader.Damaged(), "a damaged page record is reported");
+	reader.Close();
+	std::filesystem::remove(path);
+}
+
+void TestGuestWritesComeBack() {
+	const auto                    path   = TempFile("kyty_gpu_capture_writes.bin");
+	const std::vector<WriteRange> writes = {
+	    {0x200010000, 0x10000, static_cast<uint32_t>(WriteTarget::Buffers), 0},
+	    {0x200012345, 1, static_cast<uint32_t>(WriteTarget::Images), 0},
+	};
+	{
+		Writer writer;
+		Check(writer.Open(path), "the writer opens a new file");
+		writer.Write(RecordType::GuestWrites, {reinterpret_cast<const uint8_t*>(writes.data()),
+		                                       writes.size() * sizeof(WriteRange)});
+		Check(writer.Close(), "the writer closes");
+	}
+	Reader reader;
+	Check(reader.Open(path) == Reader::OpenResult::Ok, "the reader accepts the file");
+	Reader::Record record;
+	Check(reader.Next(record) && record.type == RecordType::GuestWrites, "the record comes back");
+	std::vector<WriteRange> back;
+	Check(Reader::ForEach<WriteRange>(record,
+	                                  [&](const WriteRange& write) { back.push_back(write); }),
+	      "it splits into ranges");
+	Check(back.size() == 2 && back[0].address == 0x200010000 && back[0].size == 0x10000 &&
+	          back[1].address == 0x200012345 &&
+	          back[1].target == static_cast<uint32_t>(WriteTarget::Images),
+	      "the ranges are unchanged");
+	record.payload.pop_back();
+	Check(!Reader::ForEach<WriteRange>(record, [](const WriteRange&) {}),
+	      "a record that is not a whole number of ranges is rejected");
+	reader.Close();
+	std::filesystem::remove(path);
+}
+
 } // namespace
 
 int main() {
+	TestCaptureOfAnotherBuildIsRefused();
+	TestPagesAreStoredSmallerAndComeBackWhole();
+	TestGuestWritesComeBack();
 	TestRecordsComeBackInOrder();
 	TestForeignFileIsRejected();
 	TestCutFileIsReportedAsTruncated();

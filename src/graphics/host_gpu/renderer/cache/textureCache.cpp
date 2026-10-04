@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/workCounters.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -29,6 +30,7 @@
 #include <span>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -1016,6 +1018,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	g_work.ImageUpload(image.info.data.size);
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
@@ -1913,9 +1916,10 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	// The download writes guest memory without a page fault: tell the watchers now, before the
 	// write can happen.
 	m_buffer_cache.WriteWatches().NotifyWrite(range.address, range.size);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		m_buffer_cache.NoteHostWrite(range.address, range.size);
 	});
 	return true;
 }
@@ -2144,6 +2148,127 @@ void TextureCache::RunGarbageCollector() {
 	collect(false);
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
+	}
+}
+
+TextureCache::GpuImageCount TextureCache::WriteBackGpuImages() {
+	std::vector<ImageId> ids;
+	{
+		std::scoped_lock lock {m_lock};
+		m_slot_images.ForEach([&ids](ImageId id, const Image& image) {
+			if (image.IsGpuModified() && image.SafeToDownload()) {
+				ids.push_back(id);
+			}
+		});
+	}
+	GpuImageCount count;
+	for (const auto id: ids) {
+		bool     written = false;
+		uint64_t bytes   = 0;
+		{
+			std::scoped_lock lock {m_lock};
+			const auto       image = m_slot_images.try_get(id);
+			if (image == nullptr) {
+				continue;
+			}
+			bytes   = image->info.data.size;
+			written = DownloadImageMemory(id);
+		}
+		if (!written) {
+			count.not_written++;
+			count.not_written_bytes += bytes;
+			continue;
+		}
+		count.written++;
+		count.written_bytes += bytes;
+		// One picture at a time: the reusable download buffer holds what is in flight.
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Finish();
+		m_scheduler.WaitPriorityOperations(tick);
+	}
+	return count;
+}
+
+std::vector<TextureCache::GpuImageHash> TextureCache::HashGpuImages() {
+	std::vector<ImageId> ids;
+	{
+		std::scoped_lock lock {m_lock};
+		m_slot_images.ForEach([&ids](ImageId id, const Image& image) {
+			if (image.IsGpuModified() && image.SafeToDownload() && !image.depth_id) {
+				ids.push_back(id);
+			}
+		});
+	}
+	std::vector<GpuImageHash> hashes;
+	std::vector<uint8_t>      bytes;
+	for (const auto id: ids) {
+		GpuImageHash entry;
+		{
+			std::scoped_lock lock {m_lock};
+			const auto       image = m_slot_images.try_get(id);
+			if (image == nullptr || !DownloadImageMemory(id)) {
+				continue;
+			}
+			entry.range  = image->info.data;
+			entry.width  = image->info.extent.width;
+			entry.height = image->info.extent.height;
+			entry.depth  = image->info.extent.depth;
+			entry.format = image->info.pixel_format;
+		}
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Finish();
+		m_scheduler.WaitPriorityOperations(tick);
+		bytes.resize(entry.range.size);
+		if (LibKernel::Memory::TryReadBacking(entry.range.address, bytes.data(), bytes.size())) {
+			entry.hash = XXH3_64bits(bytes.data(), bytes.size());
+			hashes.push_back(entry);
+		}
+	}
+	return hashes;
+}
+
+uint32_t TextureCache::ReloadGpuWrittenImages() {
+	std::scoped_lock lock {m_lock};
+	DropColorMetadataFillsLocked();
+	std::vector<GuestRange> ranges;
+	uint32_t                kept = 0;
+	m_slot_images.ForEach([&](ImageId, Image& image) {
+		if (!image.IsGpuModified() || image.info.data.Empty()) {
+			return;
+		}
+		// An upload from guest memory does not exist for these; they keep the host picture.
+		const auto& owner = image.depth_id ? m_slot_images[image.depth_id] : image;
+		if (image.info.samples != 1 || owner.info.samples != 1 ||
+		    image.info.metadata.compression != VideoOutCompression::Uncompressed ||
+		    (image.depth_id && owner.info.metadata.stencil_compressed)) {
+			kept++;
+			return;
+		}
+		image.ClearGpuModified();
+		ranges.push_back(image.info.data);
+	});
+	for (const auto& range: ranges) {
+		InvalidateCpuAliases(range.address, range.size);
+	}
+	return kept;
+}
+
+std::vector<TextureCache::SurfaceMeta> TextureCache::SaveSurfaceMetas() {
+	std::scoped_lock         lock {m_lock};
+	std::vector<SurfaceMeta> metas;
+	metas.reserve(m_surface_metas.size());
+	for (const auto& [address, meta]: m_surface_metas) {
+		metas.push_back({address, static_cast<uint32_t>(meta.type), meta.clear_mask});
+	}
+	return metas;
+}
+
+void TextureCache::RestoreSurfaceMetas(std::span<const SurfaceMeta> metas) {
+	std::scoped_lock lock {m_lock};
+	m_surface_metas.clear();
+	for (const auto& meta: metas) {
+		m_surface_metas[meta.address] = {.type       = static_cast<MetaDataInfo::Type>(meta.type),
+		                                 .clear_mask = meta.clear_mask};
 	}
 }
 

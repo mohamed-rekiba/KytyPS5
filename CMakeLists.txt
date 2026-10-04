@@ -148,6 +148,7 @@ include_directories(
 	${KYTY_THIRD_PARTY_DIR}/gtest/include
 	${KYTY_THIRD_PARTY_DIR}/gtest
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
+	${zstd_SOURCE_DIR}/lib
 	${KYTY_THIRD_PARTY_DIR}/magic_enum/include/magic_enum
 	${PROJECT_BINARY_DIR}
 	${KYTY_SOURCE_DIR}
@@ -334,7 +335,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak libzstd_static)
 
 # Linux system libraries.
 if(LINUX)
@@ -348,6 +349,7 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
+	${zstd_SOURCE_DIR}/lib
 	${KYTY_THIRD_PARTY_DIR}/xxhash
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
@@ -563,6 +565,12 @@ add_executable(gpu_capture_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuCaptureFileTests.cpp"
 )
 target_include_directories(gpu_capture_file_tests PRIVATE ${inc_headers})
+target_link_libraries(gpu_capture_file_tests libzstd_static)
+add_executable(gpu_replay_logic_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GpuReplayLogicTests.cpp"
+)
+target_include_directories(gpu_replay_logic_tests PRIVATE ${inc_headers})
+target_link_libraries(gpu_replay_logic_tests libzstd_static)
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
@@ -618,6 +626,7 @@ if(BUILD_TESTING)
 	add_test(NAME metadata_fill COMMAND $<TARGET_FILE:metadata_fill_tests>)
 	add_test(NAME fence_retirement COMMAND $<TARGET_FILE:fence_retirement_tests>)
 	add_test(NAME gpu_capture_file COMMAND $<TARGET_FILE:gpu_capture_file_tests>)
+	add_test(NAME gpu_replay_logic COMMAND $<TARGET_FILE:gpu_replay_logic_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
@@ -696,6 +705,7 @@ if(BUILD_TESTING)
 		metadata_fill_tests
 		fence_retirement_tests
 		gpu_capture_file_tests
+		gpu_replay_logic_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests

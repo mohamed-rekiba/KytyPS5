@@ -63,9 +63,14 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	}
 	if (access == PageFaultAccess::Write) {
 		constexpr uint64_t window = 64 * 1024;
-		m_buffer_cache.InvalidateWrittenMemory(
+		const auto         written = m_buffer_cache.InvalidateWrittenMemory(
 		    fault_vaddr, IsMapped(Common::AlignDown(fault_vaddr, window), window));
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		if (auto* observer = m_gpu != nullptr ? m_gpu->Observer() : nullptr) {
+			observer->OnGuestWrite(GuestGpuObserver::WriteTarget::Buffers, written.address,
+			                       written.size);
+			observer->OnGuestWrite(GuestGpuObserver::WriteTarget::Images, fault_vaddr, fault_size);
+		}
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
@@ -78,7 +83,16 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	if (auto* observer = m_gpu != nullptr ? m_gpu->Observer() : nullptr) {
+		observer->OnGuestWrite(GuestGpuObserver::WriteTarget::Both, vaddr, size);
+	}
 	return true;
+}
+
+void RenderContext::NoteHostWork() {
+	if (auto* observer = m_gpu != nullptr ? m_gpu->Observer() : nullptr) {
+		observer->OnHostWork();
+	}
 }
 
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {

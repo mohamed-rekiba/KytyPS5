@@ -14,8 +14,12 @@ namespace Libs::Graphics::Capture {
 // then feeds the stored submissions in their order. No guest code runs. Call it from a thread
 // that is not the GPU thread and not the window thread.
 //
-// `loops` above 1 feeds the captured frames again without restoring the state in between. The
-// first pass is the faithful one; later passes show the steady-state cost of the same frames.
+// `loops` passes feed the captured frames. Every pass starts from the state of the capture start:
+// guest memory is put back, and what the host GPU wrote in the pass before is loaded from guest
+// memory again. That load happens in the first frame of a pass, so the time of a pass is taken
+// over the frames after the first one. Each pass reports its time per frame, the work the
+// renderer handed to the host GPU against the live run's, and whether each picture matches the
+// live run's and the first pass's.
 //
 // Returns false, after printing the reason, when the file cannot be replayed.
 [[nodiscard]] bool Play(RenderContext& renderer, const std::filesystem::path& path, uint32_t loops);

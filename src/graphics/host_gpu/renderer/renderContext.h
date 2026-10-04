@@ -51,6 +51,8 @@ public:
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// A draw or a dispatch was handed to the host GPU: tells whoever observes the guest GPU.
+	void               NoteHostWork();
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// The GPU-visible guest ranges, and a number that changes with every map and unmap.
 	void                   GetMappedRanges(std::vector<GuestRange>& out) const;

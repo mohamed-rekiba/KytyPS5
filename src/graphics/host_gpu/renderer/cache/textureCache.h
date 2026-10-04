@@ -81,6 +81,40 @@ public:
 	// so guest memory has it once the GPU work is done. True when guest memory will be current;
 	// false when the GPU holds a picture that cannot be written back (compressed, multisampled).
 	[[nodiscard]] bool WriteBackImage(uint64_t address, uint64_t size);
+
+	// For the capture of the guest GPU stream. GPU thread, with no host work in flight.
+	struct GpuImageCount {
+		uint32_t written           = 0;
+		uint64_t written_bytes     = 0;
+		uint32_t not_written       = 0; // the host picture cannot be written back
+		uint64_t not_written_bytes = 0;
+	};
+	// Writes every picture that only the host GPU holds back to guest memory, and waits for it.
+	GpuImageCount WriteBackGpuImages();
+	// Writes every picture the host GPU holds back to guest memory, as `WriteBackGpuImages`,
+	// and describes each with a hash of the guest bytes it then has.
+	struct GpuImageHash {
+		GuestRange range;
+		uint64_t   hash   = 0;
+		uint32_t   width  = 0;
+		uint32_t   height = 0;
+		uint32_t   depth  = 0;
+		vk::Format format = vk::Format::eUndefined;
+	};
+	[[nodiscard]] std::vector<GpuImageHash> HashGpuImages();
+	// Makes guest memory the source of every image the host GPU wrote: each is uploaded again
+	// on its next use. For the capture player, which puts guest memory back to an earlier
+	// state. Returns the number of images that keep the host picture, because no upload from
+	// guest memory exists for them (multisampled, compressed).
+	uint32_t ReloadGpuWrittenImages();
+	// The clear state of depth and colour metadata, which no guest memory holds.
+	struct SurfaceMeta {
+		uint64_t address    = 0;
+		uint32_t type       = 0;
+		uint32_t clear_mask = 0;
+	};
+	[[nodiscard]] std::vector<SurfaceMeta> SaveSurfaceMetas();
+	void                                   RestoreSurfaceMetas(std::span<const SurfaceMeta> metas);
 	void RunGarbageCollector();
 
 private:

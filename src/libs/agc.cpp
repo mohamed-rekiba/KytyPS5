@@ -69,9 +69,10 @@ void Initialize() {
 
 	if (const auto capture_file = Config::GetGpuCaptureFile(); !capture_file.empty()) {
 		// Never destroyed: the GPU thread can still call it while the process exits.
-		auto* recorder = new Capture::Recorder(
-		    *g_renderer, capture_file, Config::GetGpuCaptureFirstFrame(),
-		    Config::GetGpuCaptureFrames(), Config::GetGpuCaptureTriggerFile());
+		auto* recorder =
+		    new Capture::Recorder(*g_renderer, capture_file, Config::GetGpuCaptureFirstFrame(),
+		                          Config::GetGpuCaptureFrames(), Config::GetGpuCaptureTriggerFile(),
+		                          Config::GetGpuCaptureChecks());
 		g_renderer->GetGpu().SetObserver(recorder);
 	}
 }

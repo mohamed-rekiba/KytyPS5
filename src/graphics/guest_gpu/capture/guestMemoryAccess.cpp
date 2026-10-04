@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 #include <vector>
 #include <xxhash.h>
 
@@ -38,7 +39,8 @@ bool ReadGuestMemory(uint64_t address, uint8_t* out, uint64_t size) {
 	return true;
 }
 
-bool HashDisplayBuffer(RenderContext& renderer, int handle, int index, uint64_t& hash) {
+bool HashDisplayBuffer(RenderContext& renderer, int handle, int index, uint64_t& hash,
+                       std::vector<uint8_t>* pixels_out) {
 	uint64_t address = 0;
 	uint64_t size    = 0;
 	if (!VideoOut::VideoOutGetBufferRange(handle, index, address, size) ||
@@ -56,6 +58,9 @@ bool HashDisplayBuffer(RenderContext& renderer, int handle, int index, uint64_t&
 		return false;
 	}
 	hash = XXH3_64bits(pixels.data(), pixels.size());
+	if (pixels_out != nullptr) {
+		*pixels_out = std::move(pixels);
+	}
 	return true;
 }
 

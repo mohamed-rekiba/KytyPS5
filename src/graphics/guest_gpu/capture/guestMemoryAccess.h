@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_GUEST_GPU_CAPTURE_GUESTMEMORYACCESS_H_
 
 #include <cstdint>
+#include <vector>
 
 namespace Libs::Graphics::Capture {
 
@@ -21,8 +22,9 @@ namespace Libs::Graphics::Capture {
 // Hash of the picture in display buffer `index` of video-out port `handle`. GPU thread; waits for
 // the GPU work recorded so far. False when the buffer is not registered or the GPU holds a
 // picture that cannot be written back to guest memory.
-[[nodiscard]] bool HashDisplayBuffer(RenderContext& renderer, int handle, int index,
-                                     uint64_t& hash);
+// `pixels`, when given, receives the bytes the hash covers.
+[[nodiscard]] bool HashDisplayBuffer(RenderContext& renderer, int handle, int index, uint64_t& hash,
+                                     std::vector<uint8_t>* pixels = nullptr);
 
 } // namespace Libs::Graphics::Capture
 

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/workCounters.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
@@ -178,6 +179,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
+			NoteHostWrite(buffer_address + copy.srcOffset, copy.size);
 		}
 	});
 	return true;
@@ -250,7 +252,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	RecordCpuWrite(vaddr, size);
 }
 
-void BufferCache::InvalidateWrittenMemory(uint64_t fault_vaddr, bool window_is_mapped) {
+GuestRange BufferCache::InvalidateWrittenMemory(uint64_t fault_vaddr, bool window_is_mapped) {
 	// Each fault costs a signal and a protection change, which is slow under Rosetta. A game that
 	// rewrites buffers every frame faults on every page it touches, so one fault covers a window.
 	constexpr uint64_t WindowSize = 64 * 1024;
@@ -258,9 +260,51 @@ void BufferCache::InvalidateWrittenMemory(uint64_t fault_vaddr, bool window_is_m
 	if (window_is_mapped && GuestRange {begin, WindowSize}.Valid() &&
 	    !m_memory_tracker.IsRegionGpuModified(begin, WindowSize)) {
 		InvalidateMemory(begin, WindowSize);
-		return;
+		return {begin, WindowSize};
 	}
 	InvalidateMemory(fault_vaddr, 1);
+	return {fault_vaddr, 1};
+}
+
+void BufferCache::NoteHostWrite(uint64_t vaddr, uint64_t size) {
+	if (auto* observer = m_scheduler.Context().GetGpu().Observer()) {
+		observer->OnGuestWrite(GuestGpuObserver::WriteTarget::Host, vaddr, size);
+	}
+}
+
+void BufferCache::NoteGuestRead(uint64_t vaddr, uint64_t size) {
+	if (auto* observer = m_scheduler.Context().GetGpu().Observer()) {
+		observer->OnGuestRead(vaddr, size);
+	}
+}
+
+std::vector<GuestRange> BufferCache::SaveBufferRanges() const {
+	std::vector<GuestRange> ranges;
+	ranges.reserve(m_buffers.size());
+	for (const auto& [address, id]: m_buffers) {
+		ranges.push_back({address, m_slot_buffers[id].Size()});
+	}
+	return ranges;
+}
+
+void BufferCache::EnsureBuffers(std::span<const GuestRange> ranges) {
+	for (const auto& range: ranges) {
+		if (range.Valid()) {
+			(void)FindBuffer(range.address, range.size);
+		}
+	}
+}
+
+void BufferCache::DiscardGpuWrites() {
+	std::vector<GuestRange> ranges;
+	m_gpu_modified_ranges.ForEach(
+	    [&ranges](uint64_t begin, uint64_t end) { ranges.push_back({begin, end - begin}); });
+	for (const auto& range: ranges) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(range.address, range.size);
+		m_memory_tracker.MarkRegionAsCpuModified(range.address, range.size);
+		m_gpu_modified_ranges.Subtract(range.address, range.size);
+	}
+	RequestFullSynchronization();
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -490,6 +534,10 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (copies.empty()) {
 		return nullptr;
 	}
+	g_work.BufferUpload(total_size);
+	for (const auto& copy: copies) {
+		NoteGuestRead(buffer.CpuAddress() + copy.dstOffset, copy.size);
+	}
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
@@ -535,6 +583,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
+			NoteGuestRead(vaddr, size);
 			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};

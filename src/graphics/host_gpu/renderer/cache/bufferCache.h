@@ -56,7 +56,20 @@ public:
 	// A CPU write faulted at `fault_vaddr`. Unprotects the whole aligned window around it when no
 	// page in the window holds GPU-modified data, so a run of writes costs one fault, not one per
 	// page. Pages the CPU did not write count as written, and the next GPU use uploads them.
-	void                   InvalidateWrittenMemory(uint64_t fault_vaddr, bool window_is_mapped);
+	// Returns the range it invalidated: a window around the fault, or the faulting byte.
+	GuestRange InvalidateWrittenMemory(uint64_t fault_vaddr, bool window_is_mapped);
+	// Forgets every byte only the host GPU holds, without reading it back: guest memory is the
+	// current content from now on. For the capture player, which puts guest memory back to an
+	// earlier state. GPU thread, with no host work in flight.
+	void DiscardGpuWrites();
+	// The renderer copied bytes the host GPU held to guest memory: tells whoever observes the
+	// guest GPU. Any thread.
+	void NoteHostWrite(uint64_t vaddr, uint64_t size);
+	// The guest ranges that have a cached buffer, and the way to have one for each of them
+	// again. Which buffers exist decides what is brought up to date before a shader that reads
+	// through addresses, so a replay needs the buffers the live run had. GPU thread.
+	[[nodiscard]] std::vector<GuestRange> SaveBufferRanges() const;
+	void                                  EnsureBuffers(std::span<const GuestRange> ranges);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
@@ -147,6 +160,8 @@ private:
 	static constexpr size_t  MaxCpuWriteLog = 4096;
 	// Records a range for TakeCpuWrites.
 	void RecordCpuWrite(uint64_t vaddr, uint64_t size);
+	// Guest memory is about to be copied to the host: tells whoever observes the guest GPU.
+	void NoteGuestRead(uint64_t vaddr, uint64_t size);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 

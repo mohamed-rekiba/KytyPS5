@@ -79,6 +79,9 @@ struct ConfigOptions {
 	// When set, recording starts at the first frame boundary after this file appears, and
 	// `gpu_capture_first_frame` is not used. Lets a script start the capture in a chosen scene.
 	std::filesystem::path gpu_capture_trigger_file;
+	// Store a hash of every image the host GPU wrote, each time this many draws and dispatches
+	// have passed. A replay then names the first image that differs. 0: no such checks.
+	uint32_t gpu_capture_checks = 0;
 	// Replay a recorded guest GPU stream instead of running a game, this many times.
 	std::filesystem::path  gpu_replay_file;
 	uint32_t               gpu_replay_loops                = 1;
@@ -129,6 +132,7 @@ std::filesystem::path GetGpuCaptureFile();
 uint32_t              GetGpuCaptureFirstFrame();
 uint32_t              GetGpuCaptureFrames();
 std::filesystem::path GetGpuCaptureTriggerFile();
+uint32_t              GetGpuCaptureChecks();
 std::filesystem::path GetGpuReplayFile();
 uint32_t              GetGpuReplayLoops();
 

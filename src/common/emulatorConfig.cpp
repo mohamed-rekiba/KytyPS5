@@ -135,6 +135,10 @@ std::filesystem::path GetGpuCaptureTriggerFile() {
 	return g_config->gpu_capture_trigger_file;
 }
 
+uint32_t GetGpuCaptureChecks() {
+	return g_config->gpu_capture_checks;
+}
+
 std::filesystem::path GetGpuReplayFile() {
 	return g_config->gpu_replay_file;
 }
