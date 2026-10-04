@@ -144,7 +144,7 @@ public:
 	int  ReadStates(int slot, ControllerState* states, int states_num, bool* flag, int* count);
 	int  GetSlotOfUser(int user_id);
 	int  GetUserOfSlot(int slot);
-	bool IsLoggedIn(int slot);
+	void GetLoggedInUsers(int* users);
 	bool TakeEvent(PlayerSlots::Event* event);
 
 private:
@@ -154,9 +154,7 @@ private:
 	Pad* InputPad(int id);
 	// The host gamepad of the player, or nullptr.
 	SDL_Gamepad* HostPad(int slot);
-	bool         IsConnected(int slot) const {
-		return slot == 0 || m_slots.GamepadOf(slot) != PlayerSlots::NoGamepad;
-	}
+	bool         IsConnected(int slot) const { return m_slots.IsLoggedIn(slot); }
 
 	Common::Mutex    m_mutex;
 	std::vector<int> m_host_pads; // every open gamepad, with a player or not
@@ -646,7 +644,9 @@ void GameController::SetVibration(int slot, uint8_t large_motor, uint8_t small_m
 	if (id == PlayerSlots::NoGamepad) {
 		return;
 	}
-	if (DualSenseHaptics::SetVibration(id, large_motor, small_motor)) {
+	// The haptics path drives one gamepad, the one of player 1. A second gamepad on it would stop
+	// the motors of the first.
+	if (slot == 0 && DualSenseHaptics::SetVibration(id, large_motor, small_motor)) {
 		return;
 	}
 
@@ -774,9 +774,11 @@ int GameController::GetUserOfSlot(int slot) {
 	return m_slots.UserOf(slot);
 }
 
-bool GameController::IsLoggedIn(int slot) {
+void GameController::GetLoggedInUsers(int* users) {
 	Common::LockGuard lock(m_mutex);
-	return m_slots.IsLoggedIn(slot);
+	for (int slot = 0; slot < PlayerSlots::MaxPlayers; ++slot) {
+		users[slot] = m_slots.IsLoggedIn(slot) ? m_slots.UserOf(slot) : -1;
+	}
 }
 
 bool GameController::TakeEvent(PlayerSlots::Event* event) {
@@ -824,12 +826,8 @@ int GetPlayerOfUser(int user_id) {
 	return g_controller->GetSlotOfUser(user_id);
 }
 
-int GetUserOfPlayer(int player) {
-	return g_controller->GetUserOfSlot(player);
-}
-
-bool IsPlayerLoggedIn(int player) {
-	return g_controller->IsLoggedIn(player);
+void GetLoggedInUsers(int* users) {
+	g_controller->GetLoggedInUsers(users);
 }
 
 bool TakePlayerEvent(bool* login, int* user_id) {

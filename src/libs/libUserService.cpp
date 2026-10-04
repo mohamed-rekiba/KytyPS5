@@ -83,10 +83,7 @@ static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdLis
 
 	EXIT_NOT_IMPLEMENTED(user_id_list == nullptr);
 
-	for (int player = 0; player < 4; ++player) {
-		user_id_list->user_id[player] =
-		    Controller::IsPlayerLoggedIn(player) ? Controller::GetUserOfPlayer(player) : -1;
-	}
+	Controller::GetLoggedInUsers(user_id_list->user_id);
 
 	return OK;
 }

@@ -9,7 +9,7 @@ namespace Libs {
 
 // Who plays: up to four players, each with one gamepad and one user.
 // A gamepad takes the lowest free slot when it connects and keeps it until it disconnects.
-// Player 1 (slot 0) is logged in from the start and stays logged in, also with no gamepad: the
+// Player 1 (slot 0) is logged in from the start and stays logged in, even with no gamepad: the
 // keyboard plays in that slot. The other players are logged in while their gamepad is connected.
 class PlayerSlots final {
 public:
