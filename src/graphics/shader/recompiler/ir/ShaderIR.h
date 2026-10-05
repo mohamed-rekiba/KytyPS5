@@ -416,6 +416,20 @@ DescriptorBindingForImage(const ImageResource& image) {
 	return static_cast<DescriptorBindingKind>(base + dimension);
 }
 
+// An entry of the sampler binding. It is the index of a sampler, and on a host where a sampler
+// has to apply the minimum LOD of the texture it reads, also the texture: one entry for each
+// texture a sampler is used with.
+inline constexpr uint32_t SamplerSlotNoImage = UINT32_MAX;
+constexpr uint32_t        SamplerSlot(uint32_t sampler, uint32_t image = SamplerSlotNoImage) {
+	return sampler | (image == SamplerSlotNoImage ? 0u : (image + 1u) << 16u);
+}
+constexpr uint32_t SamplerSlotSampler(uint32_t slot) {
+	return slot & 0xffffu;
+}
+constexpr uint32_t SamplerSlotImage(uint32_t slot) {
+	return (slot >> 16u) == 0u ? SamplerSlotNoImage : (slot >> 16u) - 1u;
+}
+
 struct DescriptorBinding {
 	DescriptorBindingKind kind = DescriptorBindingKind::Buffers;
 	std::vector<uint32_t> resources;

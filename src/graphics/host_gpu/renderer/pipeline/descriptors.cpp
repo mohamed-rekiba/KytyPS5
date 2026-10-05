@@ -710,10 +710,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	return {id, nullptr, std::move(desc)};
 }
 
-static vk::Sampler NativeSampler(RenderContext&                       context,
+static vk::Sampler NativeSampler(RenderContext&                                  context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+                                 uint32_t index, const ShaderRecompiler::IR::DescriptorValue& value,
+                                 uint32_t view_min_lod) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	const auto& sampler = program.info.samplers[index];
 	if (!sampler.depth_compare) {
@@ -722,7 +722,7 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
+	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border, view_min_lod);
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
@@ -785,9 +785,22 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
-	prepared.samplers.reserve(program.info.samplers.size());
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
+	// One host sampler for each entry of the sampler binding. An entry with a texture is the
+	// sampler of that texture alone, and applies the texture view's minimum LOD, which this host
+	// cannot put on the view (see IR::SamplerSlot).
+	if (const auto* binding = ShaderRecompiler::IR::FindBinding(
+	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Samplers);
+	    binding != nullptr) {
+		prepared.samplers.reserve(binding->resources.size());
+		for (const auto slot: binding->resources) {
+			const auto sampler = ShaderRecompiler::IR::SamplerSlotSampler(slot);
+			const auto image   = ShaderRecompiler::IR::SamplerSlotImage(slot);
+			const auto min_lod = image == ShaderRecompiler::IR::SamplerSlotNoImage
+			                         ? 0u
+			                         : prepared.images.at(image).desc.view_info.min_lod;
+			prepared.samplers.push_back(
+			    NativeSampler(m_context, program, sampler, snapshot.samplers[sampler], min_lod));
+		}
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {
@@ -1128,8 +1141,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						break;
 					}
 					case BindingKind::Samplers:
-						for (const auto resource: binding.resources) {
-							const auto sampler = descriptors.samplers.at(resource);
+						// PrepareBindings made one sampler for each entry, in this order.
+						for (size_t entry = 0; entry < binding.resources.size(); entry++) {
+							const auto sampler = descriptors.samplers.at(entry);
 							EXIT_IF(sampler == nullptr);
 							m_descriptor_images.emplace_back(sampler, nullptr,
 							                                 vk::ImageLayout::eUndefined);

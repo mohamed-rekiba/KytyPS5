@@ -368,14 +368,9 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
 	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
-	if (normalized.min_lod != 0) {
-		// The view cannot honour the guest's minimum LOD without VK_EXT_image_view_min_lod.
-		// Stop here: ignoring it would sample mips the guest marked as not resident.
-		if (!m_graphics.image_view_min_lod_enabled) {
-			EXIT("image view needs VK_EXT_image_view_min_lod, which the host GPU does not enable: "
-			     "min_lod=%u base_level=%u\n",
-			     normalized.min_lod, normalized.base_level);
-		}
+	// Without VK_EXT_image_view_min_lod the view has no minimum, and the samplers the texture is
+	// read through apply it (see samplerMinLod.h).
+	if (normalized.min_lod != 0 && m_graphics.image_view_min_lod_enabled) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +
 		                 static_cast<float>(normalized.min_lod) / 256.0f;
 		usage.pNext    = &min_lod;

@@ -517,7 +517,7 @@ struct PipelineCache::ProgramCache {
 	static constexpr uint32_t ListLayoutVersion = 2;
 
 	std::string ListSignature() const {
-		return fmt::format("KytyPL{}:{}:{}:{}:{}{}{}{}{}{}{}:{:08x}\n", ListLayoutVersion,
+		return fmt::format("KytyPL{}:{}:{}:{}:{}{}{}{}{}{}{}{}:{:08x}\n", ListLayoutVersion,
 		                   sizeof(ShaderVertexInputInfo), sizeof(ShaderPixelInputInfo),
 		                   sizeof(ShaderComputeInputInfo),
 		                   static_cast<int>(host_features.buffer_int64_atomics),
@@ -527,6 +527,7 @@ struct PipelineCache::ProgramCache {
 		                   static_cast<int>(host_features.float64),
 		                   static_cast<int>(host_features.centroid_barycentric),
 		                   static_cast<int>(host_features.per_vertex_attributes),
+		                   static_cast<int>(host_features.image_view_min_lod),
 		                   host_features.subgroup_supported_stages);
 	}
 

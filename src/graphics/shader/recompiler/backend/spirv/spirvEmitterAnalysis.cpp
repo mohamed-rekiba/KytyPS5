@@ -173,9 +173,18 @@ uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource) {
 	return image;
 }
 
-uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
+uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t image) {
+	// The entry of the sampler for this texture, when the layout has one.
+	auto        slot = IR::SamplerSlot(sampler);
+	const auto* descriptor =
+	    IR::FindBinding(state.program.bindings, IR::DescriptorBindingKind::Samplers);
+	if (descriptor != nullptr && image != IR::SamplerSlotNoImage &&
+	    std::ranges::find(descriptor->resources, IR::SamplerSlot(sampler, image)) !=
+	        descriptor->resources.end()) {
+		slot = IR::SamplerSlot(sampler, image);
+	}
 	const auto array_index =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, slot);
 	const auto sampler_type = state.builder.Type(spv::OpTypeSampler);
 	const auto pointer_type =
 	    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, sampler_type);
@@ -190,7 +199,7 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler) {
 	const auto& image_resource = state.program.info.images.at(resource);
 	const auto  image          = LoadSampledImageDescriptor(state, resource);
-	const auto  sampler_id     = LoadSamplerDescriptor(state, sampler);
+	const auto  sampler_id     = LoadSamplerDescriptor(state, sampler, resource);
 	const auto  sampled_image = state.builder.AllocateId();
 	const auto  sampled_type =
 	    state.builder.Type(spv::OpTypeSampledImage, ImageType(state, image_resource));

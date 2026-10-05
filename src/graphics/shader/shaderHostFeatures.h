@@ -21,6 +21,9 @@ struct ShaderHostFeatures {
 	// (PerVertexKHR). Without it the values come through three more flat inputs, which
 	// tessellation shaders made for the draw fill in (see triangleVertexValueShader.h).
 	bool per_vertex_attributes = true;
+	// A texture view can carry a minimum LOD (VK_EXT_image_view_min_lod). Without it each
+	// texture is read through a sampler of its own, which applies the minimum.
+	bool image_view_min_lod = true;
 	// Stages that may use subgroup operations: VkPhysicalDeviceVulkan11Properties::
 	// subgroupSupportedStages, as VkShaderStageFlagBits values. All bits set means every stage.
 	uint32_t subgroup_supported_stages = ~0u;

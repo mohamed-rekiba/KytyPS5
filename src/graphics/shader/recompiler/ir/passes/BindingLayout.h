@@ -5,7 +5,13 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0);
+// The entries of the sampler binding: one for each sampler, and with `sampler_per_texture` also
+// one for each texture a sampler is used with (see SamplerSlot).
+std::vector<uint32_t> SamplerBindingEntries(const ShaderInfo& info, bool sampler_per_texture);
+
+// `sampler_per_texture`: see SamplerBindingEntries.
+void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0,
+                      bool sampler_per_texture = false);
 
 // Collect live direct buffer indices and report whether the shader accesses GDS.
 bool CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers);

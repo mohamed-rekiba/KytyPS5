@@ -679,7 +679,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
-	IR::AllocateBindings(ir, push_data_start_dword);
+	IR::AllocateBindings(ir, push_data_start_dword, !options.host_features.image_view_min_lod);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);

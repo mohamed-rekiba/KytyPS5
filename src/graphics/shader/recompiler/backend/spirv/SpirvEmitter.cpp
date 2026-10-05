@@ -152,8 +152,12 @@ void ValidateNativeProgram(const IR::Program& program) {
 	std::array<bool, KindCount> seen {};
 	for (const auto& binding: program.bindings.descriptors) {
 		const auto kind = static_cast<size_t>(binding.kind);
+		// The sampler binding may also have an entry for each texture a sampler is used with.
+		const bool per_texture_samplers =
+		    binding.kind == Kind::Samplers &&
+		    binding.resources == IR::SamplerBindingEntries(program.info, true);
 		if (kind >= KindCount || seen[kind] || !present[kind] ||
-		    binding.resources != expected[kind]) {
+		    (binding.resources != expected[kind] && !per_texture_samplers)) {
 			Fail(program, "native descriptor groups do not match shader topology");
 		}
 		seen[kind] = true;

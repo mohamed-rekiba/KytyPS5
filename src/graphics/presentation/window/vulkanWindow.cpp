@@ -622,6 +622,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&                 graphics,
 	    .centroid_barycentric        = capabilities.centroid_barycentric,
 	    .float64                     = device_features.shaderFloat64 == VK_TRUE,
 	    .per_vertex_attributes       = capabilities.per_vertex_attributes,
+	    .image_view_min_lod          = capabilities.image_view_min_lod,
 	    .subgroup_supported_stages   = static_cast<uint32_t>(properties11.subgroupSupportedStages),
 	};
 

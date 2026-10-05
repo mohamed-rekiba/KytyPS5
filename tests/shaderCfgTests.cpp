@@ -5095,6 +5095,54 @@ void TestNewShaderRecompilerCubeSampleCoordinates() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// A host that cannot put a minimum LOD on a texture view applies it through the sampler. Textures
+// read through one guest sampler may have different minimums, so the sampler gets an entry for
+// each texture it is used with.
+void TestSamplerEntryPerTexture() {
+  using ShaderRecompiler::IR::DescriptorBindingKind;
+  using ShaderRecompiler::IR::SamplerSlot;
+  const uint32_t shader[] = {
+      EncodeMimg0(0x20, 0xf),
+      EncodeMimg1(8, 2, 3, 1), // image_sample
+      EncodeMubuf0(0x1c, 12),
+      EncodeMubuf1(8, 1, 1), // keep the sampled value live
+      0xbf810000u,
+  };
+  auto user_data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+
+  const auto plain = RecompileForTest(shader, options);
+  const auto* plain_samplers =
+      ShaderRecompiler::IR::FindBinding(plain.program.bindings, DescriptorBindingKind::Samplers);
+  Check(plain.program.info.images.size() == 1 && plain.program.info.samplers.size() == 1 &&
+            plain_samplers != nullptr &&
+            plain_samplers->resources == std::vector<uint32_t>{SamplerSlot(0)},
+        "a host with view minimum LODs did not keep one entry for the sampler");
+  Check(SpirvSourceHasInstructionUsing(DisassembleSpirvBinary(plain.spirv), "OpAccessChain",
+                                       "%samplers %uint_0"),
+        "a host with view minimum LODs does not read the sampler's one entry");
+
+  options.host_features.image_view_min_lod = false;
+  const auto split = RecompileForTest(shader, options);
+  const auto* split_samplers =
+      ShaderRecompiler::IR::FindBinding(split.program.bindings, DescriptorBindingKind::Samplers);
+  Check(split_samplers != nullptr &&
+            split_samplers->resources == (std::vector<uint32_t>{SamplerSlot(0), SamplerSlot(0, 0)}),
+        "the sampler did not get an entry for the texture it is used with");
+  Check(ShaderRecompiler::IR::SamplerSlotSampler(SamplerSlot(3, 5)) == 3 &&
+            ShaderRecompiler::IR::SamplerSlotImage(SamplerSlot(3, 5)) == 5 &&
+            ShaderRecompiler::IR::SamplerSlotImage(SamplerSlot(3)) ==
+                ShaderRecompiler::IR::SamplerSlotNoImage &&
+            SamplerSlot(3, 5) != SamplerSlot(3, 4) && SamplerSlot(3, 0) != SamplerSlot(3),
+        "a sampler entry does not give back its sampler and texture");
+  const auto source = DisassembleSpirvBinary(split.spirv);
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "%samplers %uint_1") &&
+            !SpirvSourceHasInstructionUsing(source, "OpAccessChain", "%samplers %uint_0"),
+        "the texture is not read through its own sampler entry");
+  CheckSpirvBinaryValidates(split.spirv);
+}
+
 void TestImageAddressOperands() {
   using namespace ShaderRecompiler;
   struct Case {
@@ -14931,6 +14979,7 @@ int main() {
 #endif
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
   TestPixelAppendIsDoneByARealPixel();
+  TestSamplerEntryPerTexture();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
   TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();

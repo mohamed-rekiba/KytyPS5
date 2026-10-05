@@ -342,7 +342,9 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 
 uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource);
 
-uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
+// `image`: the texture the sampler is used with, or IR::SamplerSlotNoImage.
+uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler,
+                               uint32_t image = IR::SamplerSlotNoImage);
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler);
 
