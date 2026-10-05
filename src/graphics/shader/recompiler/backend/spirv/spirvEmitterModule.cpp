@@ -569,7 +569,7 @@ void DefineInputs(EmitterState& state) {
 		state.builder.AddAnnotation(spv::OpDecorate, state.helper_invocation_variable,
 		                            spv::DecorationBuiltIn, spv::BuiltInHelperInvocation);
 	}
-	if (state.requirements.subgroup_local_invocation_id) {
+	if (state.requirements.subgroup_local_invocation_id && !state.uniform_wave) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -775,14 +775,17 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
-	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
+	if (state.uniform_wave) {
+		// No subgroup operation is written.
+	} else if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
+	           state.requirements.subgroup_shuffle ||
+	           state.requirements.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
+	if (!state.uniform_wave && (state.lane_count == 2 || state.requirements.subgroup_ballot)) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
-	if (state.requirements.subgroup_shuffle) {
+	if (state.requirements.subgroup_shuffle && !state.uniform_wave) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	}
 	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {

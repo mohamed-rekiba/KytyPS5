@@ -10146,7 +10146,9 @@ void TestHostFeaturesGateUnavailableCapabilities() {
   // Subgroup operations are only allowed in the stages the device lists.
   {
     constexpr uint32_t kVertexStageBit = 0x1u;
-    // A lane exchange has no single-lane meaning, so it still needs the host's subgroup operations.
+    // In a stage with one guest lane per invocation, the lanes of the guest wave all hold the
+    // invocation's values. A value moved from another lane is then the invocation's own, and
+    // no subgroup operation of the host is needed.
     const std::array shader = {
         EncodeVop1(0x01, 0, 250), EncodeVop1Dpp(5), // V_MOV_B32 v0, v5 dpp
         EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), // position
@@ -10154,15 +10156,27 @@ void TestHostFeaturesGateUnavailableCapabilities() {
     };
     auto options = MakeCompileOptions(ShaderType::Vertex);
     (void)RecompileForTest(shader, options);
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     options.host_features.subgroup_supported_stages = ~kVertexStageBit;
-    ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-                "a vertex shader with a lane operation compiled without host support");
-#endif
-    // The same shader is fine in a stage the device lists (fragment 0x10 | compute 0x20).
+    const auto uniform = RecompileForTest(shader, options);
+    Check(!SpirvContainsCapability(uniform.spirv, 61u) &&
+              !SpirvContainsCapability(uniform.spirv, 64u) &&
+              !SpirvContainsCapability(uniform.spirv, 65u) &&
+              DisassembleSpirvBinary(uniform.spirv).find("SubgroupLocalInvocationId") ==
+                  std::string::npos,
+          "a lane move in a stage without subgroup operations still used them");
+    CheckSpirvBinaryValidates(uniform.spirv);
+    // A stage with several guest lanes in one host subgroup keeps the real operations, and
+    // stops when the device does not list the stage (fragment 0x10 | compute 0x20 are listed).
     auto compute = MakeCompileOptions(ShaderType::Compute);
     compute.host_features.subgroup_supported_stages = 0x32u;
-    (void)RecompileForTest(shader, compute);
+    const auto native = RecompileForTest(shader, compute);
+    Check(SpirvContainsCapability(native.spirv, 65u),
+          "a lane move in a compute shader lost the real shuffle");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    compute.host_features.subgroup_supported_stages = 0x12u; // no compute
+    ExpectFatal([&] { (void)RecompileForTest(shader, compute); },
+                "a compute shader with a lane operation compiled without host support");
+#endif
   }
 
   // Without subgroup operations in the stage, a guest wave is one invocation with one active lane.
@@ -10208,6 +10222,39 @@ void TestHostFeaturesGateUnavailableCapabilities() {
     Check(!SpirvContainsCapability(lowered.spirv, kCapabilityGroupNonUniformBallot) &&
               !SpirvContainsCapability(lowered.spirv, 61u),
           "a lane mask in a stage without subgroup operations still used them");
+    CheckSpirvBinaryValidates(lowered.spirv);
+  }
+
+  // A compiler keeps scalars it has no register for in the lanes of a vector register. A stage
+  // without subgroup operations must still give each one back from its own lane.
+  {
+    const uint32_t shader[] = {
+        EncodeSMovB32(9, 133),                                      // s9 = 5
+        EncodeVop3Word0(0x361, 86), EncodeVop3Word1(9, 131, 0),     // v_writelane_b32 v86, s9, 3
+        EncodeSMovB32(10, 135),                                     // s10 = 7
+        EncodeVop3Word0(0x361, 86), EncodeVop3Word1(10, 132, 0),    // v_writelane_b32 v86, s10, 4
+        EncodeVop3Word0(0x360, 11), EncodeVop3Word1(86 + 256, 131, 0), // v_readlane_b32 s11, v86, 3
+        EncodeVop3Word0(0x360, 12), EncodeVop3Word1(86 + 256, 132, 0), // v_readlane_b32 s12, v86, 4
+        EncodeVop1(0x01, 0, 11),                                    // v_mov_b32 v0, s11
+        EncodeVop1(0x01, 1, 12),                                    // v_mov_b32 v1, s12
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 0, 1),              // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.host_features.subgroup_supported_stages = 0x32u; // no vertex
+    options.dump_ir = true;
+    const auto lowered = RecompileForTest(shader, options);
+    Check(lowered.ir_dump.find("WriteLane") == std::string::npos &&
+              lowered.ir_dump.find("ReadLane") == std::string::npos,
+          "a scalar kept in a register lane still needs lane operations");
+    const auto source = DisassembleSpirvBinary(lowered.spirv);
+    Check(!SpirvContainsCapability(lowered.spirv, 64u) &&
+              source.find("SubgroupLocalInvocationId") == std::string::npos,
+          "a scalar kept in a register lane used subgroup operations");
+    // Lane 3 holds 5 and lane 4 holds 7, as integers in the position's x and y.
+    Check(SpirvSourceHasInstructionUsing(source, "OpCompositeConstruct", "%uint_5 %uint_7") ||
+              source.find("%uint_5 %uint_7 %uint_5 %uint_7") != std::string::npos,
+          "the scalars did not come back from the lanes they were put in");
     CheckSpirvBinaryValidates(lowered.spirv);
   }
 

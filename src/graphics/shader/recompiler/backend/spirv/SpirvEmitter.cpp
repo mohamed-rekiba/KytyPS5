@@ -23,8 +23,8 @@ namespace {
 // module later with a message that does not say which guest shader needed it.
 void ValidateHostFeatures(const IR::Program&                program,
                           const Emitter::SpirvRequirements& requirements,
-                          const ShaderHostFeatures&         host_features,
-                          ShaderStageInputInfo              input_info) {
+                          const ShaderHostFeatures& host_features, ShaderStageInputInfo input_info,
+                          bool uniform_wave) {
 	if (!host_features.buffer_int64_atomics && requirements.buffer_int64_atomics) {
 		Fail(program,
 		     "shader needs 64-bit buffer atomics (shaderBufferInt64Atomics), which the host GPU "
@@ -38,8 +38,8 @@ void ValidateHostFeatures(const IR::Program&                program,
 		Fail(program, "shader needs 64-bit floating point (shaderFloat64), which the host GPU "
 		              "does not enable");
 	}
-	if (requirements.subgroup_ballot || requirements.subgroup_shuffle ||
-	    requirements.subgroup_local_invocation_id) {
+	if (!uniform_wave && (requirements.subgroup_ballot || requirements.subgroup_shuffle ||
+	                      requirements.subgroup_local_invocation_id)) {
 		// VkShaderStageFlagBits value of the stage the SPIR-V runs in.
 		uint32_t stage_bit = 0;
 		const auto model     = program.stage == ShaderType::Mesh && input_info.vertex->mesh.emulated
@@ -446,7 +446,15 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
 	state.per_vertex_attributes = host_features.per_vertex_attributes;
-	ValidateHostFeatures(program, state.requirements, host_features, input_info);
+	// The stages with one guest lane per invocation (as in ShaderRecompiler.cpp).
+	const auto single_lane_stage_bit =
+	    program.stage == ShaderType::Vertex || program.stage == ShaderType::Local ? 0x1u
+	    : program.stage == ShaderType::TessellationEvaluation                     ? 0x4u
+	                                                                              : 0u;
+	state.uniform_wave = single_lane_stage_bit != 0u &&
+	                     (host_features.subgroup_supported_stages & single_lane_stage_bit) == 0u;
+	ValidateHostFeatures(program, state.requirements, host_features, input_info,
+	                     state.uniform_wave);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

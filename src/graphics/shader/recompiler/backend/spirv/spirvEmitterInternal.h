@@ -153,6 +153,11 @@ struct EmitterState {
 	bool                                           per_vertex_attributes                 = true;
 	// gl_HelperInvocation, in a pixel shader that moves an append or consume counter.
 	uint32_t                                       helper_invocation_variable            = 0;
+	// The stage has no subgroup operations on the host, and one guest lane per invocation. The
+	// guest wave is then lanes that all hold this invocation's values: the lane id is 0, a
+	// value read from another lane is the invocation's own, and a ballot has the predicate in
+	// every bit (see LowerLaneOpsToSingleLane, which does the same for what it can fold).
+	bool                                           uniform_wave                          = false;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
 	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
