@@ -454,6 +454,11 @@ add_executable(player_slots_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(player_slots_tests PRIVATE ${inc_headers})
 
+add_executable(redrawn_targets_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RedrawnTargetsTests.cpp"
+)
+target_include_directories(redrawn_targets_tests PRIVATE ${inc_headers})
+
 add_executable(program_list_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ProgramListTests.cpp"
 )
@@ -667,6 +672,7 @@ if(BUILD_TESTING)
 	add_test(NAME latest_value COMMAND $<TARGET_FILE:latest_value_tests>)
 	add_test(NAME program_list COMMAND $<TARGET_FILE:program_list_tests>)
 	add_test(NAME wait_budget COMMAND $<TARGET_FILE:wait_budget_tests>)
+	add_test(NAME redrawn_targets COMMAND $<TARGET_FILE:redrawn_targets_tests>)
 	add_test(NAME player_slots COMMAND $<TARGET_FILE:player_slots_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -751,6 +757,7 @@ if(BUILD_TESTING)
 		latest_value_tests
 		program_list_tests
 		wait_budget_tests
+		redrawn_targets_tests
 		player_slots_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests

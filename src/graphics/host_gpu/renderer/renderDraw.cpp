@@ -1187,6 +1187,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	for (const auto& stage: vertex_stages) {
 		must_wait = must_wait || HasShaderBufferWrites(stage.stage);
 	}
+	// Nor is a draw to a target that the game does not draw again in every frame: the hole
+	// would stay. Every target is noted, also when the draw has to wait anyway.
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		must_wait =
+		    !m_redrawn_targets.Draw(state.color_info[i].desc.info.data.address) || must_wait;
+	}
+	if (const auto depth = state.depth_info.desc.info.data.address; depth != 0) {
+		must_wait = !m_redrawn_targets.Draw(depth) || must_wait;
+	}
 	auto* const pipeline_or_none = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,

@@ -1576,6 +1576,7 @@ void CommandProcessor::Flip() {
 	if (auto* observer = CurrentObserver(); observer != nullptr) {
 		observer->OnFlip(m_flip.handle, m_flip.index);
 	}
+	m_renderer.GetRenderExecutor().NextFrame();
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
@@ -1592,6 +1593,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	if (auto* observer = CurrentObserver(); observer != nullptr) {
 		observer->OnFlip(m_flip.handle, m_flip.index);
 	}
+	m_renderer.GetRenderExecutor().NextFrame();
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {
@@ -1615,6 +1617,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (auto* observer = CurrentObserver(); observer != nullptr) {
 		observer->OnFlip(m_flip.handle, m_flip.index);
 	}
+	m_renderer.GetRenderExecutor().NextFrame();
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {
