@@ -80,6 +80,8 @@ struct SpirvRequirements {
 	bool centroid_barycentric         = false;
 	// The shader reads the barycentrics as values.
 	bool barycentric = false;
+	// The shader moves an append or consume counter.
+	bool append_consume = false;
 	// The first instruction that needs a subgroup operation, for messages.
 	std::string_view subgroup_reason;
 };
@@ -149,6 +151,8 @@ struct EmitterState {
 	uint32_t                   per_vertex_variable                   = 0;
 	// ShaderHostFeatures::per_vertex_attributes.
 	bool                                           per_vertex_attributes                 = true;
+	// gl_HelperInvocation, in a pixel shader that moves an append or consume counter.
+	uint32_t                                       helper_invocation_variable            = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
 	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;

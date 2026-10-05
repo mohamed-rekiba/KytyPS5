@@ -8044,6 +8044,39 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
 }
 #endif
 
+// One lane moves an append counter for all the lanes of its subgroup. In a pixel shader a lane may
+// be a helper pixel, whose atomic changes nothing and returns no defined value: the lane that
+// moves the counter is chosen among the real pixels.
+void TestPixelAppendIsDoneByARealPixel() {
+  constexpr uint32_t kBuiltInHelperInvocation = 23u;
+  const uint32_t shader[] = {
+      EncodeSMovB32(124, 129), // m0 = one counter
+      EncodeDs0(0x3e),         // ds_append
+      EncodeDs1(0, 0, 0),
+      EncodeExp0(0x00, 0xf),
+      EncodeExp1(0, 0, 0, 0),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo pixel{};
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  const auto result = RecompileForTest(shader, options);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvHasDecorationValue(result.spirv, 11u, kBuiltInHelperInvocation),
+        "a pixel shader that appends does not know which lanes are helper pixels");
+  Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%gl_HelperInvocation") &&
+            SpirvInstructionOpcodeCount(result.spirv, 339u) >= 2u,
+        "the appending lane is not chosen from a ballot of the real pixels");
+
+  // No other stage has helper lanes.
+  const uint32_t compute_shader[] = {EncodeSMovB32(124, 129), EncodeDs0(0x3e),
+                                     EncodeDs1(0, 0, 0), 0xbf810000u};
+  const auto compute =
+      RecompileForTest(compute_shader, MakeCompileOptions(ShaderType::Compute));
+  Check(!SpirvHasDecorationValue(compute.spirv, 11u, kBuiltInHelperInvocation),
+        "a compute shader asked for helper pixels");
+}
+
 void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(124, 129), // m0 = one counter
@@ -14850,6 +14883,7 @@ int main() {
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
 #endif
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
+  TestPixelAppendIsDoneByARealPixel();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
   TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();

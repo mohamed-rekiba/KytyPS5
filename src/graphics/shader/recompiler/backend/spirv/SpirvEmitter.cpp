@@ -361,6 +361,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
+				case IR::ValueOpcode::DataAppend:
+				case IR::ValueOpcode::DataConsume: requirements.append_consume = true; break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:
 				case IR::ValueOpcode::ReadLane: {
