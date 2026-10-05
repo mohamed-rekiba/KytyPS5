@@ -85,6 +85,9 @@ struct DeviceCapabilities {
 	bool push_descriptors = false;
 	// Fragment barycentrics interpolated at the centroid. MoltenVK cannot translate them to Metal.
 	bool centroid_barycentric = false;
+	// A pixel shader input with the raw values of the three vertices of its triangle. MoltenVK
+	// cannot translate it to Metal.
+	bool per_vertex_attributes = false;
 };
 
 struct DeviceDecision {

@@ -48,6 +48,18 @@ uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo
 	return 0;
 }
 
+uint32_t CopyVariableForExport(const EmitterState& state, const IR::ExportInfo& exp) {
+	if (exp.kind != IR::ExportTargetKind::Parameter) {
+		return 0;
+	}
+	for (const auto& binding: state.outputs) {
+		if (binding.kind == IR::StageOutputKind::Parameter && binding.index == exp.index) {
+			return binding.copy_variable_id;
+		}
+	}
+	return 0;
+}
+
 uint32_t          ConstantU32(EmitterState& state, uint32_t value);
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,

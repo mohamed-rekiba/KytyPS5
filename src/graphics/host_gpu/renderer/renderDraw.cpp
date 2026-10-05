@@ -28,6 +28,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/triangleVertexValueShader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -1162,6 +1163,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	// The pixel shader reads the raw values of its triangle's three vertices, and the host has
+	// no pixel shader input for them: the triangles are drawn as patches, through tessellation
+	// shaders that hand the values over (see triangleVertexValueShader.h).
+	if (state.ps_active && !m_context.GetGraphics().shader_host_features.per_vertex_attributes &&
+	    ShaderPixelReadsVertexValues(state.ps_input_info)) {
+		if (topology != vk::PrimitiveTopology::eTriangleList || vertex_stages.size() != 1 ||
+		    mesh_active) {
+			EXIT("a pixel shader reads raw vertex values in a draw that is not a plain triangle "
+			     "list, which the host GPU cannot do yet: primitive=%u stages=%u mesh=%u\n",
+			     static_cast<uint32_t>(ucfg.GetPrimType()),
+			     static_cast<uint32_t>(vertex_stages.size()), static_cast<uint32_t>(mesh_active));
+		}
+		topology = vk::PrimitiveTopology::ePatchList;
+		// A list has no strips to restart, and a patch list may not have the restart index.
+		primitive_restart_enable = false;
+	}
+
 	// A draw that writes buffers from a shader, or clears its depth target, changes more than
 	// the picture of this frame: it is never left out.
 	bool must_wait = state.depth_info.depth_clear_enable ||

@@ -28,11 +28,16 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 struct InputBinding : IR::StageInput {
 	uint32_t variable_id = 0;
+	// The flat inputs with the value at each vertex of the triangle, on a host with no per-vertex
+	// inputs.
+	std::array<uint32_t, 3> vertex_value_variables {};
 };
 
 struct OutputBinding : IR::StageOutput {
 	uint32_t variable_id        = 0;
 	uint32_t mesh_data_variable = 0;
+	// A second output that gets the same value (ShaderVertexInputInfo::param_copy_location).
+	uint32_t copy_variable_id = 0;
 };
 
 using ImageDimension = Decoder::ImageDimension;
@@ -73,6 +78,8 @@ struct SpirvRequirements {
 	bool coherent_buffers             = false;
 	bool float64                      = false;
 	bool centroid_barycentric         = false;
+	// The shader reads the barycentrics as values.
+	bool barycentric = false;
 	// The first instruction that needs a subgroup operation, for messages.
 	std::string_view subgroup_reason;
 };
@@ -140,6 +147,8 @@ struct EmitterState {
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
+	// ShaderHostFeatures::per_vertex_attributes.
+	bool                                           per_vertex_attributes                 = true;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
 	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
@@ -294,6 +303,8 @@ uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind ki
 
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
+// The second output a parameter export also writes, or 0.
+uint32_t CopyVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 

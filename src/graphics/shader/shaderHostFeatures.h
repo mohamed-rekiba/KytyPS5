@@ -17,6 +17,10 @@ struct ShaderHostFeatures {
 	bool float64                     = true;
 	// Barycentrics interpolated at the centroid (a multisampled shader that reads them).
 	bool centroid_barycentric = true;
+	// A pixel shader input that holds the raw values of the three vertices of its triangle
+	// (PerVertexKHR). Without it the values come through three more flat inputs, which
+	// tessellation shaders made for the draw fill in (see triangleVertexValueShader.h).
+	bool per_vertex_attributes = true;
 	// Stages that may use subgroup operations: VkPhysicalDeviceVulkan11Properties::
 	// subgroupSupportedStages, as VkShaderStageFlagBits values. All bits set means every stage.
 	uint32_t subgroup_supported_stages = ~0u;

@@ -100,7 +100,8 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	caps.depth_bounds = facts.depth_bounds;
 	caps.push_descriptors =
 	    HasExtension(facts.extensions, kPushDescriptorExtension) && !facts.driver_is_moltenvk;
-	caps.centroid_barycentric = caps.fragment_shader_barycentric && !facts.driver_is_moltenvk;
+	caps.centroid_barycentric  = caps.fragment_shader_barycentric && !facts.driver_is_moltenvk;
+	caps.per_vertex_attributes = caps.fragment_shader_barycentric && !facts.driver_is_moltenvk;
 
 	const auto note = [&](bool available, const char* line) {
 		if (!available) {
@@ -119,8 +120,12 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	note(caps.shader_shared_int64_atomics,
 	     "64-bit LDS atomics are unavailable: a shader that uses them stops the emulator");
 	note(caps.fragment_shader_barycentric,
-	     "fragmentShaderBarycentric is unavailable: a shader that reads barycentrics or raw vertex "
-	     "attributes stops the emulator");
+	     "fragmentShaderBarycentric is unavailable: a shader that reads barycentrics stops the "
+	     "emulator");
+	// Not an error: tessellation shaders made for the draw carry the values instead.
+	note(caps.per_vertex_attributes,
+	     "per-vertex pixel shader inputs are unavailable: a draw whose pixel shader reads raw "
+	     "vertex attributes is drawn through tessellation shaders");
 	note(caps.depth_bounds,
 	     "depthBounds is unavailable: a draw that enables the depth bounds test stops the "
 	     "emulator");

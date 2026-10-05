@@ -12,6 +12,10 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
                                   ShaderHostFeatures host_features = {});
 
+// How many clip distances the shader of this stage with these outputs writes. This counts the one
+// the emitter adds to a vertex shader to cut away vertices with an invalid position.
+uint32_t VertexClipDistanceCount(ShaderType stage, const IR::ShaderInfo& info);
+
 // A host without mesh shaders runs a mesh program as a compute shader (EmitProgram with an emulated
 // mesh program). This is the vertex shader that draws what the compute shader wrote: one triangle
 // per primitive slot of every workgroup, with the position and parameter outputs read back from

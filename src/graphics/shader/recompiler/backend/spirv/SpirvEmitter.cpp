@@ -78,12 +78,20 @@ void ValidateHostFeatures(const IR::Program&                program,
 		Fail(program, "multisampled shader reads barycentrics at the centroid, which the host GPU "
 		              "cannot interpolate");
 	}
-	if (!host_features.fragment_shader_barycentric &&
-	    std::ranges::any_of(program.info.inputs, [](const IR::StageInput& input) {
-		    return input.per_vertex || input.kind == IR::StageInputKind::BaryCoordSmooth ||
-		           input.kind == IR::StageInputKind::BaryCoordSmoothCentroid ||
-		           input.kind == IR::StageInputKind::BaryCoordNoPerspective;
-	    })) {
+	// Without per-vertex inputs the raw vertex values come through flat inputs, and the shader
+	// has the barycentric builtin only when it reads the barycentrics as values.
+	const bool barycentric =
+	    host_features.per_vertex_attributes
+	        ? std::ranges::any_of(
+	              program.info.inputs,
+	              [](const IR::StageInput& input) {
+		              return input.per_vertex ||
+		                     input.kind == IR::StageInputKind::BaryCoordSmooth ||
+		                     input.kind == IR::StageInputKind::BaryCoordSmoothCentroid ||
+		                     input.kind == IR::StageInputKind::BaryCoordNoPerspective;
+	              })
+	        : requirements.barycentric;
+	if (!host_features.fragment_shader_barycentric && barycentric) {
 		Fail(program,
 		     "shader reads barycentrics or raw vertex attributes (fragmentShaderBarycentric), "
 		     "which the host GPU does not enable");
@@ -386,11 +394,16 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					requirements.subgroup_local_invocation_id |=
 					    program.stage != ShaderType::TessellationControl;
 					break;
-				case IR::ValueOpcode::GetBuiltin:
+				case IR::ValueOpcode::GetBuiltin: {
+					const auto kind = static_cast<IR::StageInputKind>(inst.Arg(0).U32());
 					requirements.centroid_barycentric |=
-					    inst.Arg(0).U32() ==
-					    static_cast<uint32_t>(IR::StageInputKind::BaryCoordSmoothCentroid);
+					    kind == IR::StageInputKind::BaryCoordSmoothCentroid;
+					requirements.barycentric |=
+					    kind == IR::StageInputKind::BaryCoordSmooth ||
+					    kind == IR::StageInputKind::BaryCoordSmoothCentroid ||
+					    kind == IR::StageInputKind::BaryCoordNoPerspective;
 					break;
+				}
 				case IR::ValueOpcode::ImageQueryLod: requirements.compute_derivatives = true; break;
 				case IR::ValueOpcode::ImageGatherRaw:
 					requirements.image_gather_extended = true;
@@ -430,6 +443,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
+	state.per_vertex_attributes = host_features.per_vertex_attributes;
 	ValidateHostFeatures(program, state.requirements, host_features, input_info);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
