@@ -29,11 +29,16 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 struct InputBinding : IR::StageInput {
 	uint32_t variable_id = 0;
+	// The flat inputs with the value at each vertex of the triangle, on a host with no per-vertex
+	// inputs.
+	std::array<uint32_t, 3> vertex_value_variables {};
 };
 
 struct OutputBinding : IR::StageOutput {
 	uint32_t variable_id        = 0;
 	uint32_t mesh_data_variable = 0;
+	// A second output that gets the same value (ShaderVertexInputInfo::param_copy_location).
+	uint32_t copy_variable_id = 0;
 };
 
 using ImageDimension = Decoder::ImageDimension;
@@ -78,6 +83,9 @@ struct SpirvRequirements {
 	bool float64                      = false;
 	// The shader moves an append or consume counter.
 	bool append_consume = false;
+	// The shader reads the barycentrics as values, and at the centroid.
+	bool barycentric          = false;
+	bool centroid_barycentric = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
@@ -320,6 +328,8 @@ uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind ki
 
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
+// The second output a parameter export also writes, or 0.
+uint32_t CopyVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
@@ -352,7 +362,9 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0,
                              uint32_t array_index = 0);
 
-uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
+// `image`: the texture the sampler is used with, or IR::SamplerSlotNoImage.
+uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler,
+                               uint32_t image = IR::SamplerSlotNoImage);
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
                           uint32_t mip = 0, uint32_t array_index = 0);

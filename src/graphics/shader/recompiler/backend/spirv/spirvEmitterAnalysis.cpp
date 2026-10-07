@@ -48,6 +48,18 @@ uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo
 	return 0;
 }
 
+uint32_t CopyVariableForExport(const EmitterState& state, const IR::ExportInfo& exp) {
+	if (exp.kind != IR::ExportTargetKind::Parameter) {
+		return 0;
+	}
+	for (const auto& binding: state.outputs) {
+		if (binding.kind == IR::StageOutputKind::Parameter && binding.index == exp.index) {
+			return binding.copy_variable_id;
+		}
+	}
+	return 0;
+}
+
 uint32_t          ConstantU32(EmitterState& state, uint32_t value);
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,
@@ -161,9 +173,18 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 	return image;
 }
 
-uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
+uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t image) {
+	// The entry of the sampler for this texture, when the layout has one.
+	auto        slot = IR::SamplerSlot(sampler);
+	const auto* descriptor =
+	    IR::FindBinding(state.program.bindings, IR::DescriptorBindingKind::Samplers);
+	if (descriptor != nullptr && image != IR::SamplerSlotNoImage &&
+	    std::ranges::find(descriptor->resources, IR::SamplerSlot(sampler, image)) !=
+	        descriptor->resources.end()) {
+		slot = IR::SamplerSlot(sampler, image);
+	}
 	const auto array_index =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, slot);
 	const auto sampler_type = state.builder.Type(spv::OpTypeSampler);
 	const auto pointer_type =
 	    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, sampler_type);

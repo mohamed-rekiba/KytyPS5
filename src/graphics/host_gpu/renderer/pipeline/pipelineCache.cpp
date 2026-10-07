@@ -1071,6 +1071,20 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		// What the pixel shader reads both flat and interpolated, the last vertex stage writes
+		// twice.
+		std::vector<uint32_t> active_inputs;
+		for (const auto& input: pixel_info.stage.program->info.inputs) {
+			if (input.kind == ShaderRecompiler::IR::StageInputKind::Parameter) {
+				active_inputs.push_back(input.location);
+			}
+		}
+		auto& last_stage               = vertex_info[tess_active ? 2u : 0u];
+		last_stage.param_copy_location = ShaderVertexParameterCopies(pixel_info, active_inputs);
+		// A mesh program writes its parameters to records, which have one place for each.
+		EXIT_NOT_IMPLEMENTED(mesh_active &&
+		                     std::ranges::any_of(last_stage.param_copy_location,
+		                                         [](uint8_t location) { return location != 0; }));
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);

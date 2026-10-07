@@ -112,11 +112,20 @@ std::optional<MissingCapability> FindMissingCapability(const IR::Program& progra
 		                         return input.kind == IR::StageInputKind::BaryCoordSmooth ||
 		                                input.kind == IR::StageInputKind::BaryCoordNoPerspective;
 	                         });
+	// Without per-vertex inputs the raw vertex values come through flat inputs (see
+	// triangleVertexValueShader.h), and the shader has the barycentric builtin only when it reads
+	// the barycentrics as values.
+	if (host.faults.no_per_vertex_inputs) {
+		if (!caps.fragment_barycentric && requirements.barycentric) {
+			return MissingCapability {"barycentrics", "fragmentShaderBarycentric"};
+		}
+		if (host.faults.no_centroid_barycentric && requirements.centroid_barycentric) {
+			return MissingCapability {"barycentrics at the centroid", "centroid BaryCoordKHR"};
+		}
+		return std::nullopt;
+	}
 	if (!caps.fragment_barycentric && (per_vertex || barycentric)) {
 		return MissingCapability {"barycentrics or raw vertex values", "fragmentShaderBarycentric"};
-	}
-	if (host.faults.no_per_vertex_inputs && per_vertex) {
-		return MissingCapability {"raw vertex values in a pixel shader", "PerVertexKHR inputs"};
 	}
 	if (host.faults.no_centroid_barycentric && centroid) {
 		return MissingCapability {"barycentrics at the centroid", "centroid BaryCoordKHR"};
@@ -194,8 +203,12 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	std::array<bool, KindCount> seen {};
 	for (const auto& binding: program.bindings.descriptors) {
 		const auto kind = static_cast<size_t>(binding.kind);
+		// The sampler binding may also have an entry for each texture a sampler is used with.
+		const bool per_texture_samplers =
+		    binding.kind == Kind::Samplers &&
+		    binding.resources == IR::SamplerBindingEntries(program.info, true);
 		if (kind >= KindCount || seen[kind] || !present[kind] ||
-		    binding.resources != expected[kind]) {
+		    (binding.resources != expected[kind] && !per_texture_samplers)) {
 			Fail(program, "native descriptor groups do not match shader topology");
 		}
 		seen[kind] = true;
@@ -436,6 +449,16 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					requirements.subgroup_local_invocation_id |=
 					    program.stage != ShaderType::TessellationControl;
 					break;
+				case IR::ValueOpcode::GetBuiltin: {
+					const auto kind = static_cast<IR::StageInputKind>(inst.Arg(0).U32());
+					requirements.centroid_barycentric |=
+					    kind == IR::StageInputKind::BaryCoordSmoothCentroid;
+					requirements.barycentric |=
+					    kind == IR::StageInputKind::BaryCoordSmooth ||
+					    kind == IR::StageInputKind::BaryCoordSmoothCentroid ||
+					    kind == IR::StageInputKind::BaryCoordNoPerspective;
+					break;
+				}
 				case IR::ValueOpcode::ImageQueryLod: requirements.compute_derivatives = true; break;
 				case IR::ValueOpcode::ImageGatherRaw:
 					requirements.image_gather_extended = true;

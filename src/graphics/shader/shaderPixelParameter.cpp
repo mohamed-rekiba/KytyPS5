@@ -1,6 +1,7 @@
+#include "common/assert.h"
 #include "graphics/shader/shader.h"
 
-#include "common/assert.h"
+#include <bit>
 
 namespace Libs::Graphics {
 
@@ -46,6 +47,41 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
 		}
 	}
 	return ShaderPixelParameterMappedLocation(info, input);
+}
+
+std::array<uint8_t, 32> ShaderVertexParameterCopies(const ShaderPixelInputInfo& info,
+                                                    std::span<const uint32_t>   active_inputs) {
+	std::array<uint8_t, 32> copies {};
+	for (const auto input: active_inputs) {
+		const auto parameter = ShaderPixelParameterMappedLocation(info, input);
+		const auto location  = ShaderPixelParameterLocation(info, active_inputs, input);
+		if (location != parameter) {
+			copies[parameter] = static_cast<uint8_t>(location + 1u);
+		}
+	}
+	return copies;
+}
+
+std::array<uint32_t, 3> ShaderPixelVertexValueLocations(uint32_t used_locations,
+                                                        uint32_t per_vertex_locations,
+                                                        uint32_t location) {
+	EXIT_IF(location >= 32u || (per_vertex_locations & (1u << location)) == 0u);
+	// The lowest free locations, three for each input in the order of the inputs' locations.
+	uint32_t free = ~used_locations;
+	for (uint32_t input = 0;; input++) {
+		if ((per_vertex_locations & (1u << input)) == 0u) {
+			continue;
+		}
+		std::array<uint32_t, 3> locations {};
+		for (auto& value: locations) {
+			EXIT_NOT_IMPLEMENTED(free == 0u);
+			value = static_cast<uint32_t>(std::countr_zero(free));
+			free &= free - 1u;
+		}
+		if (input == location) {
+			return locations;
+		}
+	}
 }
 
 bool ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input) {

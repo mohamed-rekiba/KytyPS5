@@ -147,6 +147,10 @@ struct ShaderVertexInputInfo {
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+	// A pixel shader may read one parameter both flat and interpolated. It then reads the two
+	// at different locations (see ShaderPixelParameterLocation), and the last vertex stage must
+	// write the parameter to both. For each parameter: the second location plus one, or zero.
+	std::array<uint8_t, RES_MAX> param_copy_location {};
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
@@ -221,6 +225,17 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
 bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
+// ShaderVertexInputInfo::param_copy_location for a vertex stage whose parameters this pixel
+// shader reads through `active_inputs`.
+std::array<uint8_t, 32> ShaderVertexParameterCopies(const ShaderPixelInputInfo& info,
+                                                    std::span<const uint32_t>   active_inputs);
+// On a host with no per-vertex pixel shader inputs, an input whose raw vertex values the shader
+// reads gets three more flat inputs: the value at each vertex of the triangle. This gives their
+// locations for the input at `location`. `used_locations` has a bit for every location the
+// shader's inputs take, and `per_vertex_locations` a bit for each of them that needs the values.
+std::array<uint32_t, 3> ShaderPixelVertexValueLocations(uint32_t used_locations,
+                                                        uint32_t per_vertex_locations,
+                                                        uint32_t location);
 
 struct ShaderSharp {
 	uint16_t offset_dw : 15;

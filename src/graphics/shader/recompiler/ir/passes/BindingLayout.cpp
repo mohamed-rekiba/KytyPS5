@@ -111,7 +111,25 @@ bool UsesFlattenedSrt(const Program& program) {
 	       std::ranges::any_of(program.info.images, uses_mapping);
 }
 
-void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage) {
+std::vector<uint32_t> SamplerBindingEntries(const ShaderInfo& info, bool sampler_per_texture) {
+	std::vector<uint32_t> entries(info.samplers.size());
+	for (uint32_t i = 0; i < entries.size(); i++) {
+		entries[i] = SamplerSlot(i);
+	}
+	if (sampler_per_texture) {
+		// After the plain entries, which serve a read whose texture is not known here.
+		for (const auto& pair: info.sampled_pairs) {
+			const auto slot = SamplerSlot(pair.sampler, pair.image);
+			if (std::ranges::find(entries, slot) == entries.end()) {
+				entries.push_back(slot);
+			}
+		}
+	}
+	return entries;
+}
+
+void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage,
+                      bool sampler_per_texture) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
@@ -157,10 +175,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 	}
 
 	if (!program.info.samplers.empty()) {
-		std::vector<uint32_t> resources(program.info.samplers.size());
-		for (uint32_t i = 0; i < resources.size(); i++) {
-			resources[i] = i;
-		}
+		auto resources = SamplerBindingEntries(program.info, sampler_per_texture);
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
 	if (shared.gds) {

@@ -166,7 +166,7 @@ uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 		state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
 		return value;
 	};
-	if (input->per_vertex) {
+	if (input->per_vertex && !state.host.faults.no_per_vertex_inputs) {
 		const auto barycentric_kind = state.input_info.pixel->ps_no_perspective
 		                                  ? IR::StageInputKind::BaryCoordNoPerspective
 		                                  : IR::StageInputKind::BaryCoordSmooth;
@@ -214,9 +214,16 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
 	const auto load_vertex = [&](uint32_t vertex) {
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer,
-		    input->variable_id, ConstantU32(state, vertex), ConstantU32(state, chan & 3u));
+		if (!state.host.faults.no_per_vertex_inputs) {
+			state.builder.AddFunction(spv::OpAccessChain,
+			                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
+			                          pointer, input->variable_id, ConstantU32(state, vertex),
+			                          ConstantU32(state, chan & 3u));
+		} else {
+			state.builder.AddFunction(
+			    spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)),
+			    pointer, input->vertex_value_variables[vertex], ConstantU32(state, chan & 3u));
+		}
 		state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
 		return value;
 	};
@@ -591,6 +598,9 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(spv::OpStore, pointer, value);
 		} else {
 			state.builder.AddFunction(spv::OpStore, variable, value);
+			if (const auto copy = CopyVariableForExport(state, exp); copy != 0) {
+				state.builder.AddFunction(spv::OpStore, copy, value);
+			}
 		}
 	});
 }

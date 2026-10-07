@@ -5,8 +5,13 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// The entries of the sampler binding: one for each sampler, and with `sampler_per_texture` also
+// one for each texture a sampler is used with (see SamplerSlot).
+std::vector<uint32_t> SamplerBindingEntries(const ShaderInfo& info, bool sampler_per_texture);
+
+// `sampler_per_texture`: see SamplerBindingEntries.
 void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0,
-                      bool lds_storage = false);
+                      bool lds_storage = false, bool sampler_per_texture = false);
 
 struct SharedMemoryResources {
 	bool lds = false;

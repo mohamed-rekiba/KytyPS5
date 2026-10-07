@@ -18,6 +18,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/triangleVertexValueShader.h"
 
 #include <algorithm>
 #include <limits>
@@ -235,8 +236,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const bool mesh_emulated = mesh && vs_input_info.stage.program->mesh_emulated;
 	EXIT_NOT_IMPLEMENTED(mesh && !mesh_emulated && !graphics.host.capabilities.mesh_shader);
 	EXIT_IF(mesh_emulated && vertex_program.mesh_vertex_module == nullptr);
-	const bool rect_list =
+	// A patch list with no guest tessellation is one of two things the emulator draws through
+	// tessellation shaders of its own. The draw path asks for vertex values only for triangle
+	// lists, so the two cannot meet.
+	const bool patches =
 	    !mesh && !tessellation && static_params.topology == vk::PrimitiveTopology::ePatchList;
+	const bool vertex_values = patches && ps_active &&
+	                           graphics.host.faults.no_per_vertex_inputs &&
+	                           ShaderPixelReadsVertexValues(*ps_input_info);
+	const bool rect_list     = patches && !vertex_values;
 
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
@@ -257,8 +265,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		}
 	}
 
+	if (vertex_values) {
+		const auto shaders = BuildTriangleVertexValueShaders(vs_input_info, *ps_input_info,
+		                                                     static_params.provoking_vtx_last);
+		tess_control_shader_module = CompileSPV(shaders.control, graphics.device);
+		tess_eval_shader_module    = CompileSPV(shaders.evaluation, graphics.device);
+	}
+
 	EXIT_NOT_IMPLEMENTED(
-	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
+	    patches && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
@@ -274,7 +289,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		              .module = programs.vertex[i].module,
 		              .pName  = "main"};
 	}
-	if (rect_list) {
+	if (patches) {
 		shader_stages[shader_stage_count++] = {.stage =
 		                                           vk::ShaderStageFlagBits::eTessellationControl,
 		                                       .module = tess_control_shader_module,
@@ -560,7 +575,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
 	tessellation_state.patchControlPoints =
 	    tessellation ? vs_input_info.tess.input_control_points : 3u;
-	pipeline_info.pTessellationState = (rect_list || tessellation) ? &tessellation_state : nullptr;
+	pipeline_info.pTessellationState = (patches || tessellation) ? &tessellation_state : nullptr;
 	pipeline_info.pViewportState          = &viewport_state;
 	pipeline_info.pRasterizationState     = &rasterizer;
 	pipeline_info.pMultisampleState       = &multisampling;

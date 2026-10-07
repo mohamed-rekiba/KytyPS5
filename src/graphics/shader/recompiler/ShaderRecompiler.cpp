@@ -679,7 +679,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::CollectShaderInfo(ir, options.input_info);
 	IR::AllocateBindings(ir, push_data_start_dword,
 	                     ir.stage == ShaderType::Compute && options.input_info.compute != nullptr &&
-	                         options.input_info.compute->lds_storage);
+	                         options.input_info.compute->lds_storage,
+	                     !options.host.capabilities.image_view_min_lod);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);

@@ -615,6 +615,12 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		}
 	}
 
+	for (uint32_t i = 0; i < info.param_copy_location.size(); i += 4) {
+		key.push_back(info.param_copy_location[i] | (info.param_copy_location[i + 1] << 8u) |
+		              (info.param_copy_location[i + 2] << 16u) |
+		              (static_cast<uint32_t>(info.param_copy_location[i + 3]) << 24u));
+	}
+
 	key.push_back(info.mesh.threads_num[0]);
 	if (info.mesh.threads_num[0] != 0) {
 		const auto& mesh = info.mesh;
