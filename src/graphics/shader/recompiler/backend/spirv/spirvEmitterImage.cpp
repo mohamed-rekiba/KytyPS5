@@ -523,8 +523,9 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 	                                 Binary(state, spv::OpFMul, TypeF32(state), coord, width_f32),
 	                                 ConstantF32(state, 0x3f000000u)));
 
-	const auto sampled = MakeSampledImage(state, mem.resource,
-	                                     LoadSamplerDescriptor(state, mem.sampler));
+	const auto sampled =
+	    MakeSampledImage(state, mem.resource,
+	                     LoadSamplerDescriptor(state, mem.sampler, mem.resource));
 	const auto vector_type = ImageVectorType(state, numeric_class, 4);
 	const auto scalar_type = ImageScalarType(state, numeric_class);
 	const auto component = ImageGatherSource(state, mem);
@@ -634,8 +635,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (op == IR::ValueOpcode::ImageQueryLod) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
 		const auto dimension = image.dimension;
-		const auto sampled = MakeSampledImage(state, mem.resource,
-		                                     LoadSamplerDescriptor(state, mem.sampler));
+		const auto sampled =
+		    MakeSampledImage(state, mem.resource,
+		                     LoadSamplerDescriptor(state, mem.sampler, mem.resource));
 		const auto lod       = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    spv::OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled,
@@ -748,7 +750,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				operand_mask = spv::ImageOperandsOffsetMask;
 				offset = PackedOffset(ctx, mem, *address, layout, dimension);
 			}
-			const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
+			const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, mem.resource);
 			const auto EmitGather = [&](uint32_t mip) {
 				const auto sampled = MakeSampledImage(state, mem.resource, sampler_id, mip);
 				const auto sample = state.builder.AllocateId();
@@ -808,9 +810,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands[1] = AddressF32(ctx, mem, *address, layout.bias);
 			operand_count = 2;
 		}
-		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index = 0u) {
-			const auto& candidate = state.program.info.images[resource];
+			// The sampler's entry for this texture, where the layout has one for each.
+			const auto  sampler_id = LoadSamplerDescriptor(state, mem.sampler, resource);
+			const auto& candidate  = state.program.info.images[resource];
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,

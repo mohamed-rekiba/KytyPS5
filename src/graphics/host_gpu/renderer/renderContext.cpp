@@ -2,7 +2,9 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -62,7 +64,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		constexpr uint64_t window = 64 * 1024;
+		m_buffer_cache.InvalidateWrittenMemory(
+		    fault_vaddr, IsMapped(Common::AlignDown(fault_vaddr, window), window));
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
@@ -90,6 +94,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_buffer_cache.RequestFullSynchronization();
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -113,6 +118,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_buffer_cache.RequestFullSynchronization();
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -123,19 +129,51 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
-void RenderContext::PrepareBda() {
+void RenderContext::PrepareBda(bool shader_writes_addresses) {
+	if (shader_writes_addresses) {
+		m_texture_cache.DropColorMetadataFills();
+		m_buffer_cache.NoteAddressWrites();
+	}
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
 	m_fault_process_pending = true;
+	// Shaders that read through device addresses can read any cached buffer, so every buffer must
+	// hold the CPU's latest bytes. Walking all of them before each dispatch is expensive with
+	// thousands of buffers; the buffer cache logs where the CPU wrote, and only those ranges are
+	// synchronized. A full walk runs when the log overflowed or the mapping changed.
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	struct UploadBatch {
+		BufferCache& cache;
+		explicit UploadBatch(BufferCache& buffer_cache): cache(buffer_cache) {
+			cache.BeginUploadBatch();
+		}
+		~UploadBatch() { cache.EndUploadBatch(); }
+	} upload_batch {m_buffer_cache};
+	if (!m_buffer_cache.TakeCpuWrites(m_bda_cpu_writes)) {
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+		return;
+	}
+	for (const auto& write: m_bda_cpu_writes) {
+		m_mapped_ranges.ForEachInRange(
+		    write.address, write.size, [this](uint64_t start, uint64_t end) {
+			    m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		    });
+	}
 }
 
 void RenderContext::RunGarbageCollector() {
+	// Pages the guest stopped rewriting are protected again after a while.
+	constexpr uint64_t CoolPeriodMs = 5000;
+	if (const auto now = Common::Timer::QueryPerformanceCounter() * 1000 /
+	                     Common::Timer::QueryPerformanceFrequency();
+	    now - m_last_heat_cool_ms >= CoolPeriodMs) {
+		m_last_heat_cool_ms = now;
+		RegionManager::CoolAllRegions();
+	}
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

@@ -15,11 +15,14 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <array>
+#include <cstring>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -41,10 +44,48 @@
 
 namespace Libs::Graphics {
 
-struct ShaderMapEntry {
-	ShaderMappedData data;
-	uint64_t hash;
+// The shader header's tables, copied out of guest memory when the shader is mapped. The header
+// is static, and a read of the guest mapping would wait for the GPU whenever its 16 KiB page
+// holds any GPU-written byte (the GPU thread stalled 25 ms per read on it).
+struct ShaderOwnedMetadata {
+	ShaderUserData                           user_data {};
+	std::vector<uint16_t>                    direct_offsets;
+	std::array<std::vector<ShaderSharp>, 4>  sharps;
+	std::vector<ShaderSemantic>              semantics;
 };
+
+struct ShaderMapEntry {
+	ShaderMappedData                           data;
+	uint64_t                                   hash;
+	std::shared_ptr<const ShaderOwnedMetadata> owned;
+};
+
+static std::shared_ptr<const ShaderOwnedMetadata> ShaderCopyMetadata(ShaderMappedData& data) {
+	auto owned = std::make_shared<ShaderOwnedMetadata>();
+	if (data.user_data != nullptr) {
+		std::memcpy(&owned->user_data, data.user_data, sizeof(owned->user_data));
+		if (owned->user_data.direct_resource_offset != nullptr) {
+			owned->direct_offsets.assign(owned->user_data.direct_resource_offset,
+			                             owned->user_data.direct_resource_offset +
+			                                 owned->user_data.direct_resource_count);
+			owned->user_data.direct_resource_offset = owned->direct_offsets.data();
+		}
+		for (size_t i = 0; i < owned->sharps.size(); i++) {
+			if (owned->user_data.sharp_resource_offset[i] != nullptr) {
+				owned->sharps[i].assign(owned->user_data.sharp_resource_offset[i],
+				                        owned->user_data.sharp_resource_offset[i] +
+				                            owned->user_data.sharp_resource_count[i]);
+				owned->user_data.sharp_resource_offset[i] = owned->sharps[i].data();
+			}
+		}
+		data.user_data = &owned->user_data;
+	}
+	if (data.input_semantics != nullptr) {
+		owned->semantics.assign(data.input_semantics, data.input_semantics + data.num_input_semantics);
+		data.input_semantics = owned->semantics.data();
+	}
+	return owned;
+}
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
@@ -63,8 +104,10 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 		     addr, data.code_size_bytes);
 	}
 	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
+	ShaderMapEntry entry {data, hash, nullptr};
+	entry.owned = ShaderCopyMetadata(entry.data);
 	std::scoped_lock lock(g_shader_map_mutex);
-	(*g_shader_map)[addr] = {data, hash};
+	(*g_shader_map)[addr] = std::move(entry);
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
@@ -502,7 +545,29 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			     shader_addr);
 			return false;
 		}
-		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
+		// Both tables are read through the backing: a read of the guest mapping waits for the
+		// GPU whenever the 16 KiB page holds any GPU-written byte, the backing read only when
+		// these bytes are (TryReadBufferBacking). The attribute table is read whole; of the
+		// buffer table only the entries the attributes name.
+		std::array<uint32_t, 256>     attrib_copy {};
+		std::array<uint32_t, 32 * 4>  buffer_copy {};
+		uint32_t                      attrib_count = 0;
+		for (const auto& in: metadata.input_semantics) {
+			attrib_count = std::max<uint32_t>(attrib_count, in.semantic + 1u);
+		}
+		auto read = [](const uint32_t* guest, uint32_t* out, size_t dwords) {
+			if (!LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(guest), out,
+			                                             dwords * sizeof(uint32_t))) {
+				std::memcpy(out, guest, dwords * sizeof(uint32_t));
+			}
+		};
+		read(attrib, attrib_copy.data(), attrib_count);
+		for (const auto& in: metadata.input_semantics) {
+			const auto index = attrib_copy[in.semantic] & 0x1fu;
+			read(buffer + static_cast<size_t>(index) * 4u, buffer_copy.data() + index * 4u, 4);
+		}
+		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib_copy.data(),
+		                           buffer_copy.data());
 		ShaderDetectBuffers(info);
 	}
 	return true;
@@ -620,6 +685,12 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		}
 	}
 
+	for (uint32_t i = 0; i < info.param_copy_location.size(); i += 4) {
+		key.push_back(info.param_copy_location[i] | (info.param_copy_location[i + 1] << 8u) |
+		              (info.param_copy_location[i + 2] << 16u) |
+		              (static_cast<uint32_t>(info.param_copy_location[i + 3]) << 24u));
+	}
+
 	key.push_back(info.mesh.threads_num[0]);
 	if (info.mesh.threads_num[0] != 0) {
 		const auto& mesh = info.mesh;
@@ -665,6 +736,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_ancillary));
 	key.push_back(static_cast<uint32_t>(info.ps_no_perspective));
 	key.push_back(static_cast<uint32_t>(info.parameter_mode));
+	key.push_back(static_cast<uint32_t>(info.flat_aliases_copied));
 	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
@@ -706,8 +778,9 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
+	KYTY_PROFILER_FUNCTION();
 	const auto& sh     = context.GetShaderRegisters();
-	const auto [data, hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
+	const auto [data, hash, data_owned] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
 	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
 	// GS_EN controls amplification, not whether an NGG shader uses a workgroup.
 	const bool native_ngg = !merged && data.type == Prospero::ShaderBinaryType::kGs &&
@@ -741,7 +814,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	mesh.fast_launch = fast_launch != 0;
 	if (data.type == Prospero::ShaderBinaryType::kGsFront) {
 		EXIT_IF(regs.gs_regs.data_addr == 0);
-		const auto [back, back_hash] = ShaderGetMappedData(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
+		const auto [back, back_hash, back_owned] = ShaderGetMappedData(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
 		const auto back_params =
 		    GetShaderParams(regs.gs_regs.data_addr, back_hash, {}, back);
 		params.back_code = back_params.code;
@@ -796,9 +869,9 @@ std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info) {
 	const auto& sh        = context.GetShaderRegisters();
-	const auto [local, local_hash] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
-	const auto [control, control_hash] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
-	const auto [evaluation, evaluation_hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
+	const auto [local, local_hash, local_owned] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
+	const auto [control, control_hash, control_owned] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
+	const auto [evaluation, evaluation_hash, evaluation_owned] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
 	EXIT_NOT_IMPLEMENTED(local.type != Prospero::ShaderBinaryType::kHsFront ||
 	                     control.type != Prospero::ShaderBinaryType::kHsBack ||
 	                     evaluation.type != Prospero::ShaderBinaryType::kGs);
@@ -851,7 +924,8 @@ ShaderParams PrepareProgram(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               ps_info) {
-	const auto [data, hash] = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
+	KYTY_PROFILER_FUNCTION();
+	const auto [data, hash, data_owned] = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, hash,
@@ -860,7 +934,8 @@ ShaderParams PrepareProgram(
 
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                             ShaderComputeInputInfo& info) {
-	const auto [data, hash] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
+	KYTY_PROFILER_FUNCTION();
+	const auto [data, hash, data_owned] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
 	ShaderGetStaticInputInfoCS(regs, sh, data, info);
 	return GetShaderParams(
 	    regs.cs_regs.data_addr, hash,

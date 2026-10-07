@@ -112,11 +112,20 @@ std::optional<MissingCapability> FindMissingCapability(const IR::Program& progra
 		                         return input.kind == IR::StageInputKind::BaryCoordSmooth ||
 		                                input.kind == IR::StageInputKind::BaryCoordNoPerspective;
 	                         });
+	// Without per-vertex inputs the raw vertex values come through flat inputs (see
+	// triangleVertexValueShader.h), and the shader has the barycentric builtin only when it reads
+	// the barycentrics as values.
+	if (host.faults.no_per_vertex_inputs) {
+		if (!caps.fragment_barycentric && requirements.barycentric) {
+			return MissingCapability {"barycentrics", "fragmentShaderBarycentric"};
+		}
+		if (host.faults.no_centroid_barycentric && requirements.centroid_barycentric) {
+			return MissingCapability {"barycentrics at the centroid", "centroid BaryCoordKHR"};
+		}
+		return std::nullopt;
+	}
 	if (!caps.fragment_barycentric && (per_vertex || barycentric)) {
 		return MissingCapability {"barycentrics or raw vertex values", "fragmentShaderBarycentric"};
-	}
-	if (host.faults.no_per_vertex_inputs && per_vertex) {
-		return MissingCapability {"raw vertex values in a pixel shader", "PerVertexKHR inputs"};
 	}
 	if (host.faults.no_centroid_barycentric && centroid) {
 		return MissingCapability {"barycentrics at the centroid", "centroid BaryCoordKHR"};
@@ -284,7 +293,15 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		}
 		count += image.mip_count;
 	}
-	expected[static_cast<size_t>(Kind::Samplers)] = static_cast<uint32_t>(program.info.samplers.size());
+	auto& sampler_count = expected[static_cast<size_t>(Kind::Samplers)];
+	sampler_count       = static_cast<uint32_t>(program.info.samplers.size());
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.descriptor_index == UINT32_MAX) continue;
+		if (pair.descriptor_index != sampler_count++ || pair.sampler >= program.info.samplers.size() ||
+		    pair.image >= program.info.images.size()) {
+			Fail(program, "native sampler descriptor index does not match shader topology");
+		}
+	}
 	expected[static_cast<size_t>(Kind::Gds)] = uses_gds;
 	expected[static_cast<size_t>(Kind::SharedMemory)] = uses_lds && lds_storage;
 	expected[static_cast<size_t>(Kind::BdaPagetable)] = program.info.uses_dma;

@@ -48,6 +48,18 @@ uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo
 	return 0;
 }
 
+uint32_t CopyVariableForExport(const EmitterState& state, const IR::ExportInfo& exp) {
+	if (exp.kind != IR::ExportTargetKind::Parameter) {
+		return 0;
+	}
+	for (const auto& binding: state.outputs) {
+		if (binding.kind == IR::StageOutputKind::Parameter && binding.index == exp.index) {
+			return binding.copy_variable_id;
+		}
+	}
+	return 0;
+}
+
 uint32_t          ConstantU32(EmitterState& state, uint32_t value);
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,
@@ -147,14 +159,23 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 	return image;
 }
 
-uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
+uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t image) {
 	if (sampler >= state.program.info.samplers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Samplers, sampler,
 		                             "sampler resource index is out of range");
 	}
+	// The entry of the sampler for this texture, when the binding has one.
+	auto slot = sampler;
+	for (const auto& pair: state.program.info.sampled_pairs) {
+		if (pair.sampler == sampler && pair.image == image &&
+		    pair.descriptor_index != UINT32_MAX) {
+			slot = pair.descriptor_index;
+			break;
+		}
+	}
 	const auto pointer = DescriptorElementPointer(
-	    state, state.sampler_pointer_type, state.sampler_variable, ConstantU32(state, sampler),
-	    IR::DescriptorBindingKind::Samplers, sampler, "sampler descriptor array was not emitted");
+	    state, state.sampler_pointer_type, state.sampler_variable, ConstantU32(state, slot),
+	    IR::DescriptorBindingKind::Samplers, slot, "sampler descriptor array was not emitted");
 	const auto sampler_id = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, state.sampler_type, sampler_id, pointer);
 	return sampler_id;

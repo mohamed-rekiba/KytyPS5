@@ -1341,7 +1341,31 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto count = Binary(state, spv::OpIAdd, TypeU32(state),
 	                          Unary(state, spv::OpBitCount, TypeU32(state), low),
 	                          Unary(state, spv::OpBitCount, TypeU32(state), high));
-	const auto first = ctx.FirstLane(ballot);
+	auto       first = ctx.FirstLane(ballot);
+	if (state.helper_invocation_variable != 0) {
+		// A helper pixel is a lane of the subgroup like any other, but its atomic changes
+		// nothing and returns no defined value. The lane that moves the counter for all the
+		// lanes must be a real pixel. Helper lanes are still counted, as the masks of the
+		// shader count them: their places stay unused.
+		const auto helper =
+		    Unary(state, spv::OpLoad, TypeBool(state), state.helper_invocation_variable);
+		const auto real =
+		    AndCondition(state, exec, Unary(state, spv::OpLogicalNot, TypeBool(state), helper));
+		const auto real_ballot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4),
+		                          real_ballot, ConstantU32(state, spv::ScopeSubgroup), real);
+		const auto real_low  = state.builder.AllocateId();
+		const auto real_high = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), real_low, real_ballot,
+		                          0);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), real_high, real_ballot,
+		                          1);
+		const auto any_real =
+		    Binary(state, spv::OpINotEqual, TypeBool(state),
+		           Binary(state, spv::OpBitwiseOr, TypeU32(state), real_low, real_high),
+		           ConstantU32(state, 0));
+		first = Select(state, TypeU32(state), any_real, ctx.FirstLane(real_ballot), first);
+	}
 	const auto source_lane =
 	    state.lane_count == 2
 	        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 31))

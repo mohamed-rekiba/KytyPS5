@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
@@ -228,7 +229,15 @@ void DefineDescriptors(EmitterState& state) {
 		if (count == 0) image_types[IR::ImageBindingIndex(*kind)] = &image;
 		count += image.mip_count;
 	}
-	counts[static_cast<size_t>(Kind::Samplers)] = static_cast<uint32_t>(info.samplers.size());
+	auto& sampler_count = counts[static_cast<size_t>(Kind::Samplers)];
+	sampler_count       = static_cast<uint32_t>(info.samplers.size());
+	// A host that cannot put a minimum LOD on a texture view applies it through the sampler.
+	// Textures read through one guest sampler may have different minimums, so each pair gets
+	// its own entry, after the plain ones, which serve a read whose texture is not known here.
+	for (auto& pair: info.sampled_pairs) {
+		pair.descriptor_index =
+		    state.host.capabilities.image_view_min_lod ? UINT32_MAX : sampler_count++;
+	}
 	counts[static_cast<size_t>(Kind::Gds)] = info.uses_gds;
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
@@ -472,9 +481,41 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 	}
 }
 
+// The three flat inputs that give a pixel shader the value of `input` at each vertex of its
+// triangle. The tessellation shaders made for the draw write them.
+void DefineVertexValueInputs(EmitterState& state, InputBinding& input) {
+	uint32_t used       = 0;
+	uint32_t per_vertex = 0;
+	for (const auto& other: state.inputs) {
+		if (other.kind == IR::StageInputKind::Parameter) {
+			const auto bit = 1u << PixelParameterLocation(state, other.location);
+			used |= bit;
+			per_vertex |= other.per_vertex ? bit : 0u;
+		}
+	}
+	const auto locations = ShaderPixelVertexValueLocations(
+	    used, per_vertex, PixelParameterLocation(state, input.location));
+	for (uint32_t vertex = 0; vertex < 3u; vertex++) {
+		const auto name     = fmt::format("{}_vertex_{}", input.debug_name, vertex);
+		const auto variable = DefineInterfaceVariable(state, TypeF32Vector(state, 4),
+		                                              spv::StorageClassInput, name.c_str());
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationLocation,
+		                            locations[vertex]);
+		input.vertex_value_variables[vertex] = variable;
+	}
+}
+
 void DefineInputs(EmitterState& state) {
 	state.inputs.reserve(state.program.info.inputs.size());
 	for (const auto& input: state.program.info.inputs) {
+		// Without per-vertex inputs the hardware interpolates the input, so the barycentrics
+		// that were collected to interpolate it by hand are not needed.
+		const bool barycentric = input.kind == IR::StageInputKind::BaryCoordSmooth ||
+		                         input.kind == IR::StageInputKind::BaryCoordNoPerspective;
+		if (barycentric && !!state.host.faults.no_per_vertex_inputs && !state.program.info.barycentric) {
+			continue;
+		}
 		state.inputs.push_back({input});
 	}
 	if (UsesDepthBounds(state) && std::ranges::none_of(state.inputs, [](const InputBinding& input) {
@@ -517,7 +558,8 @@ void DefineInputs(EmitterState& state) {
 			});
 			if (alias != state.inputs.end()) {
 				EXIT_IF(alias->per_vertex != input.per_vertex);
-				input.variable_id = alias->variable_id;
+				input.variable_id            = alias->variable_id;
+				input.vertex_value_variables = alias->vertex_value_variables;
 				continue;
 			}
 		}
@@ -547,7 +589,7 @@ void DefineInputs(EmitterState& state) {
 					if (components > 1u) {
 						type = state.builder.Type(spv::OpTypeVector, type, components);
 					}
-				} else if (input.per_vertex) {
+				} else if (input.per_vertex && !state.host.faults.no_per_vertex_inputs) {
 					type = state.builder.Type(spv::OpTypeArray, TypeF32Vector(state, 4),
 					                          ConstantU32(state, 3));
 				} else {
@@ -562,8 +604,9 @@ void DefineInputs(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
 		}
 		if (input.kind == IR::StageInputKind::Parameter) {
-			const auto flat = PixelParameterIsFlat(state, input.location);
-			if (input.per_vertex) {
+			const auto flat       = PixelParameterIsFlat(state, input.location);
+			const bool per_vertex = input.per_vertex && !state.host.faults.no_per_vertex_inputs;
+			if (per_vertex) {
 				state.builder.AddAnnotation(spv::OpDecorate, input.variable_id,
 				                            spv::DecorationPerVertexKHR);
 			} else if (flat) {
@@ -571,16 +614,25 @@ void DefineInputs(EmitterState& state) {
 				                            spv::DecorationFlat);
 			}
 			if (state.program.stage == ShaderType::Pixel &&
-			    state.input_info.pixel->ps_no_perspective && !flat && !input.per_vertex) {
+			    state.input_info.pixel->ps_no_perspective && !flat && !per_vertex) {
 				state.builder.AddAnnotation(spv::OpDecorate, input.variable_id,
 				                            spv::DecorationNoPerspective);
 			}
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationLocation,
 			                            PixelParameterLocation(state, input.location));
+			if (input.per_vertex && !per_vertex) {
+				DefineVertexValueInputs(state, input);
+			}
 		} else if (const auto builtin = BuiltInForInput(input.kind); builtin != UINT32_MAX) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationBuiltIn,
 			                            builtin);
 		}
+	}
+	if (state.program.stage == ShaderType::Pixel && state.program.info.append_consume) {
+		state.helper_invocation_variable = DefineInterfaceVariable(
+		    state, TypeBool(state), spv::StorageClassInput, "gl_HelperInvocation");
+		state.builder.AddAnnotation(spv::OpDecorate, state.helper_invocation_variable,
+		                            spv::DecorationBuiltIn, spv::BuiltInHelperInvocation);
 	}
 	if (state.program.info.subgroup_local_invocation_id && !state.single_lane) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
@@ -610,11 +662,7 @@ void DefineOutputs(EmitterState& state) {
 		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
-	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
-		    return output.kind == IR::StageOutputKind::Position;
-	    })) {
-		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
+	if (VertexClipDistanceCount(state.program.stage, state.program.info) > clip_distance_count) {
 		state.invalid_position_clip_distance = clip_distance_count++;
 		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
 		                          state.invalid_position_clip_distance, 0, "gl_ClipDistance"}});
@@ -627,6 +675,11 @@ void DefineOutputs(EmitterState& state) {
 		}
 		return variable;
 	};
+	const auto* copies = (state.program.stage == ShaderType::Vertex ||
+	                      state.program.stage == ShaderType::TessellationEvaluation) &&
+	                             state.input_info.vertex != nullptr
+	                         ? &state.input_info.vertex->param_copy_location
+	                         : nullptr;
 	for (auto& binding: state.outputs) {
 		switch (binding.kind) {
 			case IR::StageOutputKind::Position:
@@ -677,6 +730,20 @@ void DefineOutputs(EmitterState& state) {
 				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
 				    state.input_info.pixel->target_output_mode[binding.index] == 7u;
 				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+				if (binding.kind == IR::StageOutputKind::Parameter && copies != nullptr) {
+					// The pixel shader does not read this parameter where a copy of another
+					// one goes: the copy takes the location.
+					if (std::ranges::find(*copies, binding.location + 1u) != copies->end()) {
+						break;
+					}
+					if (const auto copy = (*copies)[binding.index]; copy != 0) {
+						const auto name          = binding.debug_name + "_copy";
+						binding.copy_variable_id = DefineInterfaceVariable(
+						    state, type, spv::StorageClassOutput, name.c_str());
+						state.builder.AddAnnotation(spv::OpDecorate, binding.copy_variable_id,
+						                            spv::DecorationLocation, copy - 1u);
+					}
+				}
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
 				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
@@ -795,8 +862,9 @@ void DefineModule(EmitterState& state) {
 	}
 	const bool fragment_barycentric =
 	    state.program.stage == ShaderType::Pixel &&
-	    std::any_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) {
-		    return input.per_vertex || input.kind == IR::StageInputKind::BaryCoordSmooth ||
+	    std::any_of(state.inputs.begin(), state.inputs.end(), [&](const InputBinding& input) {
+		    return (input.per_vertex && !state.host.faults.no_per_vertex_inputs) ||
+		           input.kind == IR::StageInputKind::BaryCoordSmooth ||
 		           input.kind == IR::StageInputKind::BaryCoordNoPerspective;
 	    });
 	if (fragment_barycentric) {
@@ -868,3 +936,23 @@ void DefineModule(EmitterState& state) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+uint32_t VertexClipDistanceCount(ShaderType stage, const IR::ShaderInfo& info) {
+	uint32_t clip     = 0;
+	uint32_t cull     = 0;
+	bool     position = false;
+	for (const auto& output: info.outputs) {
+		if (output.kind == IR::StageOutputKind::ClipDistance) {
+			clip = std::max(clip, output.index + 1);
+		} else if (output.kind == IR::StageOutputKind::CullDistance) {
+			cull = std::max(cull, output.index + 1);
+		}
+		position = position || output.kind == IR::StageOutputKind::Position;
+	}
+	// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
+	return stage == ShaderType::Vertex && clip + cull < 8u && position ? clip + 1 : clip;
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv

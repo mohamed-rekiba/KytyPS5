@@ -714,10 +714,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	return {id, nullptr, std::move(desc)};
 }
 
-static vk::Sampler NativeSampler(RenderContext&                       context,
+static vk::Sampler NativeSampler(RenderContext&                                  context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+                                 uint32_t index, const ShaderRecompiler::IR::DescriptorValue& value,
+                                 uint32_t view_min_lod) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	const auto& sampler = program.info.samplers[index];
 	if (!sampler.depth_compare) {
@@ -726,7 +726,7 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
+	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border, view_min_lod);
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
@@ -788,10 +788,24 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
-	prepared.samplers.reserve(program.info.samplers.size());
+	// One host sampler for each entry of the sampler binding: first each guest sampler, then the
+	// sampler of each texture that has its own entry. That one applies the texture view's minimum
+	// LOD, which this host cannot put on the view (see IR::SampledResourcePair).
+	const auto make_sampler = [&](uint32_t sampler, uint32_t min_lod) {
+		return NativeSampler(m_context, program, sampler,
+		                     snapshot.samplers[program.info.samplers[sampler].snapshot_index],
+		                     min_lod);
+	};
+	prepared.samplers.reserve(
+	    program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::Samplers)]);
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		prepared.samplers.push_back(make_sampler(i, 0));
+	}
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.descriptor_index == UINT32_MAX) continue;
+		EXIT_IF(pair.descriptor_index != prepared.samplers.size());
+		prepared.samplers.push_back(
+		    make_sampler(pair.sampler, prepared.images.at(pair.image).desc.view_info.min_lod));
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.info.user_data_registers) {
@@ -934,13 +948,15 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
-	bool uses_dma = false;
+	bool uses_dma       = false;
+	bool address_writes = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
 		uses_dma |= stage->runtime->program->info.uses_dma;
+		address_writes |= stage->runtime->program->has_address_writes;
 	}
 	if (uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(address_writes);
 	}
 	for (auto* stage: stages) {
 		RebindImages(*stage);

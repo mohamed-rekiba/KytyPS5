@@ -100,6 +100,10 @@ bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
 }
 
+bool PipelineWaitEnabled() {
+	return g_config->pipeline_wait_enabled;
+}
+
 ShaderOptimizationType GetShaderOptimizationType() {
 	return g_config->shader_optimization_type;
 }
@@ -122,6 +126,10 @@ std::filesystem::path GetCommandBufferDumpFolder() {
 
 bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
+}
+
+bool GpuDebugLabelsEnabled() {
+	return g_config->gpu_debug_labels_enabled;
 }
 
 LogDirection GetPrintfDirection() {

@@ -71,6 +71,8 @@ static void PrintUsage() {
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
+	::printf("  --pipeline-wait <true|false>         Wait for every graphics pipeline to be built;\n"
+	         "                                       by default a draw is left out while it builds.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
@@ -78,6 +80,8 @@ static void PrintUsage() {
 	::printf("  --command-buffer-dump <true|false>   Enable command buffer dumps.\n");
 	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
 	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
+	::printf("  --gpu-debug-labels <true|false>      Name GPU objects and label GPU work for "
+	         "captures.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
@@ -387,6 +391,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--pipeline-wait") {
+			if (!ParseBool(value, options.config.pipeline_wait_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--shader-optimization-type") {
 			if (!ParseEnum(value, options.config.shader_optimization_type)) {
 				::printf("invalid shader optimization type: %s\n", value.c_str());
@@ -408,6 +417,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.command_buffer_dump_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--graphics-debug-dump") {
 			if (!ParseBool(value, options.config.graphics_debug_dump_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-debug-labels") {
+			if (!ParseBool(value, options.config.gpu_debug_labels_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

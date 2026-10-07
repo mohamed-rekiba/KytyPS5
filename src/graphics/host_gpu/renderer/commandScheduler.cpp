@@ -1,8 +1,10 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/submitPlan.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -125,7 +127,7 @@ void CommandScheduler::Shutdown() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	m_master.WaitRetired(CurrentTick() - 1);
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -175,6 +177,37 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 	BeginNext();
 }
 
+bool CommandScheduler::SubmitIfDue(SubmitPoint point) {
+	if (m_command.IsInvalid()) {
+		return false;
+	}
+	const bool used = m_command.Used();
+	if (used && m_open_since == std::chrono::steady_clock::time_point {}) {
+		m_open_since = std::chrono::steady_clock::now();
+	}
+	SubmitState state {.open_work      = m_open_work,
+	                   .open_callbacks = point == SubmitPoint::Packet ? 0u : m_open_callbacks,
+	                   .open_used      = used,
+	                   .about_to_wait  = point == SubmitPoint::Wait};
+	// The clock is read only when the age can decide: it is the costly part of this check.
+	if (point == SubmitPoint::GuestSubmission && used && state.open_callbacks == 0 &&
+	    m_open_work < SUBMIT_WORK_LIMIT) {
+		state.open_age_us = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+		                                                          m_open_since)
+		        .count());
+	}
+	switch (PlanSubmit(state)) {
+		case SubmitReason::None: return false;
+		case SubmitReason::Callbacks: KYTY_PROFILER_MESSAGE("submit: callbacks"); break;
+		case SubmitReason::Idle: KYTY_PROFILER_MESSAGE("submit: idle"); break;
+		case SubmitReason::Work: KYTY_PROFILER_MESSAGE("submit: work"); break;
+		case SubmitReason::Age: KYTY_PROFILER_MESSAGE("submit: age"); break;
+	}
+	Flush();
+	return true;
+}
+
 void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit();
 	m_master.Wait(tick);
@@ -182,16 +215,20 @@ void CommandScheduler::FlushAndWait() {
 }
 
 void CommandScheduler::Finish() {
+	KYTY_PROFILER_FUNCTION();
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	// Until every submission has retired, not only until the GPU has reached it: the deferred
+	// operations below run only then, and a caller of Finish relies on them having run.
+	m_master.WaitRetired(CurrentTick() - 1);
 	BeginNext();
 	PopPendingOperations();
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -210,17 +247,55 @@ void CommandScheduler::Wait(uint64_t tick) {
 void CommandScheduler::PopPendingOperations() {
 	m_master.Refresh();
 	for (;;) {
-		PendingOperation operation;
+		uint64_t front_tick = 0;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			if (m_pending_operations.empty()) {
 				return;
+			}
+			front_tick = m_pending_operations.front().tick;
+			// Cheap early out, without holding off submissions: checked again below.
+			if (m_pending_operations.size() <= MaxPendingOperations &&
+			    !m_master.IsRetired(std::max(front_tick, m_master.CurrentTick() - 1))) {
+				return;
+			}
+		}
+		WaitPriorityOperations(front_tick);
+
+		// Deferred operations destroy resources. MoltenVK keeps every resource in one residency
+		// set attached to the queue, so each submission that was committed while a resource was
+		// alive holds it until the submission completes, whether the commands use it or not.
+		// Destroying it earlier makes Metal report an invalid resource and lose the device. So an
+		// operation runs only when every submission made so far has retired, and no submission
+		// can be made between that check and the end of the operation: any thread may get here,
+		// while the GPU thread submits.
+		Common::LockGuard submissions_held(m_graphics.queue_mutex);
+		PendingOperation  operation;
+		{
+			std::unique_lock lock(m_operation_mutex);
+			if (m_pending_operations.empty()) {
+				return;
+			}
+			if (m_pending_operations.front().tick != front_tick) {
+				continue;
+			}
+			const auto last_submitted = m_master.CurrentTick() - 1;
+			if (!m_master.IsRetired(last_submitted)) {
+				if (m_pending_operations.size() <= MaxPendingOperations) {
+					return;
+				}
+				// The GPU never caught up: wait instead of holding resources without limit.
+				lock.unlock();
+				m_master.WaitRetired(last_submitted);
+				lock.lock();
+				if (m_pending_operations.empty() ||
+				    m_pending_operations.front().tick != front_tick) {
+					continue;
+				}
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
 		}
-		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
 	}
 }
@@ -235,11 +310,24 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 
 void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
 	CheckActive();
+	QueueOperationInAnyState(std::move(operation), priority);
+}
+
+void CommandScheduler::DeferDestruction(Common::UniqueFunction<void>&& operation) {
+	QueueOperationInAnyState(std::move(operation), false);
+}
+
+void CommandScheduler::QueueOperationInAnyState(Common::UniqueFunction<void>&& operation,
+                                                bool                           priority) {
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		auto& queue = priority ? m_priority_operations : m_pending_operations;
 		queue.push({std::move(operation), CurrentTick()});
+		if (priority) {
+			// Runs when the open submission completes: the submission must go out for that.
+			m_open_callbacks++;
+		}
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();
@@ -275,9 +363,10 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
-		m_master.Wait(operation.tick);
+		m_master.WaitRetired(operation.tick);
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
+			RetireCallbackState(std::move(operation.callback));
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
@@ -286,6 +375,18 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		}
 		m_operation_available.notify_all();
 	}
+}
+
+void CommandScheduler::RetireCallbackState(Common::UniqueFunction<void>&& callback) {
+	// A callback may own resources, such as a download buffer. They are destroyed with the
+	// callback, so hand it to the deferred queue, which destroys resources only when no submission
+	// holds them.
+	std::lock_guard lock(m_operation_mutex);
+	if (m_operation_state == OperationState::Open) {
+		m_pending_operations.push(
+		    {[state = std::move(callback)]() mutable { state = {}; }, CurrentTick()});
+	}
+	// During shutdown every submission has retired, so the callback is destroyed in place.
 }
 
 void CommandScheduler::DrainPriorityOperations() {
@@ -338,10 +439,21 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (m_cpu_reads_writes) {
+		m_cpu_reads_writes = false;
+		m_command.EndRendering();
+		vk::MemoryBarrier visible_to_cpu {};
+		visible_to_cpu.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		visible_to_cpu.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                   vk::PipelineStageFlagBits::eHost, {}, 1,
+		                                   &visible_to_cpu, 0, nullptr, 0, nullptr);
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -370,7 +482,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		result = graphics.queue.submit(1, &submit_info, m_master.AcquireFence(tick));
 	}
 
 	if (result != vk::Result::eSuccess) {
@@ -382,6 +494,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
+	m_open_work      = 0;
+	m_open_callbacks = 0;
+	m_open_since     = {};
 	return tick;
 }
 

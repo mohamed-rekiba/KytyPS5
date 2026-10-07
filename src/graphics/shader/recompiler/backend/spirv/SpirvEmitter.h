@@ -17,6 +17,10 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 // (the IR pass LowerLaneOpsToSingleLane and the emitter both follow this answer).
 [[nodiscard]] bool UsesSingleLaneModel(ShaderType stage, const HostGpu& host);
 
+// How many clip distances the shader of this stage with these outputs writes. This counts the one
+// the emitter adds to a vertex shader to cut away vertices with an invalid position.
+uint32_t VertexClipDistanceCount(ShaderType stage, const IR::ShaderInfo& info);
+
 // Something a program needs that the host does not offer.
 struct MissingCapability {
 	const char* need = nullptr; // what the shader does, in plain words

@@ -408,6 +408,31 @@ add_executable(device_suitability_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(device_suitability_tests PRIVATE ${inc_headers})
 
+add_executable(write_heat_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/WriteHeatTests.cpp"
+)
+target_include_directories(write_heat_tests PRIVATE ${inc_headers})
+
+add_executable(readback_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ReadbackPlanTests.cpp"
+)
+target_include_directories(readback_plan_tests PRIVATE ${inc_headers})
+
+add_executable(pipeline_use_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PipelineUseTests.cpp"
+)
+target_include_directories(pipeline_use_tests PRIVATE ${inc_headers})
+
+add_executable(submit_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SubmitPlanTests.cpp"
+)
+target_include_directories(submit_plan_tests PRIVATE ${inc_headers})
+
+add_executable(depth_snapshot_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DepthSnapshotPlanTests.cpp"
+)
+target_include_directories(depth_snapshot_plan_tests PRIVATE ${inc_headers})
+
 add_executable(host_lowering_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/HostLoweringTests.cpp"
 )
@@ -448,6 +473,12 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
+
+add_executable(program_list_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ProgramListTests.cpp"
+)
+target_link_libraries(program_list_tests fmt::fmt)
+target_include_directories(program_list_tests PRIVATE ${inc_headers})
 
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
@@ -574,6 +605,15 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+add_executable(metadata_fill_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MetadataFillTests.cpp"
+)
+target_include_directories(metadata_fill_tests PRIVATE ${inc_headers})
+add_executable(fence_retirement_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FenceRetirementTests.cpp"
+)
+target_include_directories(fence_retirement_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -625,7 +665,14 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME device_suitability COMMAND $<TARGET_FILE:device_suitability_tests>)
 	add_test(NAME host_lowering COMMAND $<TARGET_FILE:host_lowering_tests>)
+	add_test(NAME write_heat COMMAND $<TARGET_FILE:write_heat_tests>)
+	add_test(NAME readback_plan COMMAND $<TARGET_FILE:readback_plan_tests>)
+	add_test(NAME pipeline_use COMMAND $<TARGET_FILE:pipeline_use_tests>)
+	add_test(NAME submit_plan COMMAND $<TARGET_FILE:submit_plan_tests>)
+	add_test(NAME depth_snapshot_plan COMMAND $<TARGET_FILE:depth_snapshot_plan_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
+	add_test(NAME metadata_fill COMMAND $<TARGET_FILE:metadata_fill_tests>)
+	add_test(NAME fence_retirement COMMAND $<TARGET_FILE:fence_retirement_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
@@ -633,6 +680,7 @@ if(BUILD_TESTING)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME program_list COMMAND $<TARGET_FILE:program_list_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -701,7 +749,14 @@ if(BUILD_TESTING)
 		scalar_provenance_tests
 		device_suitability_tests
 		host_lowering_tests
+		write_heat_tests
+		readback_plan_tests
+		pipeline_use_tests
+		submit_plan_tests
+		depth_snapshot_plan_tests
 		image_page_table_tests
+		metadata_fill_tests
+		fence_retirement_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests
@@ -709,6 +764,7 @@ if(BUILD_TESTING)
 		avplayer_file_tests
 		bit_array_tests
 		lru_cache_tests
+		program_list_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests

@@ -60,12 +60,16 @@ struct ConfigOptions {
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
+	bool                   pipeline_wait_enabled       = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
 	std::filesystem::path  command_buffer_dump_folder  = "_Buffers";
 	bool                   graphics_debug_dump_enabled = false;
+	// Name Vulkan objects and label passes, draws, dispatches and copies, so a GPU capture reads
+	// as the emulator's work and not as anonymous commands.
+	bool                   gpu_debug_labels_enabled        = false;
 	LogDirection           printf_direction            = LogDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
@@ -105,6 +109,8 @@ uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
+// Every draw waits for its pipeline to be built, instead of being left out while it builds.
+bool                   PipelineWaitEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
@@ -113,6 +119,7 @@ bool                  CommandBufferDumpEnabled();
 std::filesystem::path GetCommandBufferDumpFolder();
 
 bool GraphicsDebugDumpEnabled();
+bool GpuDebugLabelsEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();

@@ -170,9 +170,13 @@ struct SamplerResource {
 };
 
 struct SampledResourcePair {
-	uint32_t image        = 0;
-	uint32_t sampler      = 0;
-	uint32_t first_use_pc = 0;
+	uint32_t image            = 0;
+	uint32_t sampler          = 0;
+	uint32_t first_use_pc     = 0;
+	// The entry of the sampler binding that holds the sampler for this texture alone, or
+	// UINT32_MAX. Set on a host where a sampler applies the minimum LOD of the texture it reads,
+	// because the texture view cannot (see DefineDescriptors).
+	uint32_t descriptor_index = UINT32_MAX;
 
 	bool operator==(const SampledResourcePair& other) const = default;
 };
@@ -497,6 +501,11 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	// The shader moves an append or consume counter.
+	bool                            append_consume                = false;
+	// The shader reads the barycentrics as values, and at the centroid.
+	bool                            barycentric                   = false;
+	bool                            centroid_barycentric          = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

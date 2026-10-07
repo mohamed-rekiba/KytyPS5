@@ -955,6 +955,12 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	// While the pipelines of the game's list are built ahead, say so: the start is at work.
+	const auto ahead_total = graphic_ctx.pipelines_ahead_total.load(std::memory_order_relaxed);
+	const auto ahead_built = graphic_ctx.pipelines_ahead_built.load(std::memory_order_relaxed);
+	if (ahead_built < ahead_total) {
+		text += fmt::format(", building pipelines {}/{}", ahead_built, ahead_total);
+	}
 
 	SDL_SetWindowTitle(window, text.c_str());
 }

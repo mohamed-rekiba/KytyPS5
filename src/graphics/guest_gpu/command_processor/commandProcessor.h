@@ -68,6 +68,8 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	// Submits the open host command buffer only when PlanSubmit says so.
+	void            BufferFlushIfDue();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }

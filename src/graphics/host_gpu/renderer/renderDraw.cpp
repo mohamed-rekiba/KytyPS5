@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/depthSnapshotPlan.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -28,6 +29,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/triangleVertexValueShader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -898,6 +900,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
+	KYTY_PROFILER_FUNCTION();
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
@@ -941,6 +944,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
                                               const DrawIndexBufferSource& source) {
+	KYTY_PROFILER_FUNCTION();
 	PreparedIndexBuffer prepared;
 	if (source.size == 0) {
 		return prepared;
@@ -961,6 +965,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 
 static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
+	KYTY_PROFILER_FUNCTION();
 	for (uint32_t i = 0; i < prepared.count; i++) {
 		EXIT_IF(prepared.buffers[i] == nullptr);
 	}
@@ -1072,22 +1077,52 @@ void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderS
 	    Common::AlignUp(static_cast<uint64_t>(extent.width) * extent.height * (f32 ? 4u : 2u), 4);
 
 	auto& scheduler = m_context.GetCommandScheduler();
-	auto  snapshot  = std::make_unique<Buffer>(
-	    m_context.GetGraphics(), scheduler, MemoryUsage::DeviceLocal, 0,
-	    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst |
-	        vk::BufferUsageFlagBits::eShaderDeviceAddress,
-	    bytes);
-	const auto address = snapshot->BufferDeviceAddress();
+	auto& held      = m_depth_snapshot;
+	const auto step = PlanDepthSnapshot({
+	    .target_image       = ImageIdentity(depth.image_id),
+	    .target_layer       = view.base_layer,
+	    .content_generation = image.ContentGeneration(),
+	    .load_clear         = depth.depth_load_clear_enable,
+	    .clear_value        = depth.depth_clear_value,
+	    .cached             = held.buffer != nullptr && held.buffer->Size() >= bytes,
+	    .cached_target_image = held.image,
+	    .cached_target_layer = held.layer,
+	    .cached_generation  = held.generation,
+	    .cached_load_clear  = held.load_clear,
+	    .cached_clear_value = held.clear,
+	});
+	if (step != DepthSnapshotStep::Reuse) {
+		// The held snapshot goes back to the pool; a buffer that fits comes out of it.
+		if (held.buffer != nullptr) {
+			m_scratch.push_back({std::move(held.buffer), held.tick});
+		}
+		auto& fresh   = AcquireScratch(bytes);
+		auto  it      = std::ranges::find_if(m_scratch, [&](const ScratchBuffer& scratch) {
+            return scratch.buffer.get() == &fresh;
+        });
+		held.buffer   = std::move(it->buffer);
+		m_scratch.erase(it);
+		held.image      = ImageIdentity(depth.image_id);
+		held.layer      = view.base_layer;
+		held.generation = image.ContentGeneration();
+		held.load_clear = depth.depth_load_clear_enable;
+		held.clear      = depth.depth_clear_value;
+	}
+	held.tick          = scheduler.CurrentTick();
+	auto&      snapshot = *held.buffer;
+	const auto address  = snapshot.BufferDeviceAddress();
 
 	scheduler.EndRendering();
 	auto vk_buffer = buffer.Handle();
-	if (depth.depth_load_clear_enable) {
+	if (step == DepthSnapshotStep::Reuse) {
+		// The snapshot shows the target as it is: nothing to copy.
+	} else if (step == DepthSnapshotStep::Fill) {
 		// The pass clears the depth buffer first: every pixel holds the clear value.
 		const auto clear = depth.depth_clear_value;
 		const auto half =
 		    static_cast<uint32_t>(std::lround(std::clamp(clear, 0.0f, 1.0f) * 65535.0f));
 		const auto word = f32 ? std::bit_cast<uint32_t>(clear) : (half | (half << 16u));
-		vk_buffer.fillBuffer(snapshot->Handle(), 0, bytes, word);
+		vk_buffer.fillBuffer(snapshot.Handle(), 0, bytes, word);
 	} else {
 		const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 		                                   view.layer_count};
@@ -1100,19 +1135,20 @@ void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderS
 		                         1};
 		copy.imageExtent      = {extent.width, extent.height, 1};
 		vk_buffer.copyImageToBuffer(image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
-		                            snapshot->Handle(), 1, &copy);
+		                            snapshot.Handle(), 1, &copy);
 		image.Transit(attachment_layout, attachment_access, range, vk_buffer);
 	}
-	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eFragmentShader;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead;
-	vk::DependencyInfo dependency {};
-	dependency.memoryBarrierCount = 1;
-	dependency.pMemoryBarriers    = &barrier;
-	vk_buffer.pipelineBarrier2(dependency);
-	scheduler.DeferOperation([owner = std::move(snapshot)]() mutable { owner.reset(); });
+	if (step != DepthSnapshotStep::Reuse) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eFragmentShader;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		vk_buffer.pipelineBarrier2(dependency);
+	}
 
 	const uint32_t parameters[ShaderRecompiler::IR::PushData::DepthBoundsDwordCount] {
 	    static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u), extent.width,
@@ -1123,11 +1159,16 @@ void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderS
 	                        parameters);
 }
 
+RenderExecutor::TargetId RenderExecutor::TargetKey(const RenderColorInfo& color) {
+	return TargetKey(color.image_id, color.guest_mip_level, color.guest_array_layer);
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
+	KYTY_PROFILER_FUNCTION();
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
@@ -1170,6 +1211,64 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	if (state.ps_active && m_context.GetGraphics().host.faults.no_per_vertex_inputs &&
+	    ShaderPixelReadsVertexValues(state.ps_input_info)) {
+		if (topology != vk::PrimitiveTopology::eTriangleList || vertex_stages.size() != 1 ||
+		    mesh_active) {
+			EXIT("a pixel shader reads raw vertex values in a draw that is not a plain triangle "
+			     "list, which the host GPU cannot do yet: primitive=%u stages=%u mesh=%u\n",
+			     static_cast<uint32_t>(ucfg.GetPrimType()),
+			     static_cast<uint32_t>(vertex_stages.size()), static_cast<uint32_t>(mesh_active));
+		}
+		topology = vk::PrimitiveTopology::ePatchList;
+		// A list has no strips to restart, and a patch list may not have the restart index.
+		primitive_restart_enable = false;
+	}
+	// The pipeline before anything is prepared for the draw: when it is still being built the
+	// draw is left out, and by then it must not have touched buffers or render targets.
+	if (draw.IsIndexed()) {
+		LogDrawPhase(draw.Name(), "CreatePipeline");
+	}
+	DrawEffects effects {.clears_depth = state.depth_info.depth_clear_enable ||
+	                                     state.depth_info.stencil_clear_enable};
+	// A target drawn in the previous frame, or earlier in this one, is drawn again anyway.
+	const auto drawn_recently = [&](const TargetId& target) {
+		const auto it = m_target_frames.find(target);
+		return it != m_target_frames.end() && it->second + 1 >= m_frame;
+	};
+	const bool writes_depth =
+	    state.depth_info.image_id &&
+	    (state.depth_info.depth_write_enable || state.depth_info.stencil_test_enable);
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		effects.writes_fresh_target =
+		    effects.writes_fresh_target || !drawn_recently(TargetKey(state.color_info[i]));
+	}
+	if (writes_depth) {
+		effects.writes_fresh_target =
+		    effects.writes_fresh_target || !drawn_recently(TargetKey(state.depth_info.image_id));
+	}
+	for (const auto& stage: vertex_stages) {
+		effects.writes_memory = effects.writes_memory || HasShaderMemoryWrites(stage.stage);
+	}
+	if (state.ps_active) {
+		effects.writes_memory =
+		    effects.writes_memory || HasShaderMemoryWrites(state.ps_input_info.stage);
+	}
+	auto* const pipeline_or_none = m_context.GetPipelineCache().GetGraphicsPipeline(
+	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
+	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
+	    state.programs, effects);
+	if (pipeline_or_none == nullptr) {
+		return;
+	}
+	auto& pipeline = *pipeline_or_none;
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		m_target_frames[TargetKey(state.color_info[i])] = m_frame;
+	}
+	if (writes_depth) {
+		m_target_frames[TargetKey(state.depth_info.image_id)] = m_frame;
+	}
+
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.
@@ -1199,13 +1298,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "CreatePipeline");
-	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	// The pixel shader reads the raw values of its triangle's three vertices, and the host has
+	// no pixel shader input for them: the triangles are drawn as patches, through tessellation
+	// shaders that hand the values over (see triangleVertexValueShader.h).
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1239,11 +1334,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		mesh_vertex_count = static_cast<uint32_t>(slots * mesh.max_primitives * 3u);
 		auto& scheduler   = m_context.GetCommandScheduler();
-		auto  records     = std::make_unique<Buffer>(
-		    m_context.GetGraphics(), scheduler, MemoryUsage::DeviceLocal, 0,
-		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-		    bytes);
-		const auto address = records->BufferDeviceAddress();
+		auto& records     = AcquireScratch(bytes);
+		const auto address = records.BufferDeviceAddress();
 		mesh_draw_data     = {draw.index_count,
 		                      draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
 		                                       : emit.first_vertex,
@@ -1276,7 +1368,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		dependency.memoryBarrierCount = 1;
 		dependency.pMemoryBarriers    = &barrier;
 		vk_buffer.pipelineBarrier2(dependency);
-		scheduler.DeferOperation([owner = std::move(records)]() mutable { owner.reset(); });
 		// Only the pixel shader's bindings go with the graphics pipeline.
 		const auto graphics_stages = state.ps_active
 		                                 ? std::span {&descriptor_stages[stage_count - 1], 1u}
@@ -1320,6 +1411,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
+	InsertDebugLabel(vk_buffer, "{} submit={} indices={} instances={}", draw.Name(), submit_id,
+	                 draw.index_count, draw.instance_count);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
@@ -1348,6 +1441,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
+	if (state.depth_info.image_id &&
+	    (state.depth_info.depth_write_enable || state.depth_info.stencil_test_enable ||
+	     state.depth_info.stencil_clear_enable || state.depth_info.depth_load_clear_enable)) {
+		m_context.GetTextureCache().GetImage(state.depth_info.image_id).NoteContentWrite();
+	}
+	m_context.GetCommandScheduler().NoteWork();
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
@@ -1465,6 +1564,61 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
 	ResetBindings();
+}
+
+Buffer& RenderExecutor::AcquireScratch(uint64_t bytes) {
+	EXIT_IF(bytes == 0);
+	auto& scheduler = m_context.GetCommandScheduler();
+	auto& master    = scheduler.GetMasterSemaphore();
+	master.Refresh();
+	ScratchBuffer* chosen = nullptr;
+	for (auto& scratch: m_scratch) {
+		if (scratch.buffer->Size() < bytes || !master.IsFree(scratch.tick)) {
+			continue;
+		}
+		if (chosen == nullptr || scratch.buffer->Size() < chosen->buffer->Size()) {
+			chosen = &scratch;
+		}
+	}
+	size_t chosen_index = 0;
+	if (chosen == nullptr) {
+		// Sizes are rounded up, so a few buffers serve many draws.
+		const auto size = std::max<uint64_t>(std::bit_ceil(bytes), 64u * 1024u);
+		m_scratch.push_back({std::make_unique<Buffer>(
+		                         m_context.GetGraphics(), scheduler, MemoryUsage::DeviceLocal, 0,
+		                         vk::BufferUsageFlagBits::eStorageBuffer |
+		                             vk::BufferUsageFlagBits::eTransferDst |
+		                             vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		                         size),
+		                     0});
+		m_scratch_bytes += size;
+		chosen_index = m_scratch.size() - 1;
+	} else {
+		chosen_index = static_cast<size_t>(chosen - m_scratch.data());
+	}
+	// Busy until the open submission has run.
+	m_scratch[chosen_index].tick = scheduler.CurrentTick();
+	// Past the budget, the buffers no draw has used for a while go; the busy and the recently
+	// used ones stay: a frame that needs more than the budget at once (75 depth snapshots of
+	// 8 MiB) would otherwise create and destroy them again every frame, and a wait for a busy
+	// one would stall every draw of that frame.
+	constexpr uint64_t ScratchBudget    = 256u * 1024u * 1024u;
+	constexpr uint64_t ScratchIdleTicks = 64;
+	const auto         current          = scheduler.CurrentTick();
+	for (size_t i = 0; i < m_scratch.size() && m_scratch_bytes > ScratchBudget;) {
+		if (i != chosen_index && m_scratch[i].tick + ScratchIdleTicks < current &&
+		    master.IsFree(m_scratch[i].tick)) {
+			m_scratch_bytes -= m_scratch[i].buffer->Size();
+			scheduler.DeferOperation([old = std::move(m_scratch[i].buffer)]() mutable { old.reset(); });
+			m_scratch.erase(m_scratch.begin() + static_cast<std::ptrdiff_t>(i));
+			if (i < chosen_index) {
+				chosen_index--;
+			}
+		} else {
+			i++;
+		}
+	}
+	return *m_scratch[chosen_index].buffer;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

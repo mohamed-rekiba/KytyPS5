@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/capturedVertexLayout.h"
+#include "graphics/shader/triangleVertexValueShader.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -5349,6 +5350,46 @@ void TestNewShaderRecompilerCubeSampleCoordinates() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// A host that cannot put a minimum LOD on a texture view applies it through the sampler. Textures
+// read through one guest sampler may have different minimums, so the sampler gets an entry for
+// each texture it is used with.
+void TestSamplerEntryPerTexture() {
+  constexpr auto kSamplers =
+      static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Samplers);
+  const uint32_t shader[] = {
+      EncodeMimg0(0x20, 0xf),
+      EncodeMimg1(8, 2, 3, 1), // image_sample
+      EncodeMubuf0(0x1c, 12),
+      EncodeMubuf1(8, 1, 1), // keep the sampled value live
+      0xbf810000u,
+  };
+  auto user_data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+
+  const auto plain = RecompileForTest(shader, options);
+  Check(plain.program.info.images.size() == 1 && plain.program.info.samplers.size() == 1 &&
+            plain.program.info.sampled_pairs.size() == 1 &&
+            plain.program.info.sampled_pairs[0].descriptor_index == UINT32_MAX &&
+            plain.program.bindings.descriptor_counts[kSamplers] == 1,
+        "a host with view minimum LODs did not keep one entry for the sampler");
+  Check(SpirvSourceHasInstructionUsing(DisassembleSpirvBinary(plain.spirv), "OpAccessChain",
+                                       "%samplers %uint_0"),
+        "a host with view minimum LODs does not read the sampler's one entry");
+
+  options.host.capabilities.image_view_min_lod = false;
+  const auto split = RecompileForTest(shader, options);
+  Check(split.program.info.sampled_pairs.size() == 1 &&
+            split.program.info.sampled_pairs[0].descriptor_index == 1 &&
+            split.program.bindings.descriptor_counts[kSamplers] == 2,
+        "the sampler did not get an entry for the texture it is used with");
+  const auto source = DisassembleSpirvBinary(split.spirv);
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "%samplers %uint_1") &&
+            !SpirvSourceHasInstructionUsing(source, "OpAccessChain", "%samplers %uint_0"),
+        "the texture is not read through its own sampler entry");
+  CheckSpirvBinaryValidates(split.spirv);
+}
+
 void TestImageAddressOperands() {
   using namespace ShaderRecompiler;
   struct Case {
@@ -6413,6 +6454,130 @@ void TestNewShaderRecompilerVintrpTranslation() {
   CheckSpirvBinaryValidates(no_perspective_result.spirv);
 }
 
+// A host with no per-vertex pixel shader inputs draws the triangles as patches. The two shaders
+// made for the draw pass the triangle on unchanged and write the value at each vertex to the flat
+// inputs of the pixel shader.
+void TestTriangleVertexValueShaders() {
+  // Input 0 is read interpolated and raw (P0 and P10). Input 1 is read flat.
+  const uint32_t pixel_shader[] = {
+      EncodeVintrp(2, 12, 0, 3, 2), EncodeVintrp(2, 13, 0, 3, 0),
+      EncodeVintrp(1, 14, 0, 3, 0), EncodeVintrp(2, 15, 1, 0, 2),
+      EncodeExp0(0x00, 0xf),        EncodeExp1(12, 13, 14, 15),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 2;
+  SetIdentityInterpolatorSettings(&pixel);
+  pixel.interpolator_settings[1] |= 0x00000400u;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  options.host.faults.no_per_vertex_inputs = true;
+  auto compiled = RecompileForTest(pixel_shader, options);
+  const auto pixel_program = std::move(compiled.program).TakeCompiledInfo();
+  pixel.stage.program = &pixel_program;
+  Check(ShaderPixelReadsVertexValues(pixel),
+        "a pixel shader that reads raw vertex values was not recognised");
+
+  Check(ShaderPixelVertexValueLocations(0b0011u, 0b0001u, 0) ==
+            (std::array<uint32_t, 3>{2, 3, 4}),
+        "the vertex values of one input did not get the three lowest free locations");
+  Check(ShaderPixelVertexValueLocations(0b1011u, 0b1001u, 3) ==
+            (std::array<uint32_t, 3>{6, 7, 8}),
+        "the vertex values of a second input reused locations of the first");
+
+  ShaderRecompiler::IR::CompiledShaderInfo vertex_program;
+  vertex_program.stage = ShaderType::Vertex;
+  vertex_program.param_export_mask = 0b11u;
+  vertex_program.info.outputs = {
+      {ShaderRecompiler::IR::StageOutputKind::Position, 0, 0, "gl_Position"},
+      {ShaderRecompiler::IR::StageOutputKind::Parameter, 0, 0, "out_param_0"},
+      {ShaderRecompiler::IR::StageOutputKind::Parameter, 1, 1, "out_param_1"},
+  };
+  ShaderVertexInputInfo vertex{};
+  vertex.stage.program = &vertex_program;
+
+  const auto shaders = BuildTriangleVertexValueShaders(vertex, pixel, false);
+  CheckSpirvBinaryValidates(shaders.control);
+  CheckSpirvBinaryValidates(shaders.evaluation);
+  // The pixel shader reads the two inputs at 0 and 1, and the vertex values at 2, 3 and 4.
+  for (uint32_t location = 0; location <= 4; ++location) {
+    // Location 0 is also the render target.
+    Check(SpirvDecorationValueCount(compiled.spirv, 30u, location) == (location == 0 ? 2 : 1),
+          "the pixel shader does not read each location once");
+    // Each location is once an input and once an output of the evaluation shader, except 3 and
+    // 4, which it only writes.
+    Check(SpirvDecorationValueCount(shaders.evaluation, 30u, location) ==
+              (location <= 2 ? 2 : 1),
+          "the evaluation shader does not write what the pixel shader reads");
+  }
+  const auto control = DisassembleSpirvBinary(shaders.control);
+  const auto evaluation = DisassembleSpirvBinary(shaders.evaluation);
+  Check(control.find("OutputVertices 3") != std::string::npos &&
+            evaluation.find("Triangles") != std::string::npos &&
+            evaluation.find("SpacingEqual") != std::string::npos,
+        "the patch is not a triangle of three control points");
+  // The vertex shader writes one clip distance (the guard against invalid positions).
+  Check(control.find("BuiltIn ClipDistance") != std::string::npos &&
+            evaluation.find("BuiltIn ClipDistance") != std::string::npos,
+        "the clip distance of the vertex shader was dropped on the way");
+
+  // A vertex shader that does not write the parameter: the values are zero, not undefined.
+  vertex_program.param_export_mask = 0b10u;
+  const auto missing = BuildTriangleVertexValueShaders(vertex, pixel, true);
+  CheckSpirvBinaryValidates(missing.control);
+  CheckSpirvBinaryValidates(missing.evaluation);
+}
+
+// On a host without per-vertex inputs, a pixel shader that reads one parameter both flat and
+// interpolated reads it at two locations. The vertex shader must write it to both.
+void TestParameterReadFlatAndInterpolated() {
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 2;
+  pixel.interpolator_settings[0] = 0;
+  pixel.interpolator_settings[1] = 0x00000400u; // parameter 0 again, flat
+  pixel.flat_aliases_copied = true;
+  const std::array<uint32_t, 2> active_inputs = {0, 1};
+  const auto copies = ShaderVertexParameterCopies(pixel, active_inputs);
+  Check(copies[0] == 2 && std::ranges::count(copies, 0) == 31,
+        "parameter 0 is not also written to location 1");
+  pixel.interpolator_settings[1] = 1;
+  Check(std::ranges::count(ShaderVertexParameterCopies(pixel, active_inputs), 0) == 32,
+        "two different parameters were taken for one read twice");
+  // A host with per-vertex inputs reads both from the raw vertex values at one location.
+  pixel.interpolator_settings[1] = 0x00000400u;
+  pixel.flat_aliases_copied = false;
+  Check(std::ranges::count(ShaderVertexParameterCopies(pixel, active_inputs), 0) == 32,
+        "a host with per-vertex inputs copied a parameter");
+
+  // The vertex shader exports parameters 0 and 1. The pixel shader does not read parameter 1,
+  // so the copy of parameter 0 takes its location.
+  const uint32_t vertex_shader[] = {
+      EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(0x21, 0xf, false), EncodeExp1(4, 5, 6, 7),
+      EncodeExp0(0x0c, 0xf),        EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
+  };
+  ShaderVertexInputInfo vertex{};
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.input_info.vertex = &vertex;
+  const auto plain = RecompileForTest(vertex_shader, options);
+  vertex.param_copy_location = copies;
+  Check(MakeStageStaticKey(vertex) != MakeStageStaticKey(ShaderVertexInputInfo{}),
+        "the copy is not part of the vertex program's identity");
+  const auto copied = RecompileForTest(vertex_shader, options);
+  const auto source = DisassembleSpirvBinary(copied.spirv);
+  Check(SpirvDecorationValueCount(plain.spirv, 30u, 0u) == 1 &&
+            SpirvDecorationValueCount(plain.spirv, 30u, 1u) == 1 &&
+            DisassembleSpirvBinary(plain.spirv).find("_copy") == std::string::npos,
+        "a vertex shader with no copies changed");
+  Check(SpirvDecorationValueCount(copied.spirv, 30u, 0u) == 1 &&
+            SpirvDecorationValueCount(copied.spirv, 30u, 1u) == 1 &&
+            source.find("OpDecorate %out_param_0_copy Location 1") != std::string::npos &&
+            source.find("%out_param_1 ") == std::string::npos,
+        "parameter 0 was not written to location 1 in place of parameter 1");
+  CheckSpirvBinaryValidates(copied.spirv);
+}
+
 void TestCustomVintrpMovTranslation() {
   const uint32_t shader[] = {
       EncodeVintrp(2, 12, 0, 3, 2),      EncodeVintrp(2, 13, 0, 3, 0),
@@ -6476,6 +6641,49 @@ void TestCustomVintrpMovTranslation() {
   Check(SpirvInstructionOpcodeCount(standard_result.spirv, 131u) == 2u,
         "standard VINTRP P10/P20 did not subtract P0 exactly once each");
   CheckSpirvBinaryValidates(standard_result.spirv);
+
+  // A host with no per-vertex inputs: the input is an ordinary interpolated one, and the value at
+  // each vertex comes through three flat inputs at the free locations after it.
+  options.host.faults.no_per_vertex_inputs = true;
+  const auto fallback_result = RecompileForTest(shader, options);
+  Check(!SpirvHasDecorationValueWithDecoration(fallback_result.spirv, 30u, 0u, 5285u),
+        "a host with no per-vertex inputs still got PerVertexKHR");
+  Check(!SpirvHasDecorationValueWithDecoration(fallback_result.spirv, 30u, 0u, 14u),
+        "the interpolated input became flat");
+  for (uint32_t location = 1; location <= 3; ++location) {
+    Check(SpirvHasDecorationValueWithDecoration(fallback_result.spirv, 30u, location, 14u),
+          "a vertex value input is missing or not flat");
+  }
+  const auto fallback_source = DisassembleSpirvBinary(fallback_result.spirv);
+  Check(SpirvSourceHasInstructionUsing(fallback_source, "OpAccessChain",
+                                       "in_param_0_vertex_0 %uint_3") &&
+            SpirvSourceHasInstructionUsing(fallback_source, "OpAccessChain",
+                                           "in_param_0_vertex_1 %uint_3") &&
+            SpirvSourceHasInstructionUsing(fallback_source, "OpAccessChain",
+                                           "in_param_0_vertex_2 %uint_3"),
+        "P0, P10 and P20 did not read the three vertex value inputs");
+  Check(SpirvInstructionOpcodeCount(fallback_result.spirv, 131u) == 2u,
+        "P10/P20 from vertex value inputs did not subtract P0 exactly once each");
+  CheckSpirvBinaryValidates(fallback_result.spirv);
+
+  // The barycentrics were only collected to interpolate the input by hand. A shader that does
+  // not read them as values needs no barycentric support from the host.
+  const uint32_t raw_only_shader[] = {
+      EncodeVintrp(2, 12, 0, 3, 2), EncodeVintrp(2, 13, 0, 3, 0),
+      EncodeVintrp(1, 14, 0, 3, 0), // v_interp_p2_f32: the interpolated value of the same input
+      EncodeExp0(0x00, 0xf),        EncodeExp1(12, 13, 14, 12),
+      0xbf810000u,
+  };
+  options.host.capabilities.fragment_barycentric = false;
+  const auto raw_only_result = RecompileForTest(raw_only_shader, options);
+  const auto raw_only_source = DisassembleSpirvBinary(raw_only_result.spirv);
+  Check(!SpirvContainsCapability(raw_only_result.spirv, 5284u) &&
+            raw_only_source.find("gl_BaryCoord") == std::string::npos,
+        "a shader that does not read the barycentrics still declared them");
+  Check(SpirvSourceHasInstructionUsing(raw_only_source, "OpLoad", "%in_param_0"),
+        "the interpolated value did not come from the ordinary input");
+  CheckSpirvBinaryValidates(raw_only_result.spirv);
+  options.host = Libs::Graphics::HostGpu::Full();
 
   const uint32_t flat_shader[] = {
       EncodeVintrp(2, 12, 0, 3, 2),
@@ -8141,6 +8349,39 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured() {
             result.resources.flattened_srt.empty() && result.resources.specialization_reads.empty(),
         "loop-carried vector descriptor was evaluated on the host");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+// One lane moves an append counter for all the lanes of its subgroup. In a pixel shader a lane may
+// be a helper pixel, whose atomic changes nothing and returns no defined value: the lane that
+// moves the counter is chosen among the real pixels.
+void TestPixelAppendIsDoneByARealPixel() {
+  constexpr uint32_t kBuiltInHelperInvocation = 23u;
+  const uint32_t shader[] = {
+      EncodeSMovB32(124, 129), // m0 = one counter
+      EncodeDs0(0x3e),         // ds_append
+      EncodeDs1(0, 0, 0),
+      EncodeExp0(0x00, 0xf),
+      EncodeExp1(0, 0, 0, 0),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo pixel{};
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  const auto result = RecompileForTest(shader, options);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvHasDecorationValue(result.spirv, 11u, kBuiltInHelperInvocation),
+        "a pixel shader that appends does not know which lanes are helper pixels");
+  Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%gl_HelperInvocation") &&
+            SpirvInstructionOpcodeCount(result.spirv, 339u) >= 2u,
+        "the appending lane is not chosen from a ballot of the real pixels");
+
+  // No other stage has helper lanes.
+  const uint32_t compute_shader[] = {EncodeSMovB32(124, 129), EncodeDs0(0x3e),
+                                     EncodeDs1(0, 0, 0), 0xbf810000u};
+  const auto compute =
+      RecompileForTest(compute_shader, MakeCompileOptions(ShaderType::Compute));
+  Check(!SpirvHasDecorationValue(compute.spirv, 11u, kBuiltInHelperInvocation),
+        "a compute shader asked for helper pixels");
 }
 
 void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
@@ -10200,6 +10441,34 @@ void TestCoherentLoadOnAHostThatReusesVolatileLoads() {
   const auto other = RecompileForTest(plain_shader, options);
   Check(SpirvInstructionOpcodeCount(other.spirv, kOpAtomicLoad) == 0u,
         "a load without GLC became atomic");
+}
+
+// A legacy multiply-add rounds its product before the add. The translation keeps the two apart
+// with a denormal flush on the product's bits, and marks them NoContraction. On a host where the
+// mark is slow it is left out: the flush alone keeps a compiler from fusing them.
+void TestMadWithoutTheNoContractionMarkWhereItIsSlow() {
+  const uint32_t shader[] = {
+      0xd5410004u, 0x20121301u, // v_mad_f32 v4, -v1, v9, s4
+      EncodeVop1(0x01, 0, 4 + 256), // v_mov_b32 v0, v4
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), // position
+      EncodeSopp(0x01),
+  };
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  const auto marked = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(marked.spirv);
+  Check(DisassembleSpirvBinary(marked.spirv).find("NoContraction") != std::string::npos,
+        "a legacy multiply-add lost its NoContraction marks on an ordinary host");
+
+  options.host.faults.no_contraction_is_slow = true;
+  const auto plain = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(plain.spirv);
+  const auto source = DisassembleSpirvBinary(plain.spirv);
+  Check(source.find("NoContraction") == std::string::npos,
+        "a legacy multiply-add kept the slow mark");
+  // Still a multiply and an add, with bit work between them, and no fused operation.
+  Check(source.find("OpFMul") != std::string::npos && source.find("OpFAdd") != std::string::npos &&
+            source.find(" Fma ") == std::string::npos,
+        "a legacy multiply-add is no longer a separate multiply and add");
 }
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
@@ -15513,6 +15782,8 @@ int main() {
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
+  TestPixelAppendIsDoneByARealPixel();
+  TestSamplerEntryPerTexture();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
   TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
@@ -15559,6 +15830,7 @@ int main() {
   TestComputeDispatchWaveSize();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestCoherentLoadOnAHostThatReusesVolatileLoads();
+  TestMadWithoutTheNoContractionMarkWhereItIsSlow();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestHostFeaturesGateUnavailableCapabilities();
@@ -15613,6 +15885,8 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestTriangleVertexValueShaders();
+  TestParameterReadFlatAndInterpolated();
   TestPerspectiveCentroidInputs();
   TestPerspectiveSampleInputs();
   TestGraphicsCreateInterpolantMapping();

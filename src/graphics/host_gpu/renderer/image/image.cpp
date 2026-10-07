@@ -123,6 +123,39 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+namespace {
+
+constexpr auto DataWriteAccess = vk::AccessFlagBits2::eTransferWrite |
+                                 vk::AccessFlagBits2::eShaderWrite |
+                                 vk::AccessFlagBits2::eMemoryWrite;
+
+// Layouts in which every aspect a sampler may read is read-only.
+[[nodiscard]] bool SampledAspectsAreReadOnly(vk::ImageLayout layout) {
+	return layout == vk::ImageLayout::eShaderReadOnlyOptimal ||
+	       layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+	       layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal ||
+	       layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
+}
+
+// A new use of an image in the layout it already has, where neither the earlier uses nor the new
+// one write the aspects a sampler reads: an attachment use and a sampler read then do not depend
+// on each other. No barrier is needed and the accesses add up. Without this, a read-only depth
+// buffer that is tested and sampled by alternate draws gets a barrier, and so a new render pass,
+// on every draw.
+template <typename State>
+[[nodiscard]] bool JoinWithoutBarrier(State& state, vk::ImageLayout layout, vk::AccessFlags2 access,
+                                      vk::PipelineStageFlags2 stage) {
+	if (state.layout != layout || !SampledAspectsAreReadOnly(layout) ||
+	    static_cast<bool>((state.access_mask | access) & DataWriteAccess)) {
+		return false;
+	}
+	state.access_mask |= access;
+	state.pl_stage |= stage;
+	return true;
+}
+
+} // namespace
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
@@ -160,6 +193,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				                              vk::AccessFlagBits2::eMemoryWrite;
 				const bool     repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access);
+				if (JoinWithoutBarrier(subresource_state, destination_layout, destination_access,
+				                       destination_stage)) {
+					continue;
+				}
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -193,6 +230,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    !repeated_write) {
+			return {};
+		}
+		if (JoinWithoutBarrier(state, destination_layout, destination_access, destination_stage)) {
 			return {};
 		}
 
@@ -245,6 +285,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
+	NoteContentWrite();
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
@@ -343,6 +384,7 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 }
 
 void Image::CopyImage(Image& source) {
+	NoteContentWrite();
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
@@ -398,6 +440,7 @@ void Image::CopyImage(Image& source) {
 
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
                     const ImageSubresourceRange& destination_range) {
+	NoteContentWrite();
 	EXIT_IF(backing.samples != 1 || source.backing.image_type != vk::ImageType::e2D ||
 	        backing.image_type != vk::ImageType::e2D || source_range.level_count != 1 ||
 	        destination_range.level_count != 1 ||
@@ -463,6 +506,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 }
 
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler) {
+	NoteContentWrite();
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
@@ -566,6 +610,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+	NoteContentWrite();
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
 	m_scheduler.EndRendering();

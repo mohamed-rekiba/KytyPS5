@@ -105,6 +105,13 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_work_available.Signal();
 }
 
+void GuestGpu::SubmitRecordedBeforeWaiting() {
+	auto& scheduler = m_renderer.GetCommandScheduler();
+	if (scheduler.CurrentTick() == m_recorded_tick) {
+		scheduler.SubmitIfDue(CommandScheduler::SubmitPoint::Wait);
+	}
+}
+
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
@@ -132,6 +139,29 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		done.release();
 	});
 	done.acquire();
+}
+
+bool GuestGpu::TrySendCommandSync(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (IsGpuThread()) {
+		command();
+		return true;
+	}
+	std::binary_semaphore done {0};
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		if (!m_accepting) {
+			return false;
+		}
+		m_commands.push_back([operation = std::move(command), &done]() mutable {
+			operation();
+			done.release();
+		});
+		m_pending_commands.fetch_add(1, std::memory_order_release);
+		m_work_available.Signal();
+	}
+	done.acquire();
+	return true;
 }
 
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
@@ -243,6 +273,10 @@ void CommandProcessor::BufferInit() {
 
 void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
+}
+
+void CommandProcessor::BufferFlushIfDue() {
+	GetScheduler().SubmitIfDue(CommandScheduler::SubmitPoint::GuestSubmission);
 }
 
 void CommandProcessor::BufferWait() {
@@ -453,6 +487,12 @@ void GuestGpu::ThreadRun(void* data) {
 		bool                         should_stop    = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
+			if (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				// Nothing more to record: what this thread recorded goes to the GPU now.
+				gpu->m_queue_mutex.Unlock();
+				gpu->SubmitRecordedBeforeWaiting();
+				gpu->m_queue_mutex.Lock();
+			}
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
@@ -477,6 +517,10 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 				}
 				if (selected_queue < 0) {
+					// Every queue waits for the guest or the GPU: submit what this thread recorded.
+					gpu->m_queue_mutex.Unlock();
+					gpu->SubmitRecordedBeforeWaiting();
+					gpu->m_queue_mutex.Lock();
 					gpu->m_processing = false;
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
@@ -579,7 +623,8 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
-				cp.BufferFlush();
+				m_recorded_tick = m_renderer.GetCommandScheduler().CurrentTick();
+				cp.BufferFlushIfDue();
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
 			}
@@ -605,7 +650,8 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
-				cp.BufferFlush();
+				m_recorded_tick = m_renderer.GetCommandScheduler().CurrentTick();
+				cp.BufferFlushIfDue();
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
 			}
@@ -750,6 +796,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		// Whatever the packet prepared buffers for has been recorded by now.
+		m_renderer.GetBufferCache().SettleGpuWrites();
+		GetScheduler().SubmitIfDue(CommandScheduler::SubmitPoint::Packet);
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -1254,18 +1303,7 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
-
-	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
-	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-
-	vk::DependencyInfo dependency {};
-	dependency.memoryBarrierCount = 1;
-	dependency.pMemoryBarriers    = &barrier;
-	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	CurrentBuffer().RequestGlobalBarrier();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
@@ -1420,6 +1458,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	ProcessorScope processor_scope(*this);
 
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
+	m_renderer.GetRenderExecutor().NoteFlip();
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();
