@@ -112,17 +112,18 @@ jobs:
       - name: Build
         shell: cmd
         run: |
+          rem The unit tests: keep them as in .github/scripts/unit-tests.sh (the Linux job checks it).
           cmake --build _Build/windows --target launcher ^
-            host_lowering_tests write_heat_tests readback_plan_tests pipeline_use_tests submit_plan_tests depth_snapshot_plan_tests video_out_resolution_tests cache_folder_tests gamepad_quit_tests file_lock_tests program_list_tests metadata_fill_tests fence_retirement_tests ^
+            host_lowering_tests write_heat_tests readback_plan_tests pipeline_use_tests submit_plan_tests depth_snapshot_plan_tests video_out_resolution_tests cache_folder_tests gamepad_quit_tests file_lock_tests program_list_tests player_slots_tests soft_float64_tests metadata_fill_tests fence_retirement_tests ^
             audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
-            resource_materialization_tests shader_vertex_metadata_tests device_suitability_tests archive_file_tests avplayer_file_tests --parallel
+            resource_materialization_tests shader_vertex_metadata_tests device_suitability_tests shader_cfg_tests archive_file_tests trophy_system_tests avplayer_file_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|device_suitability|host_lowering|write_heat|readback_plan|pipeline_use|submit_plan|depth_snapshot_plan|video_out_resolution|cache_folder|gamepad_quit|file_lock|program_list|metadata_fill|fence_retirement|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^(audio_out2_port|pad_haptics|controller_settings|device_suitability|host_lowering|write_heat|readback_plan|pipeline_use|submit_plan|depth_snapshot_plan|video_out_resolution|cache_folder|gamepad_quit|file_lock|program_list|player_slots|soft_float64|shader_cfg|metadata_fill|fence_retirement|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|trophy_system|avplayer_file|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd
@@ -202,19 +203,17 @@ jobs:
       - name: Build
         shell: bash
         run: |
+          # The unit tests are listed in .github/scripts/unit-tests.sh.
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
-              host_lowering_tests write_heat_tests readback_plan_tests pipeline_use_tests submit_plan_tests depth_snapshot_plan_tests video_out_resolution_tests cache_folder_tests gamepad_quit_tests file_lock_tests program_list_tests metadata_fill_tests fence_retirement_tests \
-              memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
-              resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests device_suitability_tests shader_cfg_tests archive_file_tests avplayer_file_tests \
+            --target launcher shader_recompiler_compute_tests \
+              $(.github/scripts/unit-tests.sh targets memory_tracker page_manager) \
             --parallel
 
       - name: Test
         shell: bash
         run: |
-          ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|device_suitability|host_lowering|write_heat|readback_plan|pipeline_use|submit_plan|depth_snapshot_plan|video_out_resolution|cache_folder|gamepad_quit|file_lock|program_list|metadata_fill|fence_retirement|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+          ctest --test-dir _Build/macos --output-on-failure --no-tests=error \
+            -R "$(.github/scripts/unit-tests.sh filter memory_tracker page_manager)"
 
       - name: Install
         shell: bash
@@ -386,19 +385,19 @@ jobs:
       - name: Build
         shell: bash
         run: |
+          # The unit tests are listed in .github/scripts/unit-tests.sh.
           cmake --build _Build/linux \
-            --target launcher page_manager_tests memory_tracker_tests \
-              host_lowering_tests write_heat_tests readback_plan_tests pipeline_use_tests submit_plan_tests depth_snapshot_plan_tests video_out_resolution_tests cache_folder_tests gamepad_quit_tests file_lock_tests program_list_tests metadata_fill_tests fence_retirement_tests \
-              audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
-              resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests device_suitability_tests archive_file_tests avplayer_file_tests \
+            --target launcher \
+              $(.github/scripts/unit-tests.sh targets memory_tracker page_manager) \
             --parallel
 
       - name: Test
         shell: bash
         run: |
-          ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|device_suitability|host_lowering|write_heat|readback_plan|pipeline_use|submit_plan|depth_snapshot_plan|video_out_resolution|cache_folder|gamepad_quit|file_lock|program_list|metadata_fill|fence_retirement|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+          # Windows runs cmd and keeps its own copy of the list: it must match the script.
+          .github/scripts/unit-tests.sh check-windows .github/workflows/build.yml
+          ctest --test-dir _Build/linux --output-on-failure --no-tests=error \
+            -R "$(.github/scripts/unit-tests.sh filter memory_tracker page_manager)"
 
       - name: Install
         shell: bash
