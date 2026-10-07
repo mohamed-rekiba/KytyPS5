@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 namespace Libs::Graphics {
@@ -64,6 +65,7 @@ bool MasterSemaphore::IsRetired(uint64_t tick) {
 }
 
 void MasterSemaphore::WaitRetired(uint64_t tick) {
+	KYTY_PROFILER_FUNCTION();
 	Wait(tick);
 	m_fences.WaitRetired(tick);
 }
@@ -92,6 +94,7 @@ bool MasterSemaphore::TryWait(uint64_t tick) noexcept {
 }
 
 void MasterSemaphore::Wait(uint64_t tick) {
+	KYTY_PROFILER_FUNCTION();
 	if (IsFree(tick)) {
 		return;
 	}

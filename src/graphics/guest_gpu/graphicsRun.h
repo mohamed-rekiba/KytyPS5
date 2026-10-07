@@ -72,6 +72,7 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
+	void              SubmitRecordedBeforeWaiting();
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
@@ -98,6 +99,10 @@ private:
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
+	// The host submission (scheduler tick) that this thread last recorded guest work into. The
+	// thread submits before it waits only when that submission is still open: what others
+	// record into the scheduler (the test harness does) is theirs to submit.
+	uint64_t        m_recorded_tick = UINT64_MAX;
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;

@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -108,6 +109,8 @@ public:
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
 	[[nodiscard]] bool IsInvalid() const;
+	// Any command was recorded since Begin (Handle was taken).
+	[[nodiscard]] bool Used() const noexcept { return m_used; }
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
@@ -150,6 +153,7 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable bool        m_used        = false;
 	mutable bool        m_global_barrier_pending = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
@@ -167,7 +171,10 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 	// A frame of the game ends: what the next frame draws into is told apart from what it does
 	// not (see PlanPipelineUse).
-	void NoteFlip() { m_frame++; }
+	void NoteFlip() {
+		m_frame++;
+		KYTY_PROFILER_FRAME();
+	}
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
 
@@ -230,15 +237,48 @@ private:
 	// its generation (so a slot given to a new image does not inherit the frame of the old one)
 	// and, for colour, the mip level and array layer (a face of a cube map or a layer of an atlas
 	// drawn once is not covered by draws into the others).
-	std::unordered_map<uint64_t, uint64_t> m_target_frames;
-	static uint64_t TargetKey(ImageId image, uint32_t mip = 0, uint32_t layer = 0) {
-		uint64_t key = image.index;
-		for (const uint32_t part: {image.generation, mip, layer}) {
-			key = (key ^ part) * 0x9E3779B97F4A7C15ull;
+	// One target of a draw: an image (slot and generation), a mip and a layer. Exact, no hash.
+	struct TargetId {
+		uint64_t image = 0;
+		uint32_t mip   = 0;
+		uint32_t layer = 0;
+		bool     operator==(const TargetId&) const = default;
+	};
+	struct TargetIdHash {
+		size_t operator()(const TargetId& id) const noexcept {
+			return std::hash<uint64_t> {}(id.image ^ ((uint64_t {id.mip} << 40) | (uint64_t {id.layer} << 8)));
 		}
-		return key;
+	};
+	static uint64_t ImageIdentity(ImageId image) {
+		return (uint64_t {image.index} << 32) | image.generation;
 	}
-	static uint64_t TargetKey(const RenderColorInfo& color);
+	static TargetId TargetKey(ImageId image, uint32_t mip = 0, uint32_t layer = 0) {
+		return {ImageIdentity(image), mip, layer};
+	}
+	std::unordered_map<TargetId, uint64_t, TargetIdHash> m_target_frames;
+	// Buffers a draw uses on the GPU alone, within one submission (a depth snapshot, the records
+	// of an emulated mesh draw). Kept and used again once the GPU has passed the submission that
+	// used them: creating and destroying one per draw cost 0.45 ms each on MoltenVK.
+	struct ScratchBuffer {
+		std::unique_ptr<Buffer> buffer;
+		uint64_t                tick = 0;
+	};
+	std::vector<ScratchBuffer> m_scratch;
+	uint64_t                   m_scratch_bytes = 0;
+	// The depth snapshot the last depth-bounds draw read (see depthSnapshotPlan.h). Held out
+	// of the scratch pool while it may be read again; returned to it when replaced.
+	struct DepthSnapshot {
+		std::unique_ptr<Buffer> buffer;
+		uint64_t                tick       = 0;
+		uint64_t                image      = 0;
+		uint32_t                layer      = 0;
+		uint64_t                generation = 0;
+		bool                    load_clear = false;
+		float                   clear      = 0.0f;
+	};
+	DepthSnapshot              m_depth_snapshot;
+	Buffer&                    AcquireScratch(uint64_t bytes);
+	static TargetId TargetKey(const RenderColorInfo& color);
 	uint64_t                               m_frame = 0;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;

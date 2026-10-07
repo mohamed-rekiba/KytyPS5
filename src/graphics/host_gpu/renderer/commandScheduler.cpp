@@ -1,8 +1,10 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/submitPlan.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -175,6 +177,37 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 	BeginNext();
 }
 
+bool CommandScheduler::SubmitIfDue(SubmitPoint point) {
+	if (m_command.IsInvalid()) {
+		return false;
+	}
+	const bool used = m_command.Used();
+	if (used && m_open_since == std::chrono::steady_clock::time_point {}) {
+		m_open_since = std::chrono::steady_clock::now();
+	}
+	SubmitState state {.open_work      = m_open_work,
+	                   .open_callbacks = point == SubmitPoint::Packet ? 0u : m_open_callbacks,
+	                   .open_used      = used,
+	                   .about_to_wait  = point == SubmitPoint::Wait};
+	// The clock is read only when the age can decide: it is the costly part of this check.
+	if (point == SubmitPoint::GuestSubmission && used && state.open_callbacks == 0 &&
+	    m_open_work < SUBMIT_WORK_LIMIT) {
+		state.open_age_us = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+		                                                          m_open_since)
+		        .count());
+	}
+	switch (PlanSubmit(state)) {
+		case SubmitReason::None: return false;
+		case SubmitReason::Callbacks: KYTY_PROFILER_MESSAGE("submit: callbacks"); break;
+		case SubmitReason::Idle: KYTY_PROFILER_MESSAGE("submit: idle"); break;
+		case SubmitReason::Work: KYTY_PROFILER_MESSAGE("submit: work"); break;
+		case SubmitReason::Age: KYTY_PROFILER_MESSAGE("submit: age"); break;
+	}
+	Flush();
+	return true;
+}
+
 void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit();
 	m_master.Wait(tick);
@@ -182,6 +215,7 @@ void CommandScheduler::FlushAndWait() {
 }
 
 void CommandScheduler::Finish() {
+	KYTY_PROFILER_FUNCTION();
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -194,6 +228,7 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -289,6 +324,10 @@ void CommandScheduler::QueueOperationInAnyState(Common::UniqueFunction<void>&& o
 	if (m_operation_state == OperationState::Open) {
 		auto& queue = priority ? m_priority_operations : m_pending_operations;
 		queue.push({std::move(operation), CurrentTick()});
+		if (priority) {
+			// Runs when the open submission completes: the submission must go out for that.
+			m_open_callbacks++;
+		}
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();
@@ -400,6 +439,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
@@ -454,6 +494,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
+	m_open_work      = 0;
+	m_open_callbacks = 0;
+	m_open_since     = {};
 	return tick;
 }
 

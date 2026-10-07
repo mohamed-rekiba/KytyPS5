@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 
@@ -27,6 +28,21 @@ public:
 	void           EndRendering();
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
+	// A draw or dispatch went into the open command buffer.
+	void NoteWork() noexcept { m_open_work++; }
+	// Where the GPU thread asks whether the open command buffer should go out (see submitPlan.h).
+	enum class SubmitPoint : uint8_t {
+		// Between two PM4 packets: the work limit alone decides, so that what a packet sequence
+		// submits does not depend on the clock or on callbacks queued earlier. Packets that need
+		// a submission (an end-of-pipe interrupt, a flip) submit explicitly.
+		Packet,
+		// A guest command buffer ended: the age limit applies too.
+		GuestSubmission,
+		// The GPU thread has nothing more to record right now.
+		Wait,
+	};
+	// Submits the open command buffer when PlanSubmit says so. GPU thread only.
+	bool SubmitIfDue(SubmitPoint point);
 	void           FlushAndWait();
 	void           Finish();
 	// The open submission writes buffer memory that the CPU will read (see readbackPlan.h). The
@@ -101,6 +117,10 @@ private:
 	// shuts down.
 	void QueueOperationInAnyState(Common::UniqueFunction<void>&& operation, bool priority);
 	bool m_cpu_reads_writes = false;
+	// What the open command buffer holds, for SubmitIfDue. Reset at every submission.
+	uint32_t                              m_open_work      = 0;
+	uint32_t                              m_open_callbacks = 0;
+	std::chrono::steady_clock::time_point m_open_since {};
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 	void RetireCallbackState(Common::UniqueFunction<void>&& callback);
 

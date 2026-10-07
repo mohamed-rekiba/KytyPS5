@@ -1316,6 +1316,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	KYTY_PROFILER_FUNCTION();
 	m_program_cache->Adopt();
 	QueueListedPipelines();
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
@@ -1472,6 +1473,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs, const DrawEffects& effects) {
+	KYTY_PROFILER_FUNCTION();
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;

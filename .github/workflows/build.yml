@@ -113,6 +113,7 @@ jobs:
         shell: cmd
         run: |
           cmake --build _Build/windows --target launcher ^
+            host_lowering_tests write_heat_tests readback_plan_tests pipeline_use_tests submit_plan_tests depth_snapshot_plan_tests video_out_resolution_tests program_list_tests metadata_fill_tests fence_retirement_tests ^
             audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
@@ -121,7 +122,7 @@ jobs:
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|device_suitability|host_lowering|write_heat|readback_plan|pipeline_use|program_list|metadata_fill|fence_retirement|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|device_suitability|host_lowering|write_heat|readback_plan|pipeline_use|submit_plan|depth_snapshot_plan|program_list|metadata_fill|fence_retirement|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd
@@ -203,6 +204,7 @@ jobs:
         run: |
           cmake --build _Build/macos \
             --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              host_lowering_tests write_heat_tests readback_plan_tests pipeline_use_tests submit_plan_tests depth_snapshot_plan_tests video_out_resolution_tests program_list_tests metadata_fill_tests fence_retirement_tests \
               memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests device_suitability_tests shader_cfg_tests archive_file_tests avplayer_file_tests \
@@ -212,7 +214,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|device_suitability|host_lowering|write_heat|readback_plan|pipeline_use|program_list|metadata_fill|fence_retirement|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|controller_settings|device_suitability|host_lowering|write_heat|readback_plan|pipeline_use|submit_plan|depth_snapshot_plan|program_list|metadata_fill|fence_retirement|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -386,6 +388,7 @@ jobs:
         run: |
           cmake --build _Build/linux \
             --target launcher page_manager_tests memory_tracker_tests \
+              host_lowering_tests write_heat_tests readback_plan_tests pipeline_use_tests submit_plan_tests depth_snapshot_plan_tests video_out_resolution_tests program_list_tests metadata_fill_tests fence_retirement_tests \
               audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests device_suitability_tests archive_file_tests avplayer_file_tests \
@@ -395,7 +398,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|device_suitability|host_lowering|write_heat|readback_plan|pipeline_use|program_list|metadata_fill|fence_retirement|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|controller_settings|device_suitability|host_lowering|write_heat|readback_plan|pipeline_use|submit_plan|depth_snapshot_plan|program_list|metadata_fill|fence_retirement|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
