@@ -70,7 +70,7 @@ static uint32_t ControllerButtonToPadButton(int button) {
 		case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
 		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
 		case SDL_GAMEPAD_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
-		default: return 0;
+		default: return Controller::PAD_BUTTON_NONE;
 	}
 }
 
@@ -320,11 +320,15 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		SDL_CloseGamepad(pad);
 	}
 
+	if (f.removed) {
+		HostInputGamepadRemoved(f.id);
+	}
+
 	if (f.down || f.up) {
-		const auto button = ControllerButtonToPadButton(f.button);
-		if (button != 0) {
-			Controller::SetButton(f.id, button, f.down);
-		}
+		HostInputGamepadButton(f.id, f.button, f.down);
+		// Also a button with no pad button (PS, Back): its press seats the gamepad, as a
+		// console's controller logs in with its PS button.
+		Controller::SetButton(f.id, ControllerButtonToPadButton(f.button), f.down);
 	}
 
 	if (f.axis) {
@@ -745,11 +749,15 @@ void WindowContext::Run() {
 			title_time   = now;
 			title_frames = frames;
 		}
-		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
-		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
-			continue;
+		const auto wait_ms   = static_cast<int>(title_interval_ms - (now - title_time));
+		const bool has_event = HostInputWaitEvent(&loop.event, wait_ms);
+		if (has_event) {
+			ProcessEvent(timer.GetTimeS());
 		}
-		ProcessEvent(timer.GetTimeS());
+		if (HostInputQuitRequested()) {
+			LOGF("Event: quit (gamepad)\n");
+			loop.need_exit = true;
+		}
 	}
 }
 

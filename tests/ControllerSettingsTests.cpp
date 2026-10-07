@@ -323,7 +323,7 @@ void TestIndependentOutputsAndPadSwitch() {
 	CycleSetting(Setting::SpeakerVolume);
 	Check(haptics.size() == vibration_calls && effects.size() == trigger_calls,
 	      "speaker volume resent controller effects");
-	// The gamepad of player one leaves, and the next one to join plays as player one.
+	// The gamepad of player one leaves, and the next one seated plays as player one.
 	Disconnect(1);
 	Join(2);
 	Check(GetGamepadOfPlayerOne() == 2, "the next gamepad did not become player one");
@@ -364,7 +364,14 @@ void TestAGamepadPlaysFromItsFirstPress() {
 	SetButton(2, PAD_BUTTON_CROSS, true);
 	Check(GetGamepadOfPlayerOne() == 2, "the first gamepad pressed did not become player one");
 	SetButton(1, PAD_BUTTON_CROSS, false);
-	Check(GetGamepadOfPlayerOne() == 2, "a released button made a gamepad join");
+	Check(GetGamepadOfPlayerOne() == 2, "a released button seated a gamepad");
+	Shutdown();
+
+	// The PS button has no pad button: it seats the gamepad all the same, as on a console.
+	Initialize();
+	Connect(3);
+	SetButton(3, PAD_BUTTON_NONE, true);
+	Check(GetGamepadOfPlayerOne() == 3, "the PS button did not seat the gamepad");
 	Shutdown();
 }
 

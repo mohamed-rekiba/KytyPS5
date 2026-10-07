@@ -441,6 +441,11 @@ add_executable(cache_folder_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(cache_folder_tests PRIVATE ${inc_headers})
 
+add_executable(gamepad_quit_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GamepadQuitTests.cpp"
+)
+target_include_directories(gamepad_quit_tests PRIVATE ${inc_headers})
+
 add_executable(file_lock_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/FileLockTests.cpp"
 )
@@ -692,6 +697,7 @@ if(BUILD_TESTING)
 	add_test(NAME depth_snapshot_plan COMMAND $<TARGET_FILE:depth_snapshot_plan_tests>)
 	add_test(NAME video_out_resolution COMMAND $<TARGET_FILE:video_out_resolution_tests>)
 	add_test(NAME cache_folder COMMAND $<TARGET_FILE:cache_folder_tests>)
+	add_test(NAME gamepad_quit COMMAND $<TARGET_FILE:gamepad_quit_tests>)
 	add_test(NAME file_lock COMMAND $<TARGET_FILE:file_lock_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME metadata_fill COMMAND $<TARGET_FILE:metadata_fill_tests>)
@@ -783,6 +789,7 @@ if(BUILD_TESTING)
 		depth_snapshot_plan_tests
 		video_out_resolution_tests
 		cache_folder_tests
+		gamepad_quit_tests
 		file_lock_tests
 		image_page_table_tests
 		metadata_fill_tests

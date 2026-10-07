@@ -14,6 +14,11 @@ void               HostInputKey(int key_code, bool down);
 void               HostInputMouseButton(uint8_t mouse_button, bool down);
 void               HostInputToggleMouseToJoystick();
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms);
+// A gamepad button (an SDL_GamepadButton) went down or up; see gamepadQuit.h.
+void               HostInputGamepadButton(int gamepad, int button, bool down);
+void               HostInputGamepadRemoved(int gamepad);
+// The player held the gamepad's close buttons long enough.
+[[nodiscard]] bool HostInputQuitRequested();
 
 } // namespace Libs::Graphics
 

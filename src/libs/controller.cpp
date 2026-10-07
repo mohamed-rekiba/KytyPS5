@@ -480,6 +480,9 @@ void GameController::Button(int id, uint32_t button, bool down) {
 	    std::find(m_host_pads.begin(), m_host_pads.end(), id) != m_host_pads.end()) {
 		Seat(id);
 	}
+	if (button == PAD_BUTTON_NONE) {
+		return; // only seats the gamepad
+	}
 
 	if (auto* pad = InputPad(id); pad != nullptr) {
 		pad->state.time = LibKernel::KernelGetProcessTime();

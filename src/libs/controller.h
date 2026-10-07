@@ -18,6 +18,8 @@ struct Lifecycle {
 
 constexpr int HOST_INPUT_CONTROLLER_ID = -1000;
 
+// A host button with no pad button (PS, Back): it seats a gamepad and changes no state.
+constexpr uint32_t PAD_BUTTON_NONE      = 0x00000000;
 constexpr uint32_t PAD_BUTTON_L3        = 0x00000002;
 constexpr uint32_t PAD_BUTTON_R3        = 0x00000004;
 constexpr uint32_t PAD_BUTTON_OPTIONS   = 0x00000008;
