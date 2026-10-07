@@ -268,6 +268,18 @@ struct PipelineCache::ProgramCache {
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
+		vk::ShaderModule mesh_vertex_module = nullptr;
+		if (!result.mesh_vertex_spirv.empty()) {
+			if (!ValidateShaderSpirv(options.dump_label, options.shader_hash,
+			                         result.mesh_vertex_spirv)) {
+				DumpShaderSpirv("mesh_vs", options.shader_hash, result.mesh_vertex_spirv);
+				EXIT("%s failed hash=0x%016" PRIx64 ": emulated mesh vertex shader is invalid\n",
+				     options.dump_label, options.shader_hash);
+			}
+			DumpShaderSpirv("mesh_vs", options.shader_hash, result.mesh_vertex_spirv);
+			mesh_vertex_module = CompileSPV(result.mesh_vertex_spirv, device);
+			EXIT_IF(mesh_vertex_module == nullptr);
+		}
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -275,7 +287,10 @@ struct PipelineCache::ProgramCache {
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = {.id                 = ++next_shader_id,
+		                       .module             = module,
+		                       .mesh_vertex_module = mesh_vertex_module,
+		                       .mesh_slot_words    = result.mesh_slot_words},
 		};
 	}
 
@@ -356,6 +371,7 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.host           = host;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -398,7 +414,7 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	ProgramCache(vk::Device device, const HostGpu& host): device(device), host(host) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -406,6 +422,9 @@ struct PipelineCache::ProgramCache {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
 				device.destroyShaderModule(permutation.handle.module, nullptr);
+				if (permutation.handle.mesh_vertex_module != nullptr) {
+					device.destroyShaderModule(permutation.handle.mesh_vertex_module, nullptr);
+				}
 			}
 		}
 	}
@@ -413,11 +432,13 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
+	HostGpu                                                     host;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics),
+      m_program_cache(std::make_unique<ProgramCache>(graphics.device, graphics.host)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }
@@ -429,6 +450,10 @@ PipelineCache::~PipelineCache() {
 			(void)key;
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
 			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
+			if (pipeline->mesh_compute != nullptr) {
+				m_graphics.device.destroyPipeline(pipeline->mesh_compute, nullptr);
+				m_graphics.device.destroyPipelineLayout(pipeline->mesh_compute_layout, nullptr);
+			}
 			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
 		}
 	};
@@ -597,19 +622,34 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
-		const auto& limits      = m_graphics.mesh_shader_properties;
+		// Without mesh shaders the guest shader runs as a compute shader (see
+		// capturedVertexLayout.h).
+		mesh.emulated = !m_graphics.host.capabilities.mesh_shader;
 		const auto  logical_threads =
 		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
 		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
 		                          std::min(mesh.host_subgroup_size, mesh.wave_size);
-		if (host_threads > limits.maxMeshWorkGroupInvocations ||
-		    host_threads > limits.maxMeshWorkGroupSize[0] ||
-		    mesh.max_vertices > limits.maxMeshOutputVertices ||
-		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
-		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
+		bool within_limits = false;
+		if (mesh.emulated) {
+			const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
+			// Besides the guest LDS, the shader keeps the layers and the allocation in shared
+			// memory.
+			within_limits = host_threads <= limits.maxComputeWorkGroupInvocations &&
+			                host_threads <= limits.maxComputeWorkGroupSize[0] &&
+			                (mesh.lds_size_dwords + mesh.max_vertices + 2u) * sizeof(uint32_t) <=
+			                    limits.maxComputeSharedMemorySize;
+		} else {
+			const auto& limits = m_graphics.mesh_shader_properties;
+			within_limits =
+			    host_threads <= limits.maxMeshWorkGroupInvocations &&
+			    host_threads <= limits.maxMeshWorkGroupSize[0] &&
+			    mesh.max_vertices <= limits.maxMeshOutputVertices &&
+			    mesh.max_primitives <= limits.maxMeshOutputPrimitives &&
+			    mesh.lds_size_dwords * sizeof(uint32_t) <= limits.maxMeshSharedMemorySize;
+		}
+		if (!within_limits) {
 			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
 			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
 		}
@@ -673,9 +713,23 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
-	uint32_t          push_data_cursor =
-	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+	uint32_t push_data_cursor = !mesh_active ? 0
+	                            : vertex_info[0].mesh.emulated
+	                                ? ShaderRecompiler::IR::PushData::MeshEmulatedDrawDwordCount
+	                                : ShaderRecompiler::IR::PushData::MeshDrawDwordCount;
 	GraphicsPrograms  result;
+	if (pixel_active && !m_graphics.host.capabilities.depth_bounds &&
+	    context.GetDepthControl().depth_bounds_enable) {
+		// The host has no depth bounds test: the pixel shader applies it to a copy of the depth
+		// buffer (see EmitDepthBoundsTest).
+		switch (context.GetDepthRenderTarget().z_info.format) {
+			case Prospero::DepthFormat::kZ32F: pixel_info.ps_depth_bounds_format = 1; break;
+			case Prospero::DepthFormat::kZ16: pixel_info.ps_depth_bounds_format = 2; break;
+			default: EXIT("depth bounds test on an unsupported depth format\n");
+		}
+		pixel_info.ps_depth_bounds_dword = push_data_cursor;
+		push_data_cursor += ShaderRecompiler::IR::PushData::DepthBoundsDwordCount;
+	}
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}

@@ -1,0 +1,117 @@
+#ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_HOST_GPU_HOSTCAPABILITIES_H_
+#define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_HOST_GPU_HOSTCAPABILITIES_H_
+
+#include <cstdint>
+
+// What the host GPU can do beyond the features every device must have. The device decision
+// (deviceSuitability.h) fills these in once; the shader recompiler and the renderer read them and
+// never ask the device or the platform again.
+
+namespace Libs::Graphics {
+
+// Optional capabilities. Each one is on only when the device reports it and the emulator
+// enables it. Guest work that needs a capability that is off is either done another way or stops
+// the emulator with a message that names the capability.
+struct HostCapabilities {
+	// A texture view can carry a minimum LOD (VK_EXT_image_view_min_lod).
+	bool image_view_min_lod = false;
+	bool cull_distance      = false;
+	// 64-bit atomics on storage buffers, on compute shared memory, and on storage images.
+	bool buffer_int64_atomics = false;
+	bool shared_int64_atomics = false;
+	bool image_int64_atomics  = false;
+	bool float64              = false;
+	bool fragment_barycentric = false;
+	bool depth_bounds         = false;
+	bool depth_clamp          = false;
+	// Depth clipping can be set apart from depth clamping (VK_EXT_depth_clip_enable).
+	bool depth_clip_enable = false;
+	// Colour writes can be turned off per attachment at draw time (VK_EXT_color_write_enable).
+	bool color_write_enable = false;
+	bool mesh_shader        = false;
+	// Derivatives in compute shaders, over 2x2 groups of invocations
+	// (VK_KHR_compute_shader_derivatives).
+	bool compute_derivatives = false;
+	// Descriptors can be pushed with vkCmdPushDescriptorSet (VK_KHR_push_descriptor).
+	bool push_descriptors = false;
+	// Stages that may use subgroup operations: VkPhysicalDeviceVulkan11Properties::
+	// subgroupSupportedStages, as VkShaderStageFlagBits values.
+	uint32_t subgroup_supported_stages = 0;
+	// The subgroup operations those stages have: VkPhysicalDeviceVulkan11Properties::
+	// subgroupSupportedOperations, as VkSubgroupFeatureFlagBits values.
+	uint32_t subgroup_supported_operations = 0;
+
+	// A host with every capability. For tests and offline compilation only: the renderer always
+	// passes what its device enabled.
+	[[nodiscard]] static constexpr HostCapabilities Full() {
+		HostCapabilities all;
+		all.image_view_min_lod        = true;
+		all.cull_distance             = true;
+		all.buffer_int64_atomics      = true;
+		all.shared_int64_atomics      = true;
+		all.image_int64_atomics       = true;
+		all.float64                   = true;
+		all.fragment_barycentric      = true;
+		all.depth_bounds              = true;
+		all.depth_clamp               = true;
+		all.depth_clip_enable         = true;
+		all.color_write_enable        = true;
+		all.mesh_shader               = true;
+		all.compute_derivatives       = true;
+		all.push_descriptors          = true;
+		all.subgroup_supported_stages     = ~0u;
+		all.subgroup_supported_operations = ~0u;
+		return all;
+	}
+
+	bool operator==(const HostCapabilities&) const = default;
+};
+
+// The driver behind the device, where the emulator must know it.
+enum class HostDriver : uint8_t { Other, MoltenVk };
+
+// Defects of a driver: things the device reports as available that do not work. They are kept
+// apart from capabilities, so that a capability never depends on a driver's name.
+struct DriverFaults {
+	// Pushed descriptors get no buffer size table, so a shader that asks for a buffer length
+	// reads a null buffer.
+	bool pushed_buffers_have_no_size = false;
+	// A pixel shader input with the raw values of the three vertices of its triangle
+	// (PerVertexKHR) cannot be translated for the device.
+	bool no_per_vertex_inputs = false;
+	// Barycentrics interpolated at the centroid cannot be translated for the device.
+	bool no_centroid_barycentric = false;
+	// A plain load marked volatile may be done once and reused, so a loop that waits for a value
+	// another invocation stores never sees it.
+	bool volatile_loads_are_reused = false;
+
+	bool operator==(const DriverFaults&) const = default;
+};
+
+// Measured on MoltenVK 1.4.2. No MoltenVK release without these defects is known, so they apply
+// to every version.
+[[nodiscard]] constexpr DriverFaults FaultsOf(HostDriver driver) {
+	DriverFaults faults;
+	if (driver == HostDriver::MoltenVk) {
+		faults.pushed_buffers_have_no_size = true;
+		faults.no_per_vertex_inputs        = true;
+		faults.no_centroid_barycentric     = true;
+		faults.volatile_loads_are_reused   = true;
+	}
+	return faults;
+}
+
+// The host GPU as the shader recompiler and the renderer see it.
+struct HostGpu {
+	HostCapabilities capabilities;
+	DriverFaults     faults;
+
+	// A host with every capability and no defects. For tests and offline compilation only.
+	[[nodiscard]] static constexpr HostGpu Full() { return {HostCapabilities::Full(), {}}; }
+
+	bool operator==(const HostGpu&) const = default;
+};
+
+} // namespace Libs::Graphics
+
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_HOST_GPU_HOSTCAPABILITIES_H_ */

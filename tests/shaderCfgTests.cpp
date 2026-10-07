@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/shader/capturedVertexLayout.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -127,6 +128,8 @@ struct TestCompileResult {
   std::string ir_dump;
   ShaderRecompiler::IR::Program program;
   ShaderRecompiler::IR::ResourceSnapshot resources;
+  std::vector<uint32_t> mesh_vertex_spirv;
+  uint32_t mesh_slot_words = 0;
 };
 
 TestCompileResult RecompileForTest(
@@ -152,7 +155,8 @@ TestCompileResult RecompileForTest(
       std::move(translated), options, specialization, push_data_start_dword);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
-          std::move(resources)};
+          std::move(resources), std::move(compiled.mesh_vertex_spirv),
+          compiled.mesh_slot_words};
 }
 
 void CompilePixelRuntime(const ShaderParams &params,
@@ -6604,6 +6608,44 @@ void TestPerspectiveSampleInputs() {
   }
 }
 
+// The host has no depth bounds test (Metal). The renderer copies the depth buffer to a buffer
+// before the draw, and the pixel shader discards pixels whose stored depth is outside the range.
+void TestDepthBoundsPixelTest() {
+  constexpr uint32_t kOpKill = 252u;
+  constexpr uint32_t kOpConvertUToPtr = 120u;
+  constexpr uint32_t kBuiltInFragCoord = 15u;
+  const uint32_t shader[] = {EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3),
+                             0xbf810000u};
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+
+  ShaderPixelInputInfo off{};
+  options.input_info.pixel = &off;
+  const auto plain = RecompileForTest(shader, options);
+  Check(!SpirvContainsOpcode(plain.spirv, kOpKill) &&
+            !SpirvContainsOpcode(plain.spirv, kOpConvertUToPtr),
+        "a draw without a depth bounds test compiled a depth read");
+
+  for (const uint32_t format : {1u, 2u}) {
+    ShaderPixelInputInfo bounds{};
+    bounds.ps_depth_bounds_format = format;
+    bounds.ps_depth_bounds_dword = 6;
+    options.input_info.pixel = &bounds;
+    const auto result = RecompileForTest(shader, options);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(SpirvContainsOpcode(result.spirv, kOpKill),
+          "depth bounds test does not discard pixels outside the range");
+    Check(SpirvContainsOpcode(result.spirv, kOpConvertUToPtr),
+          "depth bounds test does not read the depth snapshot by address");
+    Check(SpirvHasDecorationValue(result.spirv, 11u, kBuiltInFragCoord),
+          "depth bounds test does not read the pixel position");
+    Check(source.find("PushConstant") != std::string::npos,
+          "depth bounds test does not read its parameters from push constants");
+    Check(format != 2u || source.find("OpConvertUToF") != std::string::npos,
+          "16-bit depth was not converted from its normalized integer value");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestPsInputCountRegisterDecode() {
   HW::Context context;
   // NUM_INTERP is 3 while bit 14 is an independent control flag that must be
@@ -10119,6 +10161,47 @@ void TestComputeDispatchWaveSize() {
         "dispatch with CS_W32_EN did not select wave32");
 }
 
+// A buffer load with GLC must see what other invocations stored. On a host that may reuse a
+// plain volatile load, the load is atomic; on any other host the translation does not change.
+void TestCoherentLoadOnAHostThatReusesVolatileLoads() {
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x0c, 0, true, true),
+      EncodeMubuf1(0, 0, 1), // buffer_load_dword v0, glc
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(0, 12, 0),
+      EncodeSopp(0x01),
+  };
+  constexpr uint32_t kOpAtomicLoad = 227u;
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  const auto plain = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(plain.spirv);
+  Check(SpirvInstructionOpcodeCount(plain.spirv, kOpAtomicLoad) == 0u,
+        "a coherent load became atomic on a host without the defect");
+
+  options.host.faults.volatile_loads_are_reused = true;
+  const auto atomic = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(atomic.spirv);
+  Check(SpirvInstructionOpcodeCount(atomic.spirv, kOpAtomicLoad) == 1u,
+        "a coherent load stayed plain on a host that reuses volatile loads");
+  // The store in the same shader: on that host every store of a shared word is atomic too, so
+  // that it does not race with an atomic load in another invocation.
+  constexpr uint32_t kOpAtomicStore = 228u;
+  Check(SpirvInstructionOpcodeCount(plain.spirv, kOpAtomicStore) == 0u,
+        "a store became atomic on a host without the defect");
+  Check(SpirvInstructionOpcodeCount(atomic.spirv, kOpAtomicStore) == 1u,
+        "a store stayed plain on a host that reuses volatile loads");
+
+  // A load without GLC stays plain on that host too.
+  const uint32_t plain_shader[] = {
+      EncodeMubuf0(0x0c), EncodeMubuf1(0, 0, 1), EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(0, 12, 0), EncodeSopp(0x01),
+  };
+  const auto other = RecompileForTest(plain_shader, options);
+  Check(SpirvInstructionOpcodeCount(other.spirv, kOpAtomicLoad) == 0u,
+        "a load without GLC became atomic");
+}
+
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const uint32_t shader[] = {
       EncodeMubuf0(0x0c),
@@ -10271,6 +10354,317 @@ void TestCapturedBufferAtomicsX2() {
           "GLC=1 64-bit MUBUF atomic did not return both dwords");
     CheckSpirvBinaryValidates(glc_result.spirv);
   }
+}
+
+// The renderer tells the recompiler which optional device capabilities are enabled. A shader
+// that needs one that is off must stop with a message that names it; a shader that does not need
+// it must still compile.
+void TestHostFeaturesGateUnavailableCapabilities() {
+  // No optional capability at all, on a driver with no known defects.
+  const HostGpu none{};
+
+  constexpr uint32_t kCapabilityInt64Atomics = 12u;
+  constexpr uint32_t kCapabilityCullDistance = 33u;
+  constexpr uint32_t kCapabilityFragmentBarycentric = 5284u;
+
+  // A shader that needs no optional capability compiles with every one off.
+  {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.host = none;
+    const std::array shader = {EncodeSopp(0x01)};
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(!SpirvContainsCapability(result.spirv, kCapabilityInt64Atomics),
+          "a shader without 64-bit atomics gained Int64Atomics");
+  }
+
+  // Cull distance. The default (every capability on) is covered by the aux-export tests.
+  {
+    ShaderVertexInputInfo vertex{};
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.input_info.vertex = &vertex;
+    options.host = none;
+
+    const uint32_t clip_only[] = {
+        EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
+        EncodeExp0(0x0d, 0x6), EncodeExp1(4, 5, 6, 7),
+        0xbf810000u,
+    };
+    vertex.pa_cl_vs_out_cntl = 0x00800050u; // clip distances only
+    const auto clip = RecompileForTest(clip_only, options);
+    CheckSpirvBinaryValidates(clip.spirv);
+    Check(!SpirvContainsCapability(clip.spirv, kCapabilityCullDistance),
+          "a clip-only shader emitted the CullDistance capability");
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    vertex.pa_cl_vs_out_cntl = 0x0080a050u; // clip and cull distances
+    ExpectFatal([&] { (void)RecompileForTest(clip_only, options); },
+                "a shader that exports cull distances compiled without host support");
+#endif
+  }
+
+  // 64-bit buffer atomics.
+  {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    const std::array shader = {0xe1680018u, 0x80000000u, EncodeSopp(0x01)}; // BUFFER_ATOMIC_OR_X2
+    const auto with_support = RecompileForTest(shader, options);
+    Check(SpirvContainsCapability(with_support.spirv, kCapabilityInt64Atomics),
+          "the default host features must keep native 64-bit buffer atomics");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    options.host = none;
+    ExpectFatal([&] { (void)RecompileForTest(shader, options); },
+                "a 64-bit buffer atomic compiled without host support");
+#endif
+
+    // A caller that must not stop can ask what is missing.
+    using ShaderRecompiler::Spirv::FindMissingCapability;
+    Check(!FindMissingCapability(with_support.program, HostGpu::Full()).has_value(),
+          "a host with every capability reported a missing one");
+    const auto missing = FindMissingCapability(with_support.program, none);
+    Check(missing.has_value() &&
+              std::string_view(missing->name) == "shaderBufferInt64Atomics",
+          "the missing capability was not named");
+    auto only_atomics = none;
+    only_atomics.capabilities.buffer_int64_atomics = true;
+    Check(!FindMissingCapability(with_support.program, only_atomics).has_value(),
+          "a capability the host has was reported missing");
+  }
+
+  // Derivatives in a compute shader: a pixel shader that queries an LOD does not need them.
+  // (The compute side runs on a GPU, in ShaderRecompilerComputeTests.)
+  {
+    using ShaderRecompiler::Spirv::FindMissingCapability;
+    const uint32_t query[] = {EncodeMimg0(0x60, 0x3), EncodeMimg1(6, 0, 0, 1),
+                              EncodeExp0(0x00, 0x3), EncodeExp1(6, 7, 0, 0),
+                              EncodeSopp(0x01)};
+    auto user_data = ImageTestUserData();
+    auto pixel_info = RegressionPixelInputInfo();
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &pixel_info;
+    options.user_data = user_data;
+    const auto pixel = RecompileForTest(query, options);
+    auto no_derivatives = HostGpu::Full();
+    no_derivatives.capabilities.compute_derivatives = false;
+    Check(!FindMissingCapability(pixel.program, no_derivatives).has_value(),
+          "a pixel LOD query asked for compute derivatives");
+  }
+
+  // Subgroup operations are only allowed in the stages the device lists.
+  {
+    constexpr uint32_t kVertexStageBit = 0x1u;
+    // In a stage with one guest lane per invocation, the lanes of the guest wave all hold the
+    // invocation's values. A value moved from another lane is then the invocation's own, and
+    // no subgroup operation of the host is needed.
+    const std::array shader = {
+        EncodeVop1(0x01, 0, 250), EncodeVop1Dpp(5), // V_MOV_B32 v0, v5 dpp
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    (void)RecompileForTest(shader, options);
+    options.host.capabilities.subgroup_supported_stages = ~kVertexStageBit;
+    const auto uniform = RecompileForTest(shader, options);
+    Check(!SpirvContainsCapability(uniform.spirv, 61u) &&
+              !SpirvContainsCapability(uniform.spirv, 64u) &&
+              !SpirvContainsCapability(uniform.spirv, 65u) &&
+              DisassembleSpirvBinary(uniform.spirv).find("SubgroupLocalInvocationId") ==
+                  std::string::npos,
+          "a lane move in a stage without subgroup operations still used them");
+    CheckSpirvBinaryValidates(uniform.spirv);
+    // A stage with several guest lanes in one host subgroup keeps the real operations, and
+    // stops when the device does not list the stage (fragment 0x10 | compute 0x20 are listed).
+    auto compute = MakeCompileOptions(ShaderType::Compute);
+    compute.host.capabilities.subgroup_supported_stages = 0x32u;
+    const auto native = RecompileForTest(shader, compute);
+    Check(SpirvContainsCapability(native.spirv, 65u),
+          "a lane move in a compute shader lost the real shuffle");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    compute.host.capabilities.subgroup_supported_stages = 0x12u; // no compute
+    ExpectFatal([&] { (void)RecompileForTest(shader, compute); },
+                "a compute shader with a lane operation compiled without host support");
+#endif
+    // The stage is listed, but the device has no shuffle (basic 0x1 and ballot 0x8 only).
+    {
+      using ShaderRecompiler::Spirv::FindMissingCapability;
+      auto host = HostGpu::Full();
+      host.capabilities.subgroup_supported_operations = 0x9u;
+      const auto missing = FindMissingCapability(native.program, host);
+      Check(missing.has_value() &&
+                std::string_view(missing->name) == "subgroupSupportedOperations",
+            "a shuffle on a device without shuffle was not named");
+      host.capabilities.subgroup_supported_operations = 0x19u;
+      Check(!FindMissingCapability(native.program, host).has_value(),
+            "a shuffle on a device with shuffle was reported missing");
+    }
+  }
+
+  // Without subgroup operations in the stage, a guest wave is one invocation with one active lane.
+  // The first active lane is then the invocation itself, so READFIRSTLANE is its own value. This is
+  // the shape of the loop that GPU compilers emit to index registers by a per-lane value.
+  {
+    constexpr uint32_t kCapabilityGroupNonUniform = 61u;
+    const std::array shader = {
+        EncodeVop1(0x02, 24, 5 + 256), // V_READFIRSTLANE_B32 s24, v5
+        EncodeVop1(0x01, 0, 24),       // V_MOV_B32 v0, s24
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    const auto native = RecompileForTest(shader, options);
+    Check(SpirvContainsCapability(native.spirv, kCapabilityGroupNonUniform),
+          "a host with subgroup operations in the vertex stage lost the real READFIRSTLANE");
+    options.host.capabilities.subgroup_supported_stages = 0x32u; // no vertex
+    const auto lowered = RecompileForTest(shader, options);
+    Check(!SpirvContainsCapability(lowered.spirv, kCapabilityGroupNonUniform),
+          "READFIRSTLANE in a stage without subgroup operations still used them");
+    CheckSpirvBinaryValidates(lowered.spirv);
+  }
+
+  // The loop's other half: a compare that makes a lane mask (a ballot) from a per-lane value that
+  // was just read from the first lane, then a select by that mask.
+  {
+    constexpr uint32_t kCapabilityGroupNonUniformBallot = 64u;
+    const std::array shader = {
+        EncodeVop1(0x02, 9, 5 + 256),  // V_READFIRSTLANE_B32 s9, v5
+        EncodeVopc(0xc2, 9, 6),        // V_CMP_EQ_U32 vcc, s9, v6
+        EncodeSop1(0x0f, 20, 106),     // S_BCNT1_I32_B64 s20, vcc (reads the mask as a scalar)
+        EncodeVop1(0x01, 0, 20),       // V_MOV_B32 v0, s20
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    const auto native = RecompileForTest(shader, options);
+    Check(SpirvContainsCapability(native.spirv, kCapabilityGroupNonUniformBallot),
+          "a host with subgroup operations in the vertex stage lost the real ballot");
+    options.host.capabilities.subgroup_supported_stages = 0x32u; // no vertex
+    const auto lowered = RecompileForTest(shader, options);
+    Check(!SpirvContainsCapability(lowered.spirv, kCapabilityGroupNonUniformBallot) &&
+              !SpirvContainsCapability(lowered.spirv, 61u),
+          "a lane mask in a stage without subgroup operations still used them");
+    CheckSpirvBinaryValidates(lowered.spirv);
+  }
+
+  // A compiler keeps scalars it has no register for in the lanes of a vector register. A stage
+  // without subgroup operations must still give each one back from its own lane.
+  {
+    const uint32_t shader[] = {
+        EncodeSMovB32(9, 133),                                      // s9 = 5
+        EncodeVop3Word0(0x361, 86), EncodeVop3Word1(9, 131, 0),     // v_writelane_b32 v86, s9, 3
+        EncodeSMovB32(10, 135),                                     // s10 = 7
+        EncodeVop3Word0(0x361, 86), EncodeVop3Word1(10, 132, 0),    // v_writelane_b32 v86, s10, 4
+        EncodeVop3Word0(0x360, 11), EncodeVop3Word1(86 + 256, 131, 0), // v_readlane_b32 s11, v86, 3
+        EncodeVop3Word0(0x360, 12), EncodeVop3Word1(86 + 256, 132, 0), // v_readlane_b32 s12, v86, 4
+        EncodeVop1(0x01, 0, 11),                                    // v_mov_b32 v0, s11
+        EncodeVop1(0x01, 1, 12),                                    // v_mov_b32 v1, s12
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 0, 1),              // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.host.capabilities.subgroup_supported_stages = 0x32u; // no vertex
+    options.dump_ir = true;
+    const auto lowered = RecompileForTest(shader, options);
+    Check(lowered.ir_dump.find("WriteLane") == std::string::npos &&
+              lowered.ir_dump.find("ReadLane") == std::string::npos,
+          "a scalar kept in a register lane still needs lane operations");
+    const auto source = DisassembleSpirvBinary(lowered.spirv);
+    Check(!SpirvContainsCapability(lowered.spirv, 64u) &&
+              source.find("SubgroupLocalInvocationId") == std::string::npos,
+          "a scalar kept in a register lane used subgroup operations");
+    // Lane 3 holds 5 and lane 4 holds 7, as integers in the position's x and y.
+    Check(SpirvSourceHasInstructionUsing(source, "OpCompositeConstruct", "%uint_5 %uint_7") ||
+              source.find("%uint_5 %uint_7 %uint_5 %uint_7") != std::string::npos,
+          "the scalars did not come back from the lanes they were put in");
+    CheckSpirvBinaryValidates(lowered.spirv);
+  }
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  // A value computed from a register with a lane write differs from lane to lane. The model does
+  // not follow the computation, so a read of another lane of it must stop, not give lane 0.
+  {
+    const uint32_t shader[] = {
+        EncodeSMovB32(9, 133),                                         // s9 = 5
+        EncodeVop3Word0(0x361, 86), EncodeVop3Word1(9, 131, 0),        // v_writelane_b32 v86, s9, 3
+        EncodeVop2(0x25, 86, 129, 86),                                 // v_add_u32 v86, 1, v86
+        EncodeVop3Word0(0x360, 11), EncodeVop3Word1(86 + 256, 131, 0), // v_readlane_b32 s11, v86, 3
+        EncodeVop1(0x01, 0, 11),                                       // v_mov_b32 v0, s11
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0),                 // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.host.capabilities.subgroup_supported_stages = 0x32u; // no vertex
+    ExpectFatal([&] { (void)RecompileForTest(shader, options); },
+                "a lane read through arithmetic on a lane write compiled in the single-lane model");
+  }
+#endif
+
+  // Fragment barycentrics.
+  {
+    ShaderPixelInputInfo custom_ps_info{};
+    custom_ps_info.input_num = 1;
+    custom_ps_info.ps_system_input_base = 2;
+    custom_ps_info.custom_interpolation_mask = 1;
+    custom_ps_info.ps_perspective_center_vgpr = 0;
+    SetIdentityInterpolatorSettings(&custom_ps_info);
+    custom_ps_info.interpolator_settings[0] = 0x00000420u;
+    const uint32_t barycentric_shader[] = {
+        EncodeVintrp(2, 12, 0, 3, 2),      EncodeVintrp(2, 13, 0, 3, 0),
+        EncodeVintrp(2, 14, 0, 3, 1),      EncodeVop2(0x03, 15, 12 + 256, 0),
+        EncodeVop2(0x03, 16, 13 + 256, 1), EncodeExp0(0x00, 0xf),
+        EncodeExp1(15, 16, 14, 12),        0xbf810000u,
+    };
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &custom_ps_info;
+    const auto with_support = RecompileForTest(barycentric_shader, options);
+    Check(SpirvContainsCapability(with_support.spirv, kCapabilityFragmentBarycentric),
+          "the default host features must keep fragment barycentrics");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    options.host = none;
+    ExpectFatal([&] { (void)RecompileForTest(barycentric_shader, options); },
+                "a barycentric shader compiled without host support");
+#endif
+
+    // A flat input does not need barycentrics.
+    ShaderPixelInputInfo flat_ps_info{};
+    flat_ps_info.input_num = 1;
+    flat_ps_info.interpolator_settings[0] = 0x00000400u;
+    const uint32_t flat_shader[] = {
+        EncodeVintrp(2, 12, 0, 3, 2),
+        EncodeExp0(0x00, 0x1),
+        EncodeExp1(12, 0, 0, 0),
+        0xbf810000u,
+    };
+    options.input_info.pixel = &flat_ps_info;
+    const auto flat = RecompileForTest(flat_shader, options);
+    CheckSpirvBinaryValidates(flat.spirv);
+    Check(!SpirvContainsCapability(flat.spirv, kCapabilityFragmentBarycentric),
+          "a flat input required fragment barycentric support");
+  }
+}
+
+// Captured from a game (hash c22d9ddc825b8c3b): a full-screen triangle vertex shader. Its prologue sets EXEC from the wave's thread count. A graphics stage runs one guest
+// lane per host invocation, so EXEC is all ones and each invocation's bit of it is always set.
+// That needs no lane id, which a Metal vertex function cannot read.
+void TestVertexAllOnesExecMaskNeedsNoSubgroup() {
+  constexpr uint32_t kCapabilityGroupNonUniform = 61u;
+  constexpr uint32_t kFragmentAndComputeStages = 0x30u;
+  const std::array<uint32_t, 28> shader = {
+      0xbfa00001u, 0x93eaff03u, 0x00080008u, 0x876bff03u, 0x000000ffu, 0x8f6a8c6au,
+      0x887c6a6bu, 0xbf900009u, 0x906a8803u, 0x81ea6a80u, 0x90fe6ac1u, 0xf8000941u,
+      0x00000000u, 0x81ea0380u, 0xbf8cff0fu, 0x90fe6ac1u, 0x34040a81u, 0x36060ac2u,
+      0x7e000280u, 0x7e0202f2u, 0x36040482u, 0x4a0606c1u, 0x4a0404c1u, 0x7e060b03u,
+      0x7e040b02u, 0xf80008cfu, 0x01000302u, 0xbf810000u,
+  };
+  ShaderVertexInputInfo input{};
+  input.wave_size = 64u;
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.user_data_base = 8;
+  options.input_info.vertex = &input;
+  options.wave_size = 64u;
+  options.host.capabilities.subgroup_supported_stages = kFragmentAndComputeStages;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(!SpirvContainsCapability(result.spirv, kCapabilityGroupNonUniform),
+        "an all-ones EXEC mask in a vertex shader still needed subgroup operations");
 }
 
 void TestNewShaderRecompilerBranchConditionForms() {
@@ -10498,6 +10892,56 @@ void TestMeshExportStorage() {
           "mesh staging must retain guest LDS, shared Layer and allocation within the host budget");
     Check(private_bytes == (4u * 16u + 4u + 4u * 4u) * (64u / subgroup_size),
           "mesh vertex and primitive exports lost their separate logical-lane storage");
+  }
+
+  // The same shader for a host without mesh shaders: a compute shader that writes this
+  // workgroup's record (vertices, primitives and counts) through a device address.
+  for (const uint32_t subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    mesh.emulated = true;
+    options.back_code = std::span{back};
+    const auto emulated = RecompileForTest(std::span{front}, options, nullptr, nullptr,
+                                           PushData::MeshEmulatedDrawDwordCount);
+    mesh.emulated = false;
+    CheckSpirvBinaryValidates(emulated.spirv);
+    const auto compute = DisassembleSpirvBinary(emulated.spirv);
+    Check(compute.find("OpEntryPoint GLCompute") != std::string::npos &&
+              !SpirvContainsCapability(emulated.spirv, 5283u) /* MeshShadingEXT */ &&
+              compute.find("OpSetMeshOutputsEXT") == std::string::npos,
+          "emulated mesh shader is not a plain compute shader");
+    Check(compute.find("OpConvertUToPtr") != std::string::npos &&
+              compute.find("PhysicalStorageBuffer") != std::string::npos,
+          "emulated mesh shader does not write its record by device address");
+    Check(compute.find("OpDecorate %gl_WorkGroupID BuiltIn WorkgroupId") != std::string::npos,
+          "emulated mesh shader cannot find its workgroup");
+    // Position and three parameters make four vec4 per vertex: 4 words of header, 192 vertices of
+    // 16 words, 176 primitives of 2 words.
+    const auto layout = ShaderRecompiler::Spirv::MeshCaptureLayout(emulated.program, mesh);
+    // Position, three parameters, four clip and three cull distances per vertex: 4 words of
+    // header, 192 vertices of 16 + 7 words, 176 primitives of 2 words.
+    Check(layout.parameters == 3u && layout.clip_distances == 4u && layout.cull_distances == 3u &&
+              layout.RecordWords() == 4u + 192u * 23u + 176u * 2u,
+          "mesh record layout changed");
+    Check(emulated.mesh_slot_words == layout.RecordWords(),
+          "emulated mesh shader reports a record size that differs from its layout");
+    // The vertex shader that draws the records: one triangle per primitive slot, reading the
+    // position and the three parameters, and the layer, back from the record.
+    CheckSpirvBinaryValidates(emulated.mesh_vertex_spirv);
+    const auto vertex = DisassembleSpirvBinary(emulated.mesh_vertex_spirv);
+    Check(vertex.find("OpEntryPoint Vertex") != std::string::npos &&
+              vertex.find("BuiltIn VertexIndex") != std::string::npos &&
+              vertex.find("BuiltIn Position") != std::string::npos &&
+              vertex.find("BuiltIn Layer") != std::string::npos &&
+              vertex.find("Location 0") != std::string::npos &&
+              vertex.find("Location 2") != std::string::npos &&
+              vertex.find("Location 3") == std::string::npos,
+          "emulated mesh vertex shader lacks the draw's inputs and outputs");
+    // Clip distances go to the host. Cull distances are applied by the shader itself, so that a
+    // host without them can run it.
+    Check(vertex.find("BuiltIn ClipDistance") != std::string::npos &&
+              vertex.find("CullDistance") == std::string::npos &&
+              compute.find("CullDistance") == std::string::npos,
+          "emulated mesh shaders must output clip distances and no cull distances");
   }
 }
 
@@ -15114,8 +15558,12 @@ int main() {
   TestVertexMadU64UsesPortableProduct();
   TestComputeDispatchWaveSize();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
+  TestCoherentLoadOnAHostThatReusesVolatileLoads();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
+  TestHostFeaturesGateUnavailableCapabilities();
+  TestDepthBoundsPixelTest();
+  TestVertexAllOnesExecMaskNeedsNoSubgroup();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();

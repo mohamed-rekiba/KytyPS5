@@ -315,6 +315,14 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// An emulated mesh draw adds the 64-bit address of the record buffer and the workgroup count of
+	// the draw's first dimension.
+	static constexpr uint32_t MeshEmulationAddressDword  = MeshDrawDwordCount;
+	static constexpr uint32_t MeshEmulationGroupsDword   = MeshDrawDwordCount + 2;
+	static constexpr uint32_t MeshEmulatedDrawDwordCount = MeshDrawDwordCount + 3;
+	// Depth bounds test of a pixel shader: depth buffer copy address (two dwords), row width in
+	// pixels, minimum and maximum bound as float bits.
+	static constexpr uint32_t        DepthBoundsDwordCount = 5;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -550,6 +558,8 @@ struct CompiledShaderInfo {
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
 	bool                          has_address_writes  = false;
+	// A mesh program compiled as a compute shader (see capturedVertexLayout.h).
+	bool                          mesh_emulated = false;
 	ShaderInfo                    info;
 	Bindings                      bindings;
 };
@@ -627,6 +637,7 @@ struct Program: ResourcePlan {
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
+	bool                          mesh_emulated        = false;
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;
