@@ -873,15 +873,18 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 
 	state.programs      = {};
 	state.ps_input_info = {};
-	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
-	    target_export_mapping {};
+	std::array<ShaderColorTarget, RENDER_COLOR_ATTACHMENTS_MAX> color_targets {};
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		const auto& rt = ctx.GetRenderTarget(slot);
 		if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
-			target_export_mapping[slot] =
+			color_targets[slot].export_mapping =
 			    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
 			                                 rt.info.channel_order)
 			        .export_mapping;
+			color_targets[slot].number_class =
+			    rt.info.channel_type == Prospero::ChannelType::kUInt   ? ShaderColorNumberClass::Uint
+			    : rt.info.channel_type == Prospero::ChannelType::kSInt ? ShaderColorNumberClass::Sint
+			                                                           : ShaderColorNumberClass::Float;
 		}
 	}
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
@@ -890,7 +893,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	    color_targets, state.ps_active, state.vertex_info, state.ps_input_info);
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,

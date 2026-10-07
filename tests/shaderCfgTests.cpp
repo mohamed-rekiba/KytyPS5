@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/capturedVertexLayout.h"
+#include "graphics/host_gpu/vertexSubgroupProbe.h"
 #include "graphics/shader/triangleVertexValueShader.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -6753,7 +6754,7 @@ void TestPerspectiveCentroidInputs() {
     ShaderMapUserData(regs.ps_regs.data_addr, mapped);
     HW::ShaderRegisters sh{};
     sh.ps_input_ena = sh.ps_input_addr = inputs;
-    const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+    const std::array<ShaderColorTarget, 8> mappings{};
     ShaderPixelInputInfo pixel{};
     (void)PrepareProgram(regs, sh, mappings, pixel);
     Check(pixel.ps_perspective_centroid_vgpr == centroid &&
@@ -6848,7 +6849,7 @@ void TestPixelAncillaryLayerInput() {
   ShaderMapUserData(regs.ps_regs.data_addr, mapped);
   HW::ShaderRegisters sh{};
   sh.ps_input_ena = sh.ps_input_addr = 0x3320; // Linear I/J, X/Y, front-face, ancillary.
-  const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+  const std::array<ShaderColorTarget, 8> mappings{};
   ShaderPixelInputInfo pixel{};
   (void)PrepareProgram(regs, sh, mappings, pixel);
   Check(pixel.ps_system_input_base == 2 && pixel.ps_front_face && pixel.ps_ancillary,
@@ -10751,6 +10752,82 @@ void TestHostFeaturesGateUnavailableCapabilities() {
     CheckSpirvBinaryValidates(lowered.spirv);
   }
 
+  // A device whose vertex stage has subgroup operations but no subgroup built-ins
+  // (DriverFaults::vertex_subgroups_unreported, MoltenVK on an Apple GPU): a vertex shader keeps
+  // the real lane operations and takes its lane index from a scan at the entry. The vertex stage
+  // of a tessellation pipeline is not covered by the fault and stays one lane per invocation.
+  {
+    constexpr uint32_t kCapabilityGroupNonUniform = 61u;
+    const std::array shader = {
+        EncodeVop1(0x02, 24, 5 + 256),  // V_READFIRSTLANE_B32 s24, v5
+        EncodeVop1(0x01, 2, 128),       // V_MOV_B32 v2, 0
+        EncodeVop2(0x23, 1, 126, 2),    // V_MBCNT_LO_U32_B32 v1, exec_lo, v2
+        EncodeVop1(0x01, 0, 24),        // V_MOV_B32 v0, s24
+        EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 0, 0), // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.host.capabilities.subgroup_supported_stages = 0x31u; // vertex, fragment, compute
+    options.host.faults.vertex_subgroups_unreported = true;
+    const auto scanned = RecompileForTest(shader, options);
+    const auto text = DisassembleSpirvBinary(scanned.spirv);
+    Check(SpirvContainsCapability(scanned.spirv, kCapabilityGroupNonUniform) &&
+              text.find("ExclusiveScan") != std::string::npos &&
+              text.find("SubgroupLocalInvocationId") == std::string::npos &&
+              text.find("SubgroupSize") == std::string::npos &&
+              text.find("OpGroupNonUniformBallotFindLSB") == std::string::npos,
+          "a vertex shader on a device without vertex subgroup built-ins used one");
+    CheckSpirvBinaryValidates(scanned.spirv);
+    // The scan is an arithmetic subgroup operation (0x4); basic, ballot and shuffle are not enough.
+    {
+      using ShaderRecompiler::Spirv::FindMissingCapability;
+      auto host = options.host;
+      host.capabilities.subgroup_supported_operations = 0x19u;
+      const auto missing = FindMissingCapability(scanned.program, host);
+      Check(missing.has_value() &&
+                std::string_view(missing->name) == "subgroupSupportedOperations",
+            "a lane index scan on a device without subgroup arithmetic was not refused");
+      host.capabilities.subgroup_supported_operations = 0x1du;
+      Check(!FindMissingCapability(scanned.program, host).has_value(),
+            "a lane index scan on a device with subgroup arithmetic was refused");
+    }
+    using ShaderRecompiler::Spirv::UsesSingleLaneModel;
+    Check(!UsesSingleLaneModel(ShaderType::Vertex, options.host) &&
+              UsesSingleLaneModel(ShaderType::Local, options.host) &&
+              UsesSingleLaneModel(ShaderType::TessellationEvaluation, options.host),
+          "the vertex fault's subgroups reached a stage other than the vertex function");
+  }
+
+  // The probe that confirms the vertex subgroup operations is a valid vertex shader.
+  CheckSpirvBinaryValidates(Libs::Graphics::VertexSubgroupProbeSpirv());
+
+  // DS_ORDERED_COUNT adds once per wave. One invocation is not a wave, so a stage with one lane
+  // per invocation cannot run it.
+  {
+    using ShaderRecompiler::Spirv::FindMissingCapability;
+    const std::array shader = {
+        EncodeDs0(0x3f, 7) | (1u << 17u), EncodeDs1(3, 9, 2), // DS_ORDERED_COUNT v3, v2 gds
+        EncodeSopp(0x0c, 0),
+        EncodeExp0(0x0c, 0xf), EncodeExp1(3, 3, 3, 3), // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    const auto compiled = RecompileForTest(shader, options);
+    Check(compiled.program.uses_ordered_count, "DS_ORDERED_COUNT was not recorded");
+    auto host = HostGpu::Full();
+    Check(!FindMissingCapability(compiled.program, host).has_value(),
+          "DS_ORDERED_COUNT with vertex subgroup operations was reported missing");
+    host.capabilities.subgroup_supported_stages = 0x30u; // no vertex
+    const auto missing = FindMissingCapability(compiled.program, host);
+    Check(missing.has_value() &&
+              std::string_view(missing->need).find("DS_ORDERED_COUNT") != std::string_view::npos,
+          "DS_ORDERED_COUNT in a stage with one lane per invocation was not refused");
+    host.capabilities.subgroup_supported_stages = 0x31u;
+    host.faults.vertex_subgroups_unreported = true;
+    Check(!FindMissingCapability(compiled.program, host).has_value(),
+          "DS_ORDERED_COUNT on the vertex fault's subgroups was refused");
+  }
+
   // The loop's other half: a compare that makes a lane mask (a ballot) from a per-lane value that
   // was just read from the first lane, then a select by that mask.
   {
@@ -10805,6 +10882,25 @@ void TestHostFeaturesGateUnavailableCapabilities() {
     Check(SpirvSourceHasInstructionUsing(source, "OpCompositeConstruct", "%uint_5 %uint_7") ||
               source.find("%uint_5 %uint_7 %uint_5 %uint_7") != std::string::npos,
           "the scalars did not come back from the lanes they were put in");
+    CheckSpirvBinaryValidates(lowered.spirv);
+  }
+
+  // The first lane of a value that differs between invocations: each invocation reads its own.
+  // That is exact for the usual loop over one lane's value at a time, so the shader still compiles
+  // (the read is reported on stderr, since a broadcast would differ).
+  {
+    const uint32_t shader[] = {
+        EncodeVop1(0x02, 11, 0 + 256),                 // v_readfirstlane_b32 s11, v0
+        EncodeVop1(0x01, 1, 11),                       // v_mov_b32 v1, s11
+        EncodeExp0(0x0c, 0xf), EncodeExp1(1, 1, 1, 1), // position
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.host.capabilities.subgroup_supported_stages = 0x32u; // no vertex
+    options.dump_ir = true;
+    const auto lowered = RecompileForTest(shader, options);
+    Check(lowered.ir_dump.find("ReadFirstLane") == std::string::npos,
+          "a first-lane read of a per-invocation value still needs a lane operation");
     CheckSpirvBinaryValidates(lowered.spirv);
   }
 
@@ -11416,6 +11512,25 @@ void TestEmbeddedFetchPreservesSharedScalarLoad() {
       (swizzled.resources[0].fields[3] & ~0xfffu) | DstSel(5, 4, 6, 7);
   Check(compile(swizzled) != result.spirv && MakeStageStaticKey(swizzled) != key,
         "vertex input destination selectors lost their shader module specialization");
+
+  // A packed 10-10-10-2 scaled attribute: the host fetches it where it can. Elsewhere (Metal)
+  // the pipeline fetches the packed word and the shader unpacks its four fields.
+  auto packed = input;
+  packed.resources[0].fields[3] =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k10_10_10_2UScaled) << 12u) |
+      DstSel(4, 5, 6, 7);
+  const auto packed_source = [&](bool host_fetch) {
+    auto packed_options = options;
+    packed_options.input_info.vertex = &packed;
+    packed_options.host.capabilities.packed_scaled_vertex_input = host_fetch;
+    const auto spirv = RecompileForTest(code, packed_options).spirv;
+    CheckSpirvBinaryValidates(spirv);
+    return DisassembleSpirvBinary(spirv);
+  };
+  Check(packed_source(true).find("OpBitFieldUExtract") == std::string::npos,
+        "a host that fetches packed scaled attributes still unpacked them in the shader");
+  Check(packed_source(false).find("OpBitFieldUExtract") != std::string::npos,
+        "a host without packed scaled vertex fetch did not unpack the attribute's word");
 }
 
 void TestEmbeddedVertexFormatSwizzle() {
@@ -13454,6 +13569,53 @@ void TestNewShaderRecompilerExpPixelOutputs() {
         "compressed UINT16 MRT export was incorrectly decoded as FP16");
   CheckSpirvBinaryValidates(uint16_result.spirv);
 
+  // An FP16 export into an integer target: the output takes the target's
+  // type (Metal refuses a float output there) and the 16-bit lanes as stored.
+  ShaderPixelInputInfo fp16_to_uint_info;
+  fp16_to_uint_info.target_output_mode[0] = 4;
+  fp16_to_uint_info.target_number_class[0] = ShaderColorNumberClass::Uint;
+  options.input_info.pixel = &fp16_to_uint_info;
+  auto fp16_to_uint_result = RecompileForTest(shader, options);
+  const auto fp16_to_uint_source =
+      DisassembleSpirvBinary(fp16_to_uint_result.spirv);
+  Check((fp16_to_uint_source.find("OpVariable %_ptr_Output_v4uint Output") !=
+         std::string::npos),
+        "FP16 export into a UINT target did not use an unsigned output");
+  // The shader exports MRT0 twice: unpacked (converted to 16 bits each), then
+  // packed (the 16-bit lanes as they are).
+  Check(CountSourceOccurrences(fp16_to_uint_source, "PackHalf2x16") == 4u &&
+            CountSourceOccurrences(fp16_to_uint_source, "OpBitFieldUExtract") == 8u &&
+            !SpirvContainsExtInst(fp16_to_uint_result.spirv, 62),
+        "FP16 export into a UINT target did not store the raw 16-bit lanes");
+  CheckSpirvBinaryValidates(fp16_to_uint_result.spirv);
+
+  ShaderPixelInputInfo fp16_to_sint_info;
+  fp16_to_sint_info.target_output_mode[0] = 4;
+  fp16_to_sint_info.target_number_class[0] = ShaderColorNumberClass::Sint;
+  options.input_info.pixel = &fp16_to_sint_info;
+  auto fp16_to_sint_result = RecompileForTest(shader, options);
+  const auto fp16_to_sint_source =
+      DisassembleSpirvBinary(fp16_to_sint_result.spirv);
+  Check((fp16_to_sint_source.find("OpVariable %_ptr_Output_v4int Output") !=
+         std::string::npos),
+        "FP16 export into a SINT target did not use a signed output");
+  Check(CountSourceOccurrences(fp16_to_sint_source, "OpBitFieldSExtract") == 8u,
+        "FP16 export into a SINT target did not sign-extend the 16-bit lanes");
+  CheckSpirvBinaryValidates(fp16_to_sint_result.spirv);
+
+  const uint32_t unpacked_shader[] = {
+      EncodeExp0(0x00, 0xf),
+      EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
+  };
+  options.input_info.pixel = &fp16_to_uint_info;
+  auto unpacked_fp16_result = RecompileForTest(unpacked_shader, options);
+  const auto unpacked_fp16_source =
+      DisassembleSpirvBinary(unpacked_fp16_result.spirv);
+  Check(CountSourceOccurrences(unpacked_fp16_source, "PackHalf2x16") == 4u,
+        "unpacked FP16 export into a UINT target did not convert to 16 bits");
+  CheckSpirvBinaryValidates(unpacked_fp16_result.spirv);
+
   ShaderPixelInputInfo unorm16_info;
   unorm16_info.target_output_mode[0] = 5;
   options.input_info.pixel = &unorm16_info;
@@ -13688,8 +13850,8 @@ void TestRenderTargetReverseExportMapping() {
   mapped.code_size_bytes = sizeof(shader);
   ShaderMapUserData(regs.ps_regs.data_addr, mapped);
   HW::ShaderRegisters sh{};
-  std::array<Prospero::ColorComponentMapping, 8> mappings{};
-  mappings[0] = gr32.export_mapping;
+  std::array<ShaderColorTarget, 8> mappings{};
+  mappings[0].export_mapping = gr32.export_mapping;
   ShaderPixelInputInfo compiled_info{};
   PrepareProgram(regs, sh, mappings, compiled_info);
   Check(compiled_info.target_export_mapping[0].IsIdentity(),
@@ -14883,7 +15045,7 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   ShaderMapUserData(regs.ps_regs.data_addr, mapped);
 
   HW::ShaderRegisters sh{};
-  const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+  const std::array<ShaderColorTarget, 8> mappings{};
   ShaderPixelInputInfo input_info{};
   const auto params = PrepareProgram(regs, sh, mappings, input_info);
   Check(params.hash == XXH3_64bits(params.code.data(), params.code.size_bytes()) &&
@@ -15054,7 +15216,7 @@ void TestPixelProgramCacheBindingIdentity() {
     mapped.code_size_bytes = static_cast<uint32_t>(shader.size_bytes());
     ShaderMapUserData(regs.ps_regs.data_addr, mapped);
 
-    const std::array<Prospero::ColorComponentMapping, 8> identity_mappings{};
+    const std::array<ShaderColorTarget, 8> identity_mappings{};
     ShaderPixelInputInfo first_info{};
     const auto first_params = PrepareProgram(regs, sh, identity_mappings,
                                              first_info);

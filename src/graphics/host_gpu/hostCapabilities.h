@@ -34,6 +34,9 @@ struct HostCapabilities {
 	bool compute_derivatives = false;
 	// Descriptors can be pushed with vkCmdPushDescriptorSet (VK_KHR_push_descriptor).
 	bool push_descriptors = false;
+	// A packed 10-10-10-2 scaled vertex attribute is fetched by the host. Without it the vertex
+	// shader fetches the packed word and unpacks it.
+	bool packed_scaled_vertex_input = false;
 	// Stages that may use subgroup operations: VkPhysicalDeviceVulkan11Properties::
 	// subgroupSupportedStages, as VkShaderStageFlagBits values.
 	uint32_t subgroup_supported_stages = 0;
@@ -59,6 +62,7 @@ struct HostCapabilities {
 		all.mesh_shader               = true;
 		all.compute_derivatives       = true;
 		all.push_descriptors          = true;
+		all.packed_scaled_vertex_input = true;
 		all.subgroup_supported_stages     = ~0u;
 		all.subgroup_supported_operations = ~0u;
 		return all;
@@ -98,6 +102,12 @@ struct DriverFaults {
 	// has a cache of its own. (Without any cache, a run lost the device: Metal reported an
 	// invalid resource.)
 	bool pipeline_cache_serializes_builds = false;
+	// The device runs subgroup operations in a vertex function, but the driver does not report
+	// them for the vertex stage and has no subgroup built-in variables there. MoltenVK on an
+	// Apple GPU: Metal has SIMD-group functions in vertex functions, but no lane index input.
+	// The vertex stages then use the operations (see subgroup_supported_stages), and a lane
+	// index comes from a scan.
+	bool vertex_subgroups_unreported = false;
 
 	bool operator==(const DriverFaults&) const = default;
 };

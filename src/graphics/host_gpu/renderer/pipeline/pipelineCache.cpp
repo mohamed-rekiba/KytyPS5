@@ -582,7 +582,7 @@ struct PipelineCache::ProgramCache {
 	uint64_t HostWords() const {
 		const auto& c = host.capabilities;
 		const auto& f = host.faults;
-		static_assert(sizeof(HostCapabilities) == 24 && sizeof(DriverFaults) == 7,
+		static_assert(sizeof(HostCapabilities) == 24 && sizeof(DriverFaults) == 8,
 		              "a host field was added: add it to the list signature");
 		const uint32_t words[] = {
 		    c.image_view_min_lod,
@@ -599,6 +599,7 @@ struct PipelineCache::ProgramCache {
 		    c.mesh_shader,
 		    c.compute_derivatives,
 		    c.push_descriptors,
+		    c.packed_scaled_vertex_input,
 		    c.subgroup_supported_stages,
 		    c.subgroup_supported_operations,
 		    f.pushed_buffers_have_no_size,
@@ -608,6 +609,7 @@ struct PipelineCache::ProgramCache {
 		    f.no_contraction_is_slow,
 		    f.pipeline_cache_load_is_slow,
 		    f.pipeline_cache_serializes_builds,
+		    f.vertex_subgroups_unreported,
 		};
 		return XXH3_64bits(words, sizeof(words));
 	}
@@ -1352,7 +1354,7 @@ void PipelineCache::Save() {
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
-    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+    std::span<const ShaderColorTarget, 8> color_targets, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
 	KYTY_PROFILER_FUNCTION();
 	m_program_cache->Adopt();
@@ -1400,7 +1402,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
-		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		pixel_params      = PrepareProgram(pixel_regs, sh, color_targets, pixel_info);
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
@@ -1412,6 +1414,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			// MRT1 supplies the second blend source for target 0.
 			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
+			pixel_info.target_number_class[1]   = pixel_info.target_number_class[0];
 		} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
 		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
 		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
@@ -1433,6 +1436,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				pixel_info.dual_source_blending     = true;
 				pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 				pixel_info.target_export_mapping[1] = {};
+				pixel_info.target_number_class[1]   = pixel_info.target_number_class[0];
 			}
 		}
 	}

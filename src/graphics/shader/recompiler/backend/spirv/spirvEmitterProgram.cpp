@@ -495,7 +495,7 @@ uint32_t TypeId(EmitterState& state, IR::Type type) {
 		case IR::Type::U64: return TypeU64(state);
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
-		case IR::Type::F64: return TypeF64(state);
+		case IR::Type::F64: return state.soft_float64 ? TypeU64(state) : TypeF64(state);
 		case IR::Type::U32x3: return TypeU32Vector(state, 3);
 		case IR::Type::U32x4: return TypeU32Vector(state, 4);
 		case IR::Type::F32x2: return TypeF32Vector(state, 2);
@@ -582,7 +582,8 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 }
 
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
-	if (other_half == nullptr && !state.single_lane) {
+	// BallotFindLSB needs the subgroup size built-in, which a stage without built-ins lacks.
+	if (other_half == nullptr && !state.single_lane && !LaneIndexFromScan(state)) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
 		                          ConstantU32(state, spv::ScopeSubgroup), ballot);
@@ -772,6 +773,7 @@ void EmitProgram(EmitterState& state) {
 	}
 	DefineGetBdaPointer(state);
 	DefineBvhIntersect(state);
+	DefineSoftFloat64(state);
 	for (const auto* block: program.blocks) {
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
 			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32;
@@ -834,6 +836,15 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.subgroup_local_invocation_id_variable != 0 && LaneIndexFromScan(state)) {
+		// The lane index is the number of active invocations below this one, here where all
+		// of them are active.
+		const auto lane = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformIAdd, TypeU32(state), lane,
+		                          ConstantU32(state, spv::ScopeSubgroup),
+		                          spv::GroupOperationExclusiveScan, ConstantU32(state, 1));
+		state.builder.AddFunction(spv::OpStore, state.subgroup_local_invocation_id_variable, lane);
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);

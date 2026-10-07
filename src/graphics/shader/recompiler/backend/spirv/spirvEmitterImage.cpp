@@ -934,6 +934,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto zero = image.atomic64 ? ConstantU64(state, 0) : ConstantU32(state, 0);
 		ctx.Define(inst, EmitValueOrDefaultIfCondition(
 		                     state, ctx.Arg(inst, inst.NumArgs() - 1), result_type, zero, [&]() {
+			           // The atomic must see this invocation's earlier image writes, also through
+			           // another binding. SPIR-V orders them by program order, but MoltenVK puts
+			           // no fence between a texture write and a texture atomic. The barrier becomes
+			           // a texture memory fence there.
+			           EmitAtomicMemoryBarrier(state, IR::ResourceKind::Image);
 			           const auto pointer      = state.builder.AllocateId();
 			           const auto pointer_type =
 			               state.builder.Type(spv::OpTypePointer, spv::StorageClassImage,

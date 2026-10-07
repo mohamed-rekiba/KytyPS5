@@ -6,6 +6,19 @@
 #include <atomic>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+ShaderColorNumberClass MrtOutputClass(const EmitterState& state, uint32_t index) {
+	const auto& pixel = *state.input_info.pixel;
+	if (index >= std::size(pixel.target_output_mode)) {
+		return ShaderColorNumberClass::Float;
+	}
+	if (pixel.target_number_class[index] != ShaderColorNumberClass::Float) {
+		return pixel.target_number_class[index];
+	}
+	return pixel.target_output_mode[index] == 7u ? ShaderColorNumberClass::Uint
+	                                             : ShaderColorNumberClass::Float;
+}
+
 namespace {
 
 bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& dword_index) {
@@ -255,9 +268,16 @@ uint32_t ExportRawComponent(ValueEmitContext& ctx, uint32_t vector, uint32_t com
 	return value;
 }
 
+// An integer output (an integer target, or a UINT16 export) takes the export's bits as the colour
+// unit receives them: the 16-bit lanes of a packed export, the dword of a 32-bit one, and for a
+// 16-bit format exported unpacked the 16 bits it is converted to. Which value an FP16 export into an
+// integer target stores is not documented; AMD's own drivers never pair them (Mesa,
+// ac_choose_spi_color_formats). The colour unit is taken to store the lanes it receives.
 uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo& exp,
-                      bool uint_output) {
-	auto& state = ctx.state;
+                      ShaderColorNumberClass output_class) {
+	auto&      state       = ctx.state;
+	const bool uint_output = output_class != ShaderColorNumberClass::Float;
+	const bool sint_output = output_class == ShaderColorNumberClass::Sint;
 	if (exp.compr && !uint_output) {
 		const auto unpack =
 		    MrtOutputMode(state, exp) == 5u ? GLSLstd450UnpackUnorm2x16 : GLSLstd450UnpackHalf2x16;
@@ -304,23 +324,51 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 					continue;
 				}
 				raw[component] = state.builder.AllocateId();
-				state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), raw[component],
-				                          packed, ConstantU32(state, lane * 16u),
-				                          ConstantU32(state, 16));
+				state.builder.AddFunction(
+				    sint_output ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract, TypeU32(state),
+				    raw[component], packed, ConstantU32(state, lane * 16u), ConstantU32(state, 16));
 			}
 		}
 	} else {
+		const auto mode = MrtOutputMode(state, exp);
+		const auto pack = mode == 4u   ? GLSLstd450PackHalf2x16
+		                  : mode == 5u ? GLSLstd450PackUnorm2x16
+		                  : mode == 6u ? GLSLstd450PackSnorm2x16
+		                               : GLSLstd450Bad;
 		for (uint32_t component = 0; component < 4u; component++) {
-			if (((exp.en >> component) & 1u) != 0u) {
-				raw[component] = ExportRawComponent(ctx, data, component);
+			if (((exp.en >> component) & 1u) == 0u) {
+				continue;
 			}
+			raw[component] = ExportRawComponent(ctx, data, component);
+			if (!uint_output || pack == GLSLstd450Bad) {
+				continue;
+			}
+			// A 16-bit format exported unpacked: the hardware converts each float to 16 bits.
+			const auto f32    = state.builder.AllocateId();
+			const auto pair   = state.builder.AllocateId();
+			const auto packed = state.builder.AllocateId();
+			const auto bits   = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitcast, TypeF32(state), f32, raw[component]);
+			state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, f32,
+			                          ConstantF32(state, 0));
+			state.builder.AddFunction(spv::OpExtInst, TypeU32(state), packed, GlslStd450(state),
+			                          pack, pair);
+			state.builder.AddFunction(
+			    sint_output ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract, TypeU32(state),
+			    bits, packed, ConstantU32(state, 0), ConstantU32(state, 16));
+			raw[component] = bits;
 		}
 	}
 	if (uint_output) {
 		const auto vector = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), vector,
 		                          raw[0], raw[1], raw[2], raw[3]);
-		return vector;
+		if (!sint_output) {
+			return vector;
+		}
+		const auto signed_vector = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitcast, TypeI32Vector(state, 4), signed_vector, vector);
+		return signed_vector;
 	}
 	uint32_t f32[4] {};
 	for (uint32_t component = 0; component < 4u; component++) {
@@ -506,11 +554,18 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (state.program.stage != ShaderType::Mesh && variable == 0) {
 			return;
 		}
-		const bool uint_output = MrtOutputMode(state, exp) == 7u;
-		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
-		auto       value       = ExportVector(ctx, data, exp, uint_output);
+		const auto output_class =
+		    state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt
+		        ? MrtOutputClass(state, exp.index)
+		        : ShaderColorNumberClass::Float;
+		const auto vector_type = output_class == ShaderColorNumberClass::Uint
+		                             ? TypeU32Vector(state, 4)
+		                         : output_class == ShaderColorNumberClass::Sint
+		                             ? TypeI32Vector(state, 4)
+		                             : TypeF32Vector(state, 4);
+		auto value = ExportVector(ctx, data, exp, output_class);
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-		    exp.index == 0 && !uint_output &&
+		    exp.index == 0 && output_class == ShaderColorNumberClass::Float &&
 		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 			// Broadcast logical alpha before swizzling the primary output.
 			const auto blend_output =
@@ -790,13 +845,16 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), index, shifted,
 	                          ConstantU32(state, 15));
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, row_value, index);
-	const auto shuffled = ctx.Shuffle(inst, 0, target);
-	uint32_t   result   = shuffled;
+	// A lane the host subgroup does not have, as in a vertex group smaller than the wave, has no
+	// value: a shuffle from it is undefined. The shuffle reads this lane instead, and the result
+	// is zero.
+	const auto present  = EmitBallotLaneActiveBool(state, ctx.Ballot(IR::Value(true)), target);
+	const auto source   = Select(state, TypeU32(state), present, target, subid);
+	const auto shuffled = ctx.Shuffle(inst, 0, source);
+	auto       result   = Select(state, TypeU32(state), present, shuffled, ConstantU32(state, 0));
 	if (!flags.fetch_inactive) {
-		const auto source_exec = ctx.Shuffle(inst, 3, target);
-		result                 = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, source_exec, shuffled,
-		                          ConstantU32(state, 0));
+		const auto source_exec = ctx.Shuffle(inst, 3, source);
+		result = Select(state, TypeU32(state), source_exec, result, ConstantU32(state, 0));
 	}
 	return result;
 }

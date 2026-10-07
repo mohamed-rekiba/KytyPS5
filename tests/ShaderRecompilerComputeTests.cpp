@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/vertexSubgroupProbe.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -77,6 +78,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -1304,6 +1306,12 @@ struct TestCase {
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
+  // The functions of softFloat64.h the translation for a host without 64-bit floats defines
+  // and calls, for example "soft_f64_add": exactly these, each once.
+  std::vector<std::string> soft_float64;
+  // A vertex shader instead of a compute shader: the code runs once per vertex of a draw of
+  // this many points, with rasterization discarded. compute_info.wave_size is its wave size.
+  u32 vertex_draw = 0;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
     info.lds_size_dwords = 1024;
@@ -1578,6 +1586,56 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
+// The translation for a host without 64-bit floats: no 64-bit float type or capability, and
+// each 64-bit float operation the test expects is one function of softFloat64.h that is called.
+void CheckSoftFloat64Text(const TestCase &test, const std::vector<u32> &spirv) {
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string text;
+  if (!tools.Disassemble(spirv, &text)) {
+    Fail(test.name, "soft float64 SPIR-V", "failed to disassemble emitted SPIR-V");
+  }
+  for (const char *forbidden : {"OpCapability Float64", "OpTypeFloat 64"}) {
+    if (text.find(forbidden) != std::string::npos) {
+      Fail(test.name, "soft float64 SPIR-V", std::string("found forbidden text: ") + forbidden);
+    }
+  }
+  if (text.find("OpCapability Int64") == std::string::npos) {
+    Fail(test.name, "soft float64 SPIR-V", "missing OpCapability Int64");
+  }
+  std::vector<std::string> defined;
+  std::vector<std::string> called;
+  size_t start = 0;
+  while (start < text.size()) {
+    auto end = text.find('\n', start);
+    if (end == std::string::npos) end = text.size();
+    const std::string_view line(text.data() + start, end - start);
+    start = end + 1;
+    const auto name_at = line.find("%soft_f64_");
+    if (name_at == std::string_view::npos) continue;
+    const auto name_end = line.find_first_of(" \t", name_at);
+    const std::string name(line.substr(name_at + 1, name_end - name_at - 1));
+    if (line.find(" = OpFunction ") != std::string_view::npos) {
+      defined.push_back(name);
+    } else if (line.find("OpFunctionCall") != std::string_view::npos) {
+      called.push_back(name);
+    }
+  }
+  auto expected = test.soft_float64;
+  std::ranges::sort(expected);
+  std::ranges::sort(defined);
+  if (defined != expected) {
+    std::string list;
+    for (const auto &name : defined) list += " " + name;
+    Fail(test.name, "soft float64 SPIR-V",
+         "the defined soft float64 functions differ from the expected ones:" + list);
+  }
+  for (const auto &name : expected) {
+    if (std::ranges::find(called, name) == called.end()) {
+      Fail(test.name, "soft float64 SPIR-V", "never called: " + name);
+    }
+  }
+}
+
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64,
                            const HostGpu &host = HostGpu::Full()) {
   auto user_data =
@@ -1597,12 +1655,18 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64,
     user_data[2] = static_cast<u32>(test.initial.size() * sizeof(u32));
   }
   ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  options.stage = test.vertex_draw != 0 ? ShaderType::Vertex : ShaderType::Compute;
   options.dump_ir = true;
   options.host = host;
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
-  options.input_info.compute = &compute_info;
+  ShaderVertexInputInfo vertex_info{};
+  vertex_info.wave_size = test.compute_info.wave_size;
+  if (test.vertex_draw != 0) {
+    options.input_info.vertex = &vertex_info;
+  } else {
+    options.input_info.compute = &compute_info;
+  }
   options.user_data = user_data;
 
   if (test.has_compute_info) {
@@ -1691,6 +1755,12 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64,
   // translation for a lesser device may reach the same result another way; running it checks it.
   if (host == HostGpu::Full()) {
     CheckSpirvText(test, result.spirv);
+    // The same for a host without 64-bit floats, on every device: also where the device has them.
+    if (!test.soft_float64.empty()) {
+      auto soft_host = HostGpu::Full();
+      soft_host.capabilities.float64 = false;
+      CheckSoftFloat64Text(test, CompileCase(test, host_subgroup_size, soft_host).spirv);
+    }
   }
   const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
@@ -15186,6 +15256,16 @@ public:
                 std::span<const Image> sampled_resources = {}) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
+    const auto shader_stage = compiled.program.stage;
+    const bool vertex = test.vertex_draw != 0;
+    Require(test.name, "dispatch", vertex == (shader_stage == ShaderType::Vertex),
+            "a vertex draw needs a vertex program");
+    const auto stage_flags = vertex ? vk::ShaderStageFlagBits::eVertex
+                                    : vk::ShaderStageFlagBits::eCompute;
+    const auto pipeline_stage = vertex ? vk::PipelineStageFlagBits::eVertexShader
+                                       : vk::PipelineStageFlagBits::eComputeShader;
+    const auto bind_point = vertex ? vk::PipelineBindPoint::eGraphics
+                                   : vk::PipelineBindPoint::eCompute;
     auto shader_data = compiled.packed_user_data;
     if (layout.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
       Require(test.name, "dispatch dimensions", test.has_compute_info,
@@ -15196,8 +15276,8 @@ public:
     auto Binding = [&](Kind kind) {
       return ShaderRecompiler::IR::FindBinding(layout, kind);
     };
-    auto Native = [](Kind kind) {
-      return ShaderRecompiler::IR::NativeBinding(ShaderType::Compute, kind);
+    auto Native = [shader_stage](Kind kind) {
+      return ShaderRecompiler::IR::NativeBinding(shader_stage, kind);
     };
     for (const auto &binding : layout.descriptors) {
       const auto resource_class =
@@ -15232,7 +15312,7 @@ public:
 
     std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
     auto add_layout_binding =
-        [&layout_bindings](u32 binding, vk::DescriptorType type, u32 count) {
+        [&layout_bindings, stage_flags](u32 binding, vk::DescriptorType type, u32 count) {
           if (count == 0) {
             return;
           }
@@ -15240,12 +15320,12 @@ public:
           item.binding = binding;
           item.descriptorType = type;
           item.descriptorCount = count;
-          item.stageFlags = vk::ShaderStageFlagBits::eCompute;
+          item.stageFlags = stage_flags;
           layout_bindings.push_back(item);
         };
     for (const auto &binding : layout.descriptors) {
       add_layout_binding(ShaderRecompiler::IR::NativeBinding(
-                             ShaderType::Compute, binding.kind),
+                             shader_stage, binding.kind),
                          NativeDescriptorType(binding.kind),
                          NativeDescriptorCount(binding));
     }
@@ -15267,7 +15347,7 @@ public:
     pipeline_layout_info.pSetLayouts = &descriptor_layout;
     vk::PushConstantRange push_range{};
     if (layout.UsesPushData()) {
-      push_range.stageFlags = vk::ShaderStageFlagBits::eCompute;
+      push_range.stageFlags = stage_flags;
       push_range.offset = 0;
       push_range.size = ShaderRecompiler::IR::NativePushConstantSize;
       pipeline_layout_info.pushConstantRangeCount = 1;
@@ -15281,19 +15361,60 @@ public:
 
     vk::PipelineShaderStageCreateInfo stage{};
     stage.sType = vk::StructureType::ePipelineShaderStageCreateInfo;
-    stage.stage = vk::ShaderStageFlagBits::eCompute;
+    stage.stage = stage_flags;
     stage.module = module;
     stage.pName = "main";
 
-    vk::ComputePipelineCreateInfo pipeline_info{};
-    pipeline_info.sType = vk::StructureType::eComputePipelineCreateInfo;
-    pipeline_info.stage = stage;
-    pipeline_info.layout = pipeline_layout;
     vk::Pipeline pipeline = nullptr;
-    RequireVk(test.name, "dispatch",
-              m_device.createComputePipelines(nullptr, 1, &pipeline_info,
-                                              nullptr, &pipeline),
-              "vkCreateComputePipelines");
+    if (vertex) {
+      // Only the vertex stage runs: points, no vertex buffers, rasterization discarded.
+      vk::PipelineVertexInputStateCreateInfo vertex_input{};
+      vertex_input.sType = vk::StructureType::ePipelineVertexInputStateCreateInfo;
+      vk::PipelineInputAssemblyStateCreateInfo assembly{};
+      assembly.sType = vk::StructureType::ePipelineInputAssemblyStateCreateInfo;
+      assembly.topology = vk::PrimitiveTopology::ePointList;
+      const vk::Viewport viewport{0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
+      const vk::Rect2D scissor{{0, 0}, {1, 1}};
+      vk::PipelineViewportStateCreateInfo viewport_state{};
+      viewport_state.sType = vk::StructureType::ePipelineViewportStateCreateInfo;
+      viewport_state.viewportCount = 1;
+      viewport_state.pViewports = &viewport;
+      viewport_state.scissorCount = 1;
+      viewport_state.pScissors = &scissor;
+      vk::PipelineRasterizationStateCreateInfo raster{};
+      raster.sType = vk::StructureType::ePipelineRasterizationStateCreateInfo;
+      raster.rasterizerDiscardEnable = VK_TRUE;
+      raster.lineWidth = 1.0f;
+      vk::PipelineMultisampleStateCreateInfo multisample{};
+      multisample.sType = vk::StructureType::ePipelineMultisampleStateCreateInfo;
+      multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+      vk::PipelineRenderingCreateInfo rendering{};
+      rendering.sType = vk::StructureType::ePipelineRenderingCreateInfo;
+      vk::GraphicsPipelineCreateInfo pipeline_info{};
+      pipeline_info.sType = vk::StructureType::eGraphicsPipelineCreateInfo;
+      pipeline_info.pNext = &rendering;
+      pipeline_info.stageCount = 1;
+      pipeline_info.pStages = &stage;
+      pipeline_info.pVertexInputState = &vertex_input;
+      pipeline_info.pInputAssemblyState = &assembly;
+      pipeline_info.pViewportState = &viewport_state;
+      pipeline_info.pRasterizationState = &raster;
+      pipeline_info.pMultisampleState = &multisample;
+      pipeline_info.layout = pipeline_layout;
+      RequireVk(test.name, "dispatch",
+                m_device.createGraphicsPipelines(nullptr, 1, &pipeline_info, nullptr,
+                                                 &pipeline),
+                "vkCreateGraphicsPipelines");
+    } else {
+      vk::ComputePipelineCreateInfo pipeline_info{};
+      pipeline_info.sType = vk::StructureType::eComputePipelineCreateInfo;
+      pipeline_info.stage = stage;
+      pipeline_info.layout = pipeline_layout;
+      RequireVk(test.name, "dispatch",
+                m_device.createComputePipelines(nullptr, 1, &pipeline_info,
+                                                nullptr, &pipeline),
+                "vkCreateComputePipelines");
+    }
 
     std::vector<vk::DescriptorPoolSize> pool_sizes;
     auto add_pool_size = [&pool_sizes](vk::DescriptorType type, u32 count) {
@@ -15627,21 +15748,31 @@ public:
       }
       barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                          vk::PipelineStageFlagBits::eComputeShader, {}, 0,
+                          pipeline_stage, {}, 0,
                           nullptr, static_cast<u32>(barriers.size()),
                           barriers.data(), 0, nullptr);
     }
-    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
-    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0,
+    cmd.bindPipeline(bind_point, pipeline);
+    cmd.bindDescriptorSets(bind_point, pipeline_layout, 0,
                            1, &descriptor_set, 0, nullptr);
     if (layout.UsesPushData()) {
       ShaderRecompiler::IR::PushData push_data;
       std::copy(shader_data.begin(), shader_data.end(),
                 push_data.dwords.begin() + layout.push_data_start_dword);
-      cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+      cmd.pushConstants(pipeline_layout, stage_flags, 0,
                         sizeof(push_data), push_data.dwords.data());
     }
-    cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
+    if (vertex) {
+      vk::RenderingInfo rendering{};
+      rendering.sType = vk::StructureType::eRenderingInfo;
+      rendering.renderArea = vk::Rect2D{{0, 0}, {1, 1}};
+      rendering.layerCount = 1;
+      cmd.beginRendering(rendering);
+      cmd.draw(test.vertex_draw, 1, 0, 0);
+      cmd.endRendering();
+    } else {
+      cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
+    }
 
     if (buffers != nullptr) {
       vk::BufferMemoryBarrier barrier{};
@@ -15654,7 +15785,7 @@ public:
       barrier.buffer = buffer.buffer;
       barrier.offset = 0;
       barrier.size = buffer.size;
-      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+      cmd.pipelineBarrier(pipeline_stage,
                           vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
                           &barrier, 0, nullptr);
     }
@@ -15669,7 +15800,7 @@ public:
       barrier.buffer = gds_buffer->buffer;
       barrier.offset = 0;
       barrier.size = gds_buffer->size;
-      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+      cmd.pipelineBarrier(pipeline_stage,
                           vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
                           &barrier, 0, nullptr);
     }
@@ -16247,7 +16378,7 @@ public:
       depth.stencil_test_enable = false;
       registers.SetViewportTransformControl(0x300);
       user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
-      std::array<Prospero::ColorComponentMapping, 8> export_mapping{};
+      std::array<ShaderColorTarget, 8> color_targets{};
       std::array<ShaderVertexInputInfo, 3> native_vertex_info{};
       std::array<uint64_t, 2> wave_ids{};
       std::array<std::vector<u32>, 2> wave_keys;
@@ -16258,7 +16389,7 @@ public:
         registers.SetPsInControl(wave.control);
         const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
             native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+            registers, user_config, color_targets, true, native_vertex_info, pixel);
         Require(name, "pixel wave metadata propagation",
                 pixel.input_num == 8 && pixel.stage.program->wave_size == wave.width,
                 "SPI_PS_IN_CONTROL width did not reach the compiled pixel program");
@@ -16311,7 +16442,7 @@ public:
       auto blend_target_info = saved_target_info;
       blend_target_info.blend_bypass = false;
       registers.SetColorInfo(0, blend_target_info);
-      export_mapping[0] = color.export_mapping = Prospero::ColorMappingAbgr;
+      color_targets[0].export_mapping = color.export_mapping = Prospero::ColorMappingAbgr;
       HW::BlendControl alpha_blend{};
       alpha_blend.enable = true;
       alpha_blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrcAlpha);
@@ -16336,7 +16467,7 @@ public:
         registers.SetBlendControl(0, alpha_blend);
         const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
             native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+            registers, user_config, color_targets, true, native_vertex_info, pixel);
         Require(name, "logical alpha blend program", pixel.alpha_blend_source == test.mode &&
                     pixel.dual_source_blending,
                 "the separate alpha equation did not reach the compiled pixel program");
@@ -16364,7 +16495,7 @@ public:
         }
       }
       native_pixel_regs.ps_regs.data_addr = pixel_address;
-      export_mapping[0] = color.export_mapping = {};
+      color_targets[0].export_mapping = color.export_mapping = {};
       registers.SetBlendControl(0, saved_blend);
       registers.SetColorInfo(0, saved_target_info);
       registers.SetTargetOutputMode(0, saved_output_mode);
@@ -16411,7 +16542,7 @@ public:
              .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
         const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
             native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+            registers, user_config, color_targets, true, native_vertex_info, pixel);
         vertex_shader = programs.vertex[0];
         pixel_shader = programs.pixel;
         vertex = native_vertex_info[0];
@@ -18282,6 +18413,17 @@ private:
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
     m_device.getQueue(m_queue_family, 0, &m_queue);
+    // As the emulator does: the vertex subgroup operations the driver does not report work only
+    // after this device has run them.
+    if (m_host.faults.vertex_subgroups_unreported) {
+      m_runtime_context.device = m_device;
+      m_runtime_context.physical_device_memory_properties = m_memory_properties;
+      m_runtime_context.queue_family = m_queue_family;
+      m_runtime_context.queue = m_queue;
+      const bool confirmed = ProbeVertexSubgroups(m_runtime_context);
+      ApplyVertexSubgroupProbe(m_host, confirmed);
+      std::printf("[host]    vertex subgroup probe: %s\n", confirmed ? "passed" : "FAILED");
+    }
 
     vk::CommandPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
@@ -18806,6 +18948,140 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   CompareWords(test, "readback", test.expected, actual);
   std::printf("[compute] %-32s %s\n", test.name,
               g_wrong_results.size() == wrong_before ? "ok" : "WRONG RESULT");
+}
+
+// DS_ORDERED_COUNT in a vertex shader. Each wave adds the number of its active lanes once, and
+// each lane takes the slot base + its rank among them: the counter ends at base + vertices, and
+// every vertex has a slot of its own. A host that ran each vertex as a whole wave of its own
+// would add the full count once per vertex.
+void CheckVertexOrderedCount(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 counter_base = 1000;
+  for (const u32 wave_size : {32u, 64u}) {
+    for (const u32 vertices : {1u, 7u, 32u, 33u, 1000u, 65536u}) {
+      const auto name = "VertexOrderedCountWave" + std::to_string(wave_size) + "x" +
+                        std::to_string(vertices);
+      TestCase test;
+      test.name = name.c_str();
+      test.vertex_draw = vertices;
+      test.compute_info.wave_size = wave_size;
+      test.has_compute_info = true;
+      auto &code = test.code;
+      AppendSMovLiteral(&code, 124, 0x01030003u);    // M0: GDS counter at 0x104
+      code.push_back(EncodeSop1(0x10, 20, 126));     // s20 = active lanes
+      code.push_back(EncodeVop1(0x01, 2, 20));       // v2 = the count to add
+      AppendVMovU32(&code, 8, 0);
+      code.push_back(EncodeVop2(0x23, 4, 126, 8));   // v4 = rank among active lanes
+      code.push_back(EncodeVop2(0x24, 4, 127, 4));
+      code.push_back(EncodeDs0(0x3f, 7, true));      // v3 = DS_ORDERED_COUNT add v2
+      code.push_back(EncodeDs1(3, 9, 2));
+      code.push_back(EncodeSopp(0x0c, 0));
+      code.push_back(EncodeVop2(0x25, 6, Vgpr(3), 4)); // v6 = slot
+      code.push_back(EncodeVop2(0x1a, 31, InlineU32(4), 5)); // v31 = vertex index * 16
+      for (const u32 value : {4u, 2u, 3u, 6u}) {
+        AppendBufferStoreDword(&code, value, 31);
+        code.push_back(EncodeVop2(0x25, 31, InlineU32(4), 31));
+      }
+      AppendVMovU32(&code, 32, 0);
+      AppendVMovLiteral(&code, 33, std::bit_cast<u32>(1.0f));
+      code.push_back(EncodeExp0(0x0c, 0xf));
+      code.push_back(EncodeExp1(32, 32, 32, 33));
+      AppendEnd(&code);
+      test.initial.assign(size_t{vertices} * 4u, 0xdeadbeefu);
+      test.gds_initial.assign(0x120u / sizeof(u32), 0);
+      test.gds_initial[0x104u / sizeof(u32)] = counter_base;
+      test.opcodes = {O::S_MOV_B32, O::S_BCNT1_I32_B64, O::V_MOV_B32,
+                      O::V_MBCNT_LO_U32_B32, O::V_MBCNT_HI_U32_B32, O::DS_ORDERED_COUNT,
+                      O::S_WAITCNT, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                      O::BUFFER_STORE_DWORD, O::EXP, O::S_ENDPGM};
+      auto compiled = CompileCase(test, vulkan.SubgroupSize(), vulkan.Host());
+      if (vulkan.CannotRun("graphics", test.name, compiled.program)) {
+        continue;
+      }
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      auto gds = vulkan.CreateStorageBuffer(test.name, test.gds_initial, test.gds_initial.size());
+      vulkan.Dispatch(test, compiled, buffer, &gds);
+      const auto results = vulkan.ReadBuffer(test.name, buffer, test.initial.size());
+      const auto counter = vulkan.ReadBuffer(test.name, gds, test.gds_initial.size());
+      Require(test.name, "ordered count total", counter[0x104u / sizeof(u32)] ==
+                                                    counter_base + vertices,
+              "the counter is " + std::to_string(counter[0x104u / sizeof(u32)]) +
+                  ", not the first value plus one per vertex");
+      std::vector<bool> taken(vertices, false);
+      for (u32 vertex = 0; vertex < vertices; vertex++) {
+        const auto lane = results[vertex * 4u], count = results[vertex * 4u + 1u];
+        const auto base = results[vertex * 4u + 2u], slot = results[vertex * 4u + 3u];
+        Require(test.name, "ordered count slots",
+                count != 0 && count <= wave_size && lane < count && slot == base + lane &&
+                    slot >= counter_base && slot - counter_base < vertices &&
+                    !taken[slot - counter_base],
+                "vertex " + std::to_string(vertex) + " has lane " + std::to_string(lane) +
+                    " of " + std::to_string(count) + ", base " + std::to_string(base) +
+                    ", slot " + std::to_string(slot));
+        taken[slot - counter_base] = true;
+      }
+      std::printf("[gpu]     %-32s ok\n", test.name);
+    }
+  }
+}
+
+// V_PERMLANE16 in a vertex group smaller than the wave: a lane of the guest wave that the host
+// group does not have gives zero, and a lane it has gives that lane's value.
+void CheckVertexPermlanePartialGroup(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 vertices = 7;
+  constexpr u32 value_base = 100;
+  TestCase test;
+  test.name = "VertexPermlanePartialGroup";
+  test.vertex_draw = vertices;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 9, value_base);
+  code.push_back(EncodeVop2(0x25, 0, Vgpr(9), 5));       // v0 = vertex index + 100
+  AppendVMovU32(&code, 8, 0);
+  code.push_back(EncodeVop2(0x23, 4, 126, 8));           // v4 = lane
+  code.push_back(EncodeVop1(0x02, 21, Vgpr(5)));         // s21 = the group's first vertex
+  code.push_back(EncodeVop1(0x01, 6, 21));
+  AppendSMovLiteral(&code, 0, 0xa9876543u);              // lane l reads lane (l + 3) & 15
+  AppendSMovLiteral(&code, 1, 0x210fedcbu);
+  AppendVop3(&code, 0x377, 1, Vgpr(0), 0, 1);            // v1 = V_PERMLANE16_B32 v0
+  code.push_back(EncodeVop2(0x1a, 31, InlineU32(4), 5)); // v31 = vertex index * 16
+  for (const u32 value : {4u, 6u, 1u, 0u}) {
+    AppendBufferStoreDword(&code, value, 31);
+    code.push_back(EncodeVop2(0x25, 31, InlineU32(4), 31));
+  }
+  AppendVMovU32(&code, 32, 0);
+  AppendVMovLiteral(&code, 33, std::bit_cast<u32>(1.0f));
+  code.push_back(EncodeExp0(0x0c, 0xf));
+  code.push_back(EncodeExp1(32, 32, 32, 33));
+  AppendEnd(&code);
+  test.initial.assign(vertices * 4u, 0xdeadbeefu);
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_MBCNT_LO_U32_B32,
+                  O::V_READFIRSTLANE_B32, O::S_MOV_B32, O::V_PERMLANE16_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::EXP, O::S_ENDPGM};
+  auto compiled = CompileCase(test, vulkan.SubgroupSize(), vulkan.Host());
+  if (vulkan.CannotRun("graphics", test.name, compiled.program)) {
+    return;
+  }
+  auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+  vulkan.Dispatch(test, compiled, buffer);
+  const auto results = vulkan.ReadBuffer(test.name, buffer, test.initial.size());
+  // The vertex at each lane of each group, the group named by its first vertex.
+  std::map<std::pair<u32, u32>, u32> vertex_at;
+  for (u32 vertex = 0; vertex < vertices; vertex++) {
+    vertex_at[{results[vertex * 4u + 1u], results[vertex * 4u]}] = vertex;
+  }
+  for (u32 vertex = 0; vertex < vertices; vertex++) {
+    const auto lane = results[vertex * 4u], group = results[vertex * 4u + 1u];
+    const auto source = vertex_at.find({group, (lane + 3u) & 15u});
+    const auto expected = source == vertex_at.end() ? 0u : value_base + source->second;
+    Require(test.name, "partial group permute",
+            results[vertex * 4u + 2u] == expected && results[vertex * 4u + 3u] == value_base + vertex,
+            "vertex " + std::to_string(vertex) + " at lane " + std::to_string(lane) + " read " +
+                std::to_string(results[vertex * 4u + 2u]) + ", not " + std::to_string(expected));
+  }
+  std::printf("[gpu]     %-32s ok\n", test.name);
 }
 
 void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
@@ -25108,6 +25384,7 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
       O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD,
       O::BUFFER_STORE_DWORD, O::S_ENDPGM});
   test.required_spirv = {"OpFOrdLessThanEqual", "OpFOrdGreaterThanEqual"};
+  test.soft_float64 = {"soft_f64_ord_less_equal", "soft_f64_ord_greater_equal"};
   return test;
 }
 
@@ -25167,6 +25444,7 @@ TestCase VectorCompareF64Edges() {
                   O::V_CMP_EQ_F64, O::V_CMP_LE_F64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "OpFOrdEqual",
                          "OpFOrdLessThanEqual"};
+  test.soft_float64 = {"soft_f64_ord_equal", "soft_f64_ord_less_equal"};
   return test;
 }
 
@@ -25235,6 +25513,7 @@ TestCase VectorCompare64WaveMasks(u32 wave_size, bool integer_ne = false) {
                   integer_ne ? O::V_CMP_NE_I64 : O::V_CMP_EQ_F64,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {integer_ne ? "OpINotEqual" : "OpFOrdEqual"};
+  if (!integer_ne) test.soft_float64 = {"soft_f64_ord_equal"};
   return test;
 }
 
@@ -25285,6 +25564,7 @@ TestCase VectorF64CapturedScreenSpaceShadows() {
                          "OpFDiv",
                          "Fma",
                          "SignedZeroInfNanPreserve 64"};
+  test.soft_float64 = {"soft_f64_from_s32", "soft_f64_recip", "soft_f64_mul", "soft_f64_fma", "soft_f64_to_f32"};
   test.ir_counts = {{"ConvertF64S32", 9},
                     {"FPRecip64", 3},
                     {"FPMul64", 3},
@@ -25360,6 +25640,7 @@ TestCase VectorFractF64CapturedAndEdges() {
                   O::V_AND_B32, O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_FRACT_F64 v4, v4", cases.size() + 1}};
   test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "Fract"};
+  test.soft_float64 = {"soft_f64_fract"};
   return test;
 }
 
@@ -25434,6 +25715,7 @@ TestCase VectorMinMaxF64CapturedAndEdges() {
                   O::V_MIN_F64, O::V_MAX_F64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64",
                          "SignedZeroInfNanPreserve 64"};
+  test.soft_float64 = {"soft_f64_min", "soft_f64_max"};
   return test;
 }
 
@@ -25501,6 +25783,7 @@ TestCase VectorRoundF64EdgesAndModifiers() {
                   O::V_TRUNC_F64, O::V_CEIL_F64, O::V_FLOOR_F64, O::V_CMP_EQ_F64,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "Trunc", "Ceil", "Floor"};
+  test.soft_float64 = {"soft_f64_trunc", "soft_f64_ceil", "soft_f64_floor", "soft_f64_ord_equal"};
   return test;
 }
 
@@ -25560,6 +25843,7 @@ TestCase VectorFractF64CapturedChainRuntimeExec() {
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   test.required_spirv = {"OpCapability Float64", "OpFDiv", "Fma", "Fract"};
+  test.soft_float64 = {"soft_f64_from_s32", "soft_f64_from_f32", "soft_f64_fma", "soft_f64_fract", "soft_f64_to_f32"};
   test.forbidden_spirv = {"RoundingModeRTE"};
   test.ir_counts = {{"FPRecip32", 1}, {"ConvertF64S32", 1}, {"ConvertF64F32", 3},
                     {"FPFma64", 3}, {"FPFract64", 3}, {"ConvertF32F64", 3}};
@@ -25623,6 +25907,7 @@ TestCase VectorF64WideningConversions() {
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "OpFConvert",
                          "OpConvertUToF"};
+  test.soft_float64 = {"soft_f64_from_f32", "soft_f64_from_u32"};
 
   std::vector<u32> vertex_code;
   AppendSMovLiteral(&vertex_code, 8, std::bit_cast<u32>(2.0f));
@@ -25794,6 +26079,7 @@ TestCase VectorF64ModesModifiersAndExec() {
                   O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.initial.resize(test.expected.size());
   test.required_spirv = {"OpFAdd"};
+  test.soft_float64 = {"soft_f64_from_s32", "soft_f64_recip", "soft_f64_mul", "soft_f64_add", "soft_f64_fma", "soft_f64_to_f32"};
   return test;
 }
 
@@ -41946,6 +42232,8 @@ int RunSelectedCases(int argc, char **argv) {
   CheckPixelParameterAliases();
   CheckRectListShaders();
   CheckIndirectBufferStore(vulkan);
+  CheckVertexOrderedCount(vulkan);
+  CheckVertexPermlanePartialGroup(vulkan);
   CheckRuntimeBufferRecords(vulkan);
   CheckComputeThreadDimensions(vulkan);
   CheckIndirectImageKeySwitch(vulkan);

@@ -18,6 +18,10 @@ Pair ExtractPair(EmitterState& state, uint32_t value) {
 }
 
 uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	if (state.soft_float64) {
+		return EmitSoftFloat64(state, max_value ? SoftFloat64Op::Max : SoftFloat64Op::Min,
+		                       {lhs, rhs});
+	}
 	const auto bits_type = TypeU32Vector(state, 2);
 	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
 	const auto rhs_bits = Unary(state, spv::OpBitcast, bits_type, rhs);
@@ -216,6 +220,10 @@ uint32_t EmitConvertU32F32(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
+	if (state.soft_float64) {
+		return Unary(state, spv::OpBitcast, TypeF32(state),
+		             EmitSoftFloat64(state, SoftFloat64Op::ToF32, {arg0}));
+	}
 	const auto converted = Unary(state, spv::OpFConvert, TypeF32(state), arg0);
 	const auto source    = EmitNative<spv::OpCompositeExtract, IR::Type::U32>(
 	    state, Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), arg0), 1u);
@@ -232,6 +240,10 @@ uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitConvertF64F32(EmitterState& state, uint32_t arg0) {
+	if (state.soft_float64) {
+		return EmitSoftFloat64(state, SoftFloat64Op::FromF32,
+		                       {Unary(state, spv::OpBitcast, TypeU32(state), arg0)});
+	}
 	return EmitNative<spv::OpFConvert, IR::Type::F64>(state,
 	                                                  EmitFlushF32DenormToSignedZero(state, arg0));
 }
@@ -374,6 +386,9 @@ uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitFPRecip64(EmitterState& state, uint32_t arg0) {
+	if (state.soft_float64) {
+		return EmitSoftFloat64(state, SoftFloat64Op::Recip, {arg0});
+	}
 	const auto one = state.builder.Constant(spv::OpConstant, TypeF64(state), 0u, 0x3ff00000u);
 	return EmitNative<spv::OpFDiv, IR::Type::F64>(state, one, arg0);
 }

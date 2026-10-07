@@ -96,10 +96,21 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	caps.compute_derivatives =
 	    with_extension(facts.compute_derivative_group_quads, kComputeDerivativesExtension);
 	caps.push_descriptors   = HasExtension(facts.extensions, kPushDescriptorExtension);
+	caps.packed_scaled_vertex_input = facts.packed_scaled_vertex_format;
 	caps.subgroup_supported_stages = facts.subgroup_supported_stages;
 	caps.subgroup_supported_operations = facts.subgroup_supported_operations;
 
 	decision.faults = FaultsOf(facts.driver);
+	// Metal runs SIMD-group functions in a vertex function on an Apple GPU, and MoltenVK passes
+	// them through, but reports no subgroup operations for the vertex stage (MoltenVK 1.4.2;
+	// the vertex ordered-count GPU test checks it). A wave of the vertex stage is then one
+	// SIMD group, as it is on the guest, instead of one vertex.
+	constexpr uint32_t vertex_stage = 0x1u; // VK_SHADER_STAGE_VERTEX_BIT
+	if (facts.driver == HostDriver::MoltenVk && facts.apple_gpu &&
+	    (facts.subgroup_supported_stages & vertex_stage) == 0u) {
+		decision.faults.vertex_subgroups_unreported = true;
+		caps.subgroup_supported_stages |= vertex_stage;
+	}
 
 	const auto note = [&](bool available, const char* name) {
 		if (!available) {
@@ -111,12 +122,13 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	note(caps.buffer_int64_atomics, "shaderBufferInt64Atomics");
 	note(caps.shared_int64_atomics, "64-bit atomics on compute shared memory");
 	note(caps.image_int64_atomics, "shaderImageInt64Atomics");
-	note(caps.float64, "shaderFloat64 that keeps special values");
+	note(caps.float64, "shaderFloat64 that keeps special values (64-bit floats run in software)");
 	note(caps.fragment_barycentric, "fragmentShaderBarycentric");
 	note(caps.depth_bounds, "depthBounds");
 	note(caps.depth_clamp, "depthClamp");
 	note(caps.depth_clip_enable, "depthClipEnable");
 	note(caps.color_write_enable, "colorWriteEnable");
+	note(caps.packed_scaled_vertex_input, "a packed 10-10-10-2 scaled vertex format");
 	note(caps.mesh_shader, "meshShader");
 	note(caps.compute_derivatives, "computeDerivativeGroupQuads");
 	note(caps.push_descriptors, "push descriptors");

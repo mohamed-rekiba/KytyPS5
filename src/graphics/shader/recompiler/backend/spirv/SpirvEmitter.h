@@ -17,6 +17,11 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 // (the IR pass LowerLaneOpsToSingleLane and the emitter both follow this answer).
 [[nodiscard]] bool UsesSingleLaneModel(ShaderType stage, const HostGpu& host);
 
+// A vertex stage that uses subgroup operations on a device without subgroup built-ins there
+// (DriverFaults::vertex_subgroups_unreported): the lane index comes from a scan, an arithmetic
+// subgroup operation.
+[[nodiscard]] bool LaneIndexFromScan(ShaderType stage, const HostGpu& host);
+
 // How many clip distances the shader of this stage with these outputs writes. This counts the one
 // the emitter adds to a vertex shader to cut away vertices with an invalid position.
 uint32_t VertexClipDistanceCount(ShaderType stage, const IR::ShaderInfo& info);

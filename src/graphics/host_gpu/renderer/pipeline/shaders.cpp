@@ -93,7 +93,7 @@ static bool NarrowInputFormat(vk::Format& format, uint32_t& size, uint32_t used_
 }
 
 static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, uint32_t& size,
-                           uint32_t used_components) {
+                           uint32_t used_components, const HostCapabilities& host) {
 	const auto fmt        = res.Format();
 	const auto raw_format = res.RawFormat();
 	if (raw_format == kTemporaryVertexAttribFormat113) {
@@ -120,6 +120,12 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		return;
 	}
 
+	if (fmt == Prospero::BufferFormat::k10_10_10_2UScaled && !host.packed_scaled_vertex_input) {
+		// The packed word: the vertex shader unpacks it (see VertexInputScalarKind).
+		format = vk::Format::eR32Uint;
+		size   = 1;
+		return;
+	}
 	format = VulkanFormat(fmt);
 	size   = ShaderRecompiler::Format::GetFormatInfo(fmt).component_count;
 	if (format == vk::Format::eUndefined || size == 0) {
@@ -325,7 +331,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		const auto used_components =
 		    compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
 		GetInputFormat(vs_input_info.resources[index], input_attr[index].format, attr_size,
-		               static_cast<uint32_t>(used_components));
+		               static_cast<uint32_t>(used_components), graphics.host.capabilities);
 
 		if (graphics_debug_dump_enabled()) {
 			static std::atomic_uint log_count = 0;

@@ -575,7 +575,7 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 
 static void ShaderGetStaticInputInfoPS(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    std::span<const ShaderColorTarget, 8> color_targets,
 	const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -624,10 +624,12 @@ static void ShaderGetStaticInputInfoPS(
 	}
 
 	for (int i = 0; i < 8; i++) {
+		const bool exported              = sh.target_output_mode[i] != 0;
 		ps_info.target_output_mode[i]    = sh.target_output_mode[i];
-		ps_info.target_export_mapping[i] = sh.target_output_mode[i] != 0
-		                                       ? target_export_mapping[i]
-		                                       : Prospero::ColorComponentMapping {};
+		ps_info.target_export_mapping[i] =
+		    exported ? color_targets[i].export_mapping : Prospero::ColorComponentMapping {};
+		ps_info.target_number_class[i] =
+		    exported ? color_targets[i].number_class : ShaderColorNumberClass::Float;
 	}
 }
 
@@ -738,6 +740,9 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
 	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
+	for (const auto number_class: info.target_number_class) {
+		key.push_back(static_cast<uint32_t>(number_class));
+	}
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
 		for (uint32_t i = 0; i < 4u; i++) {
@@ -909,11 +914,11 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 
 ShaderParams PrepareProgram(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    std::span<const ShaderColorTarget, 8> color_targets,
     ShaderPixelInputInfo&                               ps_info) {
 	KYTY_PROFILER_FUNCTION();
 	const auto [data, hash, data_owned] = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
-	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
+	ShaderGetStaticInputInfoPS(regs, sh, color_targets, data, ps_info);
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);

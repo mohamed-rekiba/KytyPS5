@@ -2,6 +2,7 @@
 // accept/reject reasons and the optional capabilities that are enabled come out.
 // No Vulkan device is needed.
 
+#include "graphics/host_gpu/vertexSubgroupProbe.h"
 #include "graphics/presentation/window/deviceSuitability.h"
 
 #include <algorithm>
@@ -91,6 +92,7 @@ DeviceFacts FullFacts() {
 	f.shader_image_int64_atomics                      = true;
 	f.mesh_shader                                     = true;
 	f.compute_derivative_group_quads                  = true;
+	f.packed_scaled_vertex_format                     = true;
 	return f;
 }
 
@@ -116,6 +118,7 @@ DeviceFacts MoltenVkFacts() {
 	f.shader_image_int64_atomics       = false;
 	f.mesh_shader                      = false;
 	f.compute_derivative_group_quads   = false;
+	f.packed_scaled_vertex_format      = false; // Metal has no such vertex format
 	return f;
 }
 
@@ -144,6 +147,9 @@ void TestMoltenVkLikeDeviceIsAccepted() {
 	      "an unavailable cull distance must be reported");
 	Check(Contains(decision.unavailable, "shaderBufferInt64Atomics"),
 	      "unavailable 64-bit buffer atomics must be reported");
+	Check(!c.packed_scaled_vertex_input &&
+	          Contains(decision.unavailable, "a packed 10-10-10-2 scaled vertex format"),
+	      "a missing packed scaled vertex format must be off and reported");
 }
 
 void TestDriverDefectsAreNotCapabilities() {
@@ -250,6 +256,76 @@ void TestSharedInt64AtomicsNeedExplicitWorkgroupLayout() {
 	      "native 64-bit LDS atomics need shaderSharedInt64Atomics");
 }
 
+// MoltenVK on an Apple GPU runs subgroup operations in a vertex function but does not report
+// them: the vertex stage gets them, through the fault that tells the shaders it has no subgroup
+// built-ins there. Another GPU under MoltenVK, or another driver, gets nothing more.
+void TestMoltenVkAppleGpuGetsVertexSubgroups() {
+	auto facts      = MoltenVkFacts();
+	facts.apple_gpu = true;
+	auto decision   = EvaluateDeviceSuitability(facts, kRequiredExtensions);
+	Check(decision.faults.vertex_subgroups_unreported &&
+	          decision.capabilities.subgroup_supported_stages == (0x20u | 0x10u | 0x1u),
+	      "MoltenVK on an Apple GPU must get vertex subgroup operations through the fault");
+	facts.apple_gpu = false;
+	decision        = EvaluateDeviceSuitability(facts, kRequiredExtensions);
+	Check(!decision.faults.vertex_subgroups_unreported &&
+	          decision.capabilities.subgroup_supported_stages == (0x20u | 0x10u),
+	      "MoltenVK on another GPU must not get vertex subgroup operations");
+	facts           = FullFacts();
+	facts.apple_gpu = true;
+	facts.subgroup_supported_stages = 0x20u | 0x10u;
+	decision        = EvaluateDeviceSuitability(facts, kRequiredExtensions);
+	Check(!decision.faults.vertex_subgroups_unreported &&
+	          decision.capabilities.subgroup_supported_stages == (0x20u | 0x10u),
+	      "another driver must not get the MoltenVK fault");
+}
+
+// The probe's samples: two groups of a draw of 5 vertices, named by their first vertex.
+void TestVertexSubgroupProbeSamples() {
+	using Libs::Graphics::VertexSubgroupSample;
+	std::vector<VertexSubgroupSample> samples {
+	    {0, 3, 0, 0b111u}, {1, 3, 0, 0b111u}, {2, 3, 0, 0b111u}, {0, 2, 3, 0b11u}, {1, 2, 3, 0b11u}};
+	Check(Libs::Graphics::VertexSubgroupSamplesAreConsistent(samples),
+	      "consistent probe samples must pass");
+	auto bad = samples;
+	bad[1].lane = 0;
+	Check(!Libs::Graphics::VertexSubgroupSamplesAreConsistent(bad), "a repeated rank must fail");
+	bad = samples;
+	bad[4].count = 3;
+	Check(!Libs::Graphics::VertexSubgroupSamplesAreConsistent(bad),
+	      "a group with two sizes must fail");
+	bad = samples;
+	bad[2].ballot_low = 0b1011u;
+	Check(!Libs::Graphics::VertexSubgroupSamplesAreConsistent(bad),
+	      "a ballot that disagrees with the size must fail");
+	bad = samples;
+	bad[4].first_vertex = 1;
+	Check(!Libs::Graphics::VertexSubgroupSamplesAreConsistent(bad),
+	      "a first vertex that is not rank 0 must fail");
+	bad = samples;
+	bad[3].ballot_low = bad[4].ballot_low = 0b101u;
+	Check(!Libs::Graphics::VertexSubgroupSamplesAreConsistent(bad),
+	      "a group whose lanes are not the lowest must fail: a rank is used as a lane");
+	bad = samples;
+	bad.resize(4);
+	bad[3] = {0, 2, 3, 0b11u};
+	Check(!Libs::Graphics::VertexSubgroupSamplesAreConsistent(bad), "a missing rank must fail");
+	Check(!Libs::Graphics::VertexSubgroupSamplesAreConsistent({}), "no samples must fail");
+
+	auto facts      = MoltenVkFacts();
+	facts.apple_gpu = true;
+	auto decision   = EvaluateDeviceSuitability(facts, kRequiredExtensions);
+	Libs::Graphics::HostGpu host {decision.capabilities, decision.faults};
+	Libs::Graphics::ApplyVertexSubgroupProbe(host, true);
+	Check(host.faults.vertex_subgroups_unreported &&
+	          (host.capabilities.subgroup_supported_stages & 0x1u) != 0u,
+	      "a passed probe must keep the vertex subgroup operations");
+	Libs::Graphics::ApplyVertexSubgroupProbe(host, false);
+	Check(!host.faults.vertex_subgroups_unreported &&
+	          host.capabilities.subgroup_supported_stages == (0x20u | 0x10u),
+	      "a failed probe must take the vertex subgroup operations away");
+}
+
 void TestFloat64NeedsSpecialValues() {
 	auto facts                             = FullFacts();
 	facts.float64_preserves_special_values = false;
@@ -297,6 +373,8 @@ int main() {
 	TestCapabilityNeedsBothFeatureAndExtension();
 	TestSharedInt64AtomicsNeedExplicitWorkgroupLayout();
 	TestFloat64NeedsSpecialValues();
+	TestMoltenVkAppleGpuGetsVertexSubgroups();
+	TestVertexSubgroupProbeSamples();
 	TestEveryMandatoryFeatureRejectsByName();
 	if (g_failures != 0) {
 		std::cerr << "DeviceSuitabilityTests: " << g_failures << " check(s) failed\n";
