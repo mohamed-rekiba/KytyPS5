@@ -58,6 +58,10 @@ static void PrintUsage() {
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
+	::printf("  --video-out-resolution <value>       Title, FullHd, or Uhd: the output resolution the\n"
+	         "                                       console reports to games, which render at it.\n"
+	         "                                       Default: Title (4K unless the title may detect\n"
+	         "                                       a smaller output).\n");
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
@@ -387,6 +391,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--shader-validation") {
 			if (!ParseBool(value, options.config.shader_validation_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--video-out-resolution") {
+			if (!ParseEnum(value, options.config.video_out_resolution)) {
+				::printf("invalid video out resolution: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--pipeline-wait") {
