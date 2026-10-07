@@ -903,6 +903,11 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	// Most buffers of a range hold nothing the CPU wrote; for them a synchronization uploads
+	// nothing and only costs its setup.
+	if (!m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		return;
+	}
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {
@@ -912,7 +917,7 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 		auto&      buffer = m_slot_buffers[it->second];
 		const auto start  = std::max(buffer.CpuAddress(), vaddr);
 		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-		if (start < finish) {
+		if (start < finish && m_memory_tracker.IsRegionCpuModified(start, finish - start)) {
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
 		}
 	}
