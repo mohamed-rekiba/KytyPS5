@@ -1731,7 +1731,15 @@ private:
 		indirect.table_immediate = table_immediate;
 		indirect.table_stride = table_stride;
 		indirect.workgroup_axis = WorkgroupAxis(key);
-		if (indirect.workgroup_axis != UINT32_MAX && table_source.dword_count == 2u) {
+		// A bounded image table becomes a native array root, and only a sample reads through
+		// such a root. Any other image access keeps one descriptor per dispatch.
+		const bool sample_only = std::ranges::none_of(handle.Uses(), [](const Use& use) {
+			const auto op = use.user->GetOpcode();
+			return op != ValueOpcode::ImageSampleRaw &&
+			       ImageOpcodeInfoOf(op).access != ImageAccess::None;
+		});
+		if (indirect.workgroup_axis != UINT32_MAX &&
+		    (table_source.dword_count == 2u || !sample_only)) {
 			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;
 			// only the image handle is projected onto the bounded workgroup key.
 			plan.retain_reads = true;
@@ -1756,7 +1764,7 @@ private:
 		} else {
 			// A bounded V# supplies the complete image table. Leave every GPU selector
 			// and descriptor read in the shader; the host only translates table bytes.
-			if (plan.split_offsets) return false;
+			if (plan.split_offsets || !sample_only) return false;
 			indirect.table_stride = 0u;
 			indirect.table_offset = 0u;
 			indirect.table_immediate = 0u;
