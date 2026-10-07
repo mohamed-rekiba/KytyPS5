@@ -131,6 +131,8 @@ private:
 	void RetireCallbackState(Common::UniqueFunction<void>&& callback);
 
 	MasterSemaphore              m_master;
+	// This scheduler's timeline in GraphicContext::queue_commits.
+	uint32_t                     m_queue_timeline = 0;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;

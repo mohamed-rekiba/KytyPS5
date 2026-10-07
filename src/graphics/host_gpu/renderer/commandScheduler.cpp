@@ -103,10 +103,16 @@ bool CommandScheduler::InCompletionOffGpuThread() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	Common::LockGuard lock(graphics.queue_mutex);
+	m_queue_timeline = graphics.queue_commits.AddTimeline(
+	    [this](uint64_t tick) { return m_master.IsRetired(tick); });
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	Common::LockGuard lock(m_graphics.queue_mutex);
+	m_graphics.queue_commits.RemoveTimeline(m_queue_timeline);
 }
 
 void CommandScheduler::Shutdown() {
@@ -133,7 +139,10 @@ void CommandScheduler::Shutdown() {
 		Submit();
 	}
 	m_master.WaitRetired(CurrentTick() - 1);
-	PopPendingOperations();
+	WaitPriorityOperations(CurrentTick() - 1);
+	// Also for the other scheduler and the presents, and with nothing committed until every
+	// deferred operation has run.
+	m_graphics.WithQueueIdle([this] { PopPendingOperations(); });
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
 	m_operation_available.notify_all();
@@ -236,7 +245,18 @@ void CommandScheduler::Finish() {
 	// operations below run only then, and a caller of Finish relies on them having run.
 	m_master.WaitRetired(CurrentTick() - 1);
 	BeginNext();
-	PopPendingOperations();
+	bool pending = false;
+	{
+		std::lock_guard lock(m_operation_mutex);
+		pending = !m_pending_operations.empty();
+	}
+	if (!pending) {
+		return;
+	}
+	WaitPriorityOperations(CurrentTick() - 1);
+	// Also for the other scheduler and the presents, and with nothing committed until every
+	// deferred operation has run.
+	m_graphics.WithQueueIdle([this] { PopPendingOperations(); });
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
@@ -279,13 +299,10 @@ void CommandScheduler::PopPendingOperations() {
 		}
 		WaitPriorityOperations(front_tick);
 
-		// Deferred operations destroy resources. MoltenVK keeps every resource in one residency
-		// set attached to the queue, so each submission that was committed while a resource was
-		// alive holds it until the submission completes, whether the commands use it or not.
-		// Destroying it earlier makes Metal report an invalid resource and lose the device. So an
-		// operation runs only when every submission made so far has retired, and no submission
-		// can be made between that check and the end of the operation: any thread may get here,
-		// while the GPU thread submits.
+		// Deferred operations destroy resources. An operation runs only when every command buffer
+		// committed to the queue so far has completed, also those of the other scheduler and of
+		// the presents (see queueCommits.h), and no submission can be made between that check and
+		// the end of the operation: any thread may get here, while the GPU thread submits.
 		Common::LockGuard submissions_held(m_graphics.queue_mutex);
 		PendingOperation  operation;
 		{
@@ -300,7 +317,7 @@ void CommandScheduler::PopPendingOperations() {
 			if (front_tick > last_submitted) {
 				return; // of the open submission: see above
 			}
-			if (!m_master.IsRetired(last_submitted)) {
+			if (!m_master.IsRetired(last_submitted) || !m_graphics.queue_commits.AllDone()) {
 				if (m_pending_operations.size() <= MaxPendingOperations) {
 					return;
 				}
@@ -311,6 +328,17 @@ void CommandScheduler::PopPendingOperations() {
 				if (m_pending_operations.empty() ||
 				    m_pending_operations.front().tick != front_tick) {
 					continue;
+				}
+				// Another submitter's command buffer or a present may still run. Submissions are
+				// held off here, so the queue is drained.
+				if (!m_graphics.queue_commits.AllDone()) {
+					lock.unlock();
+					m_graphics.WithQueueIdle([] {});
+					lock.lock();
+					if (m_pending_operations.empty() ||
+					    m_pending_operations.front().tick != front_tick) {
+						continue;
+					}
 				}
 			}
 			operation = std::move(m_pending_operations.front());
@@ -506,6 +534,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, m_master.AcquireFence(tick));
+		if (result == vk::Result::eSuccess) {
+			graphics.queue_commits.NoteSubmit(m_queue_timeline, tick);
+		}
 	}
 
 	if (result != vk::Result::eSuccess) {

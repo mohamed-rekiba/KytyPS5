@@ -2,9 +2,11 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICCONTEXT_H_
 
 #include "common/abi.h"
+#include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/hostCapabilities.h"
+#include "graphics/host_gpu/queueCommits.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
 #include <atomic>
@@ -49,6 +51,21 @@ struct GraphicContext {
 	uint32_t                           max_push_descriptors                  = 0;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
+	// What every submitter committed to the queue. Under queue_mutex.
+	QueueCommits queue_commits;
+
+	// Waits until every command buffer committed to the queue has completed, then runs `then`
+	// before anything new can be committed: for destroying resources the queue may hold (see
+	// queueCommits.h). Waits only when some command buffer may still run.
+	template <typename Then>
+	void WithQueueIdle(Then&& then) {
+		Common::LockGuard lock(queue_mutex);
+		if (!queue_commits.AllDone()) {
+			EXIT_NOT_IMPLEMENTED(queue.waitIdle() != vk::Result::eSuccess);
+			queue_commits.NoteIdle();
+		}
+		then();
+	}
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
 

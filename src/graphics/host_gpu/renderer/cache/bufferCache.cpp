@@ -187,6 +187,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		publish();
+		// A temporary download buffer is held by every command buffer committed while it lived,
+		// also by the other submitters' (see queueCommits.h).
+		m_scheduler.DeferDestruction([held = std::move(publish)] {});
 	}
 	return true;
 }

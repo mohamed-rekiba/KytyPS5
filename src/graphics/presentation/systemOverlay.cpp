@@ -789,6 +789,10 @@ struct SystemOverlay::Impl {
 		info.DescriptorPoolSize           = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE;
 		info.MinImageCount                = image_count;
 		info.ImageCount                   = image_count;
+		buffer_sets                       = image_count;
+		vertex_high_water                 = 0;
+		index_high_water                  = 0;
+		growing_records                   = 0;
 		info.UseDynamicRendering          = true;
 		info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
 		info.PipelineInfoMain.PipelineRenderingCreateInfo.sType =
@@ -1277,10 +1281,25 @@ struct SystemOverlay::Impl {
 		rendering.colorAttachmentCount = 1;
 		rendering.pColorAttachments    = &color;
 		command.beginRendering(rendering);
-		{
+		auto*      draw_data = ImGui::GetDrawData();
+		const auto render    = [&] {
+            ImGui_ImplVulkan_RenderDrawData(draw_data, static_cast<VkCommandBuffer>(command));
+		};
+		// The backend replaces a vertex or index buffer that is too small and destroys the old
+		// one at once. Each command buffer committed while it lived holds it (see
+		// queueCommits.h), so the queue is drained first, once for each of its buffer sets.
+		if (draw_data->TotalVtxCount > vertex_high_water ||
+		    draw_data->TotalIdxCount > index_high_water) {
+			vertex_high_water = std::max(vertex_high_water, draw_data->TotalVtxCount);
+			index_high_water  = std::max(index_high_water, draw_data->TotalIdxCount);
+			growing_records   = buffer_sets;
+		}
+		if (growing_records > 0) {
+			growing_records--;
+			graphics.WithQueueIdle(render);
+		} else {
 			Common::LockGuard queue_lock(graphics.queue_mutex);
-			ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
-			                                static_cast<VkCommandBuffer>(command));
+			render();
 		}
 		command.endRendering();
 	}
@@ -1297,6 +1316,11 @@ struct SystemOverlay::Impl {
 	GraphicContext&                       graphics;
 	ImGuiContext*                         imgui_context      = nullptr;
 	bool                                  vulkan_initialized = false;
+	// The backend's vertex and index buffer sets, and the largest draw they held (see Record).
+	uint32_t                                    buffer_sets        = 0;
+	int                                         vertex_high_water  = 0;
+	int                                         index_high_water   = 0;
+	uint32_t                                    growing_records    = 0;
 	bool                                  shift              = false;
 	bool                                  symbol_mode        = false;
 	bool                                  focus_pending      = true;

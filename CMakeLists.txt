@@ -436,6 +436,11 @@ add_executable(video_out_resolution_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(video_out_resolution_tests PRIVATE ${inc_headers})
 
+add_executable(queue_commits_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/QueueCommitsTests.cpp"
+)
+target_include_directories(queue_commits_tests PRIVATE ${inc_headers})
+
 add_executable(bench_script_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BenchScriptTests.cpp"
 )
@@ -707,6 +712,7 @@ if(BUILD_TESTING)
 	add_test(NAME depth_snapshot_plan COMMAND $<TARGET_FILE:depth_snapshot_plan_tests>)
 	add_test(NAME video_out_resolution COMMAND $<TARGET_FILE:video_out_resolution_tests>)
 	add_test(NAME bench_script COMMAND $<TARGET_FILE:bench_script_tests>)
+	add_test(NAME queue_commits COMMAND $<TARGET_FILE:queue_commits_tests>)
 	add_test(NAME cache_folder COMMAND $<TARGET_FILE:cache_folder_tests>)
 	add_test(NAME gamepad_quit COMMAND $<TARGET_FILE:gamepad_quit_tests>)
 	add_test(NAME file_lock COMMAND $<TARGET_FILE:file_lock_tests>)
@@ -801,6 +807,7 @@ if(BUILD_TESTING)
 		depth_snapshot_plan_tests
 		video_out_resolution_tests
 		bench_script_tests
+		queue_commits_tests
 		cache_folder_tests
 		gamepad_quit_tests
 		file_lock_tests
