@@ -3,14 +3,50 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/shader/capturedVertexLayout.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/shader.h"
 
+#include <optional>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info);
+// A vertex, local or tessellation evaluation stage runs one guest lane per host invocation. On a
+// host with no subgroup operations in that stage, its lane operations are done on that one lane
+// (the IR pass LowerLaneOpsToSingleLane and the emitter both follow this answer).
+[[nodiscard]] bool UsesSingleLaneModel(ShaderType stage, const HostGpu& host);
+
+// Something a program needs that the host does not offer.
+struct MissingCapability {
+	const char* need = nullptr; // what the shader does, in plain words
+	const char* name = nullptr; // the Vulkan feature or construct
+};
+
+// The first thing `program` needs that `host` does not offer, if any. EmitProgram stops the
+// emulator on such a program; a caller that must not stop asks here first.
+[[nodiscard]] std::optional<MissingCapability> FindMissingCapability(const IR::Program& program,
+                                                                     const HostGpu&     host);
+
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  const HostGpu& host = HostGpu::Full());
+
+// The record of a mesh program's outputs on a host without mesh shaders: the program runs as a
+// compute shader (EmitProgram with an emulated mesh program), which stores one record per
+// workgroup.
+[[nodiscard]] CapturedVertexLayout MeshCaptureLayout(const IR::Program&         program,
+                                                     const ShaderMeshInputInfo& mesh);
+
+// The vertex shader that draws what the compute shader stored: one triangle per primitive of
+// every record. A primitive that is absent, that the program culled, or that a cull distance
+// rejects gets one position for its three corners, so it covers no sample. The pixel shader is
+// unchanged.
+struct MeshEmulationVertexProgram {
+	std::vector<uint32_t> spirv;
+	uint32_t              slot_words = 0;
+};
+[[nodiscard]] MeshEmulationVertexProgram
+EmitMeshEmulationVertexProgram(const IR::Program& program, ShaderStageInputInfo input_info);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

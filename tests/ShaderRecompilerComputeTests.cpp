@@ -1573,7 +1573,8 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
-CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
+CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64,
+                           const HostGpu &host = HostGpu::Full()) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1593,6 +1594,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
   options.dump_ir = true;
+  options.host = host;
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
@@ -1675,12 +1677,16 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
                 shader_data != nullptr,
             "oversized shader data did not use its storage fallback");
     result.spirv = ShaderRecompiler::Spirv::EmitProgram(result.program,
-                                                        options.input_info);
+                                                        options.input_info, options.host);
   }
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
-  CheckSpirvText(test, result.spirv);
+  // The expected text describes the translation for a host with every capability. A
+  // translation for a lesser device may reach the same result another way; running it checks it.
+  if (host == HostGpu::Full()) {
+    CheckSpirvText(test, result.spirv);
+  }
   const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
   if (test.expected_buffer_resources) {
@@ -1951,6 +1957,37 @@ public:
     return m_rasterization_supported;
   }
   void SkipRasterizationCases(u32 count) { m_skipped_cases += count; }
+  // What the device of this run offers. A case that needs more is not run on it, and is counted.
+  [[nodiscard]] const HostGpu &Host() const { return m_host; }
+  [[nodiscard]] u32 NotRunCaseCount() const { return m_not_run_cases; }
+  // A depth-stencil format wider than D16 that this device can use as a target: what the
+  // emulator picks for a 16-bit depth target with stencil when the device has no D16S8.
+  [[nodiscard]] vk::Format WiderD16StencilFormat(u32 samples) {
+    for (const auto format : {vk::Format::eD24UnormS8Uint, vk::Format::eD32SfloatS8Uint}) {
+      vk::ImageFormatProperties properties{};
+      if (RuntimeContext().GetImageFormatProperties(
+              format, vk::ImageType::e2D, vk::ImageTiling::eOptimal,
+              vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled |
+                  vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+              vk::ImageCreateFlags{}, &properties) == vk::Result::eSuccess &&
+          static_cast<bool>(properties.sampleCounts & static_cast<vk::SampleCountFlagBits>(samples))) {
+        return format;
+      }
+    }
+    Fail("VulkanHarness", "depth format", "no depth-stencil format wider than D16");
+  }
+  // True when the device cannot run `program`. The case is then reported and counted.
+  [[nodiscard]] bool CannotRun(const char *kind, const char *name,
+                               const ShaderRecompiler::IR::Program &program) {
+    const auto missing = ShaderRecompiler::Spirv::FindMissingCapability(program, m_host);
+    if (!missing) {
+      return false;
+    }
+    m_not_run_cases++;
+    std::printf("[%s] %-32s not run on this device: needs %s (%s)\n", kind, name,
+                missing->need, missing->name);
+    return true;
+  }
   [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
@@ -3867,7 +3904,7 @@ public:
             "unified depth view cache lost sampled/attachment identity");
 
     auto depth_stencil_info = depth_info;
-    depth_stencil_info.pixel_format = vk::Format::eD24UnormS8Uint;
+    depth_stencil_info.pixel_format = WiderD16StencilFormat(1);
     depth_stencil_info.guest_format = Prospero::BufferFormat::k16UNorm;
     depth_stencil_info.bytes_per_block = 2;
     Libs::Graphics::Image depth_stencil(m_runtime_context, scheduler,
@@ -6225,12 +6262,12 @@ public:
       auto ms_depth_desc = color_desc;
       ms_depth_desc.type = BindingType::DepthTarget;
       ms_depth_desc.info.stencil = {base + ms_stencil_offset, ms_stencil_size};
-      ms_depth_desc.info.pixel_format = vk::Format::eD24UnormS8Uint;
+      ms_depth_desc.info.pixel_format = WiderD16StencilFormat(2);
       ms_depth_desc.info.guest_format = Prospero::BufferFormat::k16UNorm;
       ms_depth_desc.info.bytes_per_block = 2;
       ms_depth_desc.info.samples = 2;
       ms_depth_desc.info.type = Prospero::ImageType::kColor2D;
-      ms_depth_desc.view_info.format = vk::Format::eD24UnormS8Uint;
+      ms_depth_desc.view_info.format = ms_depth_desc.info.pixel_format;
       ms_depth_desc.view_info.aspect =
           vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
       ms_depth_desc.view_info.usage =
@@ -8546,7 +8583,7 @@ public:
       std::memset(memory + d16_fallback_stencil_offset, 0x6d, 4);
       auto d16_depth_desc = MakeLinearDesc(
           base + d16_fallback_offset, sizeof(d16_fallback_values),
-          vk::Format::eD24UnormS8Uint, Prospero::BufferFormat::k16UNorm,
+          WiderD16StencilFormat(1), Prospero::BufferFormat::k16UNorm,
           Prospero::ImageType::kColor2D, {4, 1, 1}, 1, 2, 1);
       d16_depth_desc.type = BindingType::DepthTarget;
       d16_depth_desc.info.stencil = {base + d16_fallback_stencil_offset, 4};
@@ -17819,6 +17856,8 @@ public:
 private:
   bool m_rasterization_supported = true;
   u32   m_skipped_cases          = 0;
+  u32   m_not_run_cases          = 0;
+  HostGpu m_host;
 
   RenderContext &Renderer() {
     EXIT_IF(m_renderer == nullptr);
@@ -17851,7 +17890,7 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
-    m_runtime_context.shader_image_int64_atomics_enabled = true;
+    m_runtime_context.host = m_host;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -17920,129 +17959,72 @@ private:
                                                   physical_devices.data()),
               "vkEnumeratePhysicalDevices");
 
+    // The same decision as the emulator: a device is rejected only for a feature that every
+    // guest program may need. What it lacks beyond that decides which cases can run on it.
+    DeviceDecision decision;
+    std::string rejections;
+    bool portability_subset = false;
     for (auto physical : physical_devices) {
       u32 queue_count = 0;
       physical.getQueueFamilyProperties(&queue_count, nullptr);
       std::vector<vk::QueueFamilyProperties> queues(queue_count);
       physical.getQueueFamilyProperties(&queue_count, queues.data());
-      for (u32 i = 0; i < queue_count; i++) {
+      u32 family = UINT32_MAX;
+      for (u32 i = 0; i < queue_count && family == UINT32_MAX; i++) {
         if ((queues[i].queueFlags &
              (vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eGraphics)) ==
             (vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eGraphics)) {
-          vk::PhysicalDeviceVulkan11Features features11{};
-          vk::PhysicalDeviceVulkan12Features features12{};
-          features12.sType = vk::StructureType::ePhysicalDeviceVulkan12Features;
-          vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
-          features12.pNext = &features11;
-          features11.pNext = &workgroup_layout;
-          vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic64{};
-          workgroup_layout.pNext = &image_atomic64;
-          vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
-          barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
-          barycentric.pNext = &features12;
-          vk::PhysicalDeviceFeatures2 features{};
-          features.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-          features.pNext = &barycentric;
-          physical.getFeatures2(&features);
-          if (barycentric.fragmentShaderBarycentric != true ||
-              features.features.shaderInt64 != true ||
-              features11.storageBuffer16BitAccess != true ||
-              features12.storageBuffer8BitAccess != true ||
-              features12.samplerMirrorClampToEdge != true ||
-              features12.shaderOutputViewportIndex != true ||
-              features12.shaderBufferInt64Atomics != true ||
-              features12.shaderSampledImageArrayNonUniformIndexing != true ||
-              features12.shaderSharedInt64Atomics != true ||
-              image_atomic64.shaderImageInt64Atomics != true ||
-              workgroup_layout.workgroupMemoryExplicitLayout != true ||
-              features12.bufferDeviceAddress != true) {
-            continue;
-          }
-          m_physical_device = physical;
-          m_queue_family = i;
-          break;
+          family = i;
         }
       }
-      if (m_physical_device != nullptr) {
-        break;
+      if (family == UINT32_MAX) {
+        continue;
       }
+      u32 extension_count = 0;
+      RequireVk("VulkanHarness", "dispatch",
+                physical.enumerateDeviceExtensionProperties(nullptr, &extension_count, nullptr),
+                "vkEnumerateDeviceExtensionProperties");
+      std::vector<vk::ExtensionProperties> extensions(extension_count);
+      RequireVk("VulkanHarness", "dispatch",
+                physical.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                            extensions.data()),
+                "vkEnumerateDeviceExtensionProperties");
+      auto candidate = EvaluateDeviceSuitability(
+          WindowContext::ReadDeviceFacts(physical, extensions),
+          {VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME});
+      if (!candidate.Accepted()) {
+        for (const auto &reason : candidate.rejections) {
+          rejections += "\n  " + reason;
+        }
+        continue;
+      }
+      m_physical_device = physical;
+      m_queue_family = family;
+      decision = std::move(candidate);
+      portability_subset = std::ranges::any_of(extensions, [](const auto &extension) {
+        return std::strcmp(extension.extensionName, "VK_KHR_portability_subset") == 0;
+      });
+      break;
     }
     Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
-            "no Vulkan graphics+compute device with fragment barycentrics and 64-bit LDS/image atomics");
+            "no Vulkan graphics+compute device the emulator accepts:" + rejections);
+    m_host = {decision.capabilities, decision.faults};
+    const auto &caps = m_host.capabilities;
+    for (const auto &line : decision.unavailable) {
+      std::printf("[host]    %s\n", line.c_str());
+    }
     m_physical_device.getMemoryProperties(&m_memory_properties);
 
-    vk::PhysicalDeviceFeatures available_features{};
-    m_physical_device.getFeatures(&available_features);
-    vk::PhysicalDeviceVulkan11Features available_features11{};
-    vk::PhysicalDeviceVulkan12Features available_features12{};
-    available_features12.pNext = &available_features11;
-    available_features12.sType =
-        vk::StructureType::ePhysicalDeviceVulkan12Features;
-    vk::PhysicalDeviceVulkan13Features available_features13{};
-    available_features13.sType =
-        vk::StructureType::ePhysicalDeviceVulkan13Features;
-    available_features13.pNext = &available_features12;
-    vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR available_derivatives{};
-    available_derivatives.pNext = &available_features13;
-    vk::PhysicalDeviceDepthClipEnableFeaturesEXT available_depth_clip{};
-    available_depth_clip.pNext = &available_derivatives;
-    vk::PhysicalDeviceDepthClipControlFeaturesEXT available_clip_control{};
-    available_clip_control.pNext = &available_depth_clip;
-    vk::PhysicalDeviceColorWriteEnableFeaturesEXT available_color_write{};
-    available_color_write.pNext = &available_clip_control;
     vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT available_feedback_layout{};
-    available_feedback_layout.pNext = &available_color_write;
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT available_feedback_dynamic{};
     available_feedback_dynamic.pNext = &available_feedback_layout;
     vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
     available_provoking_vertex.pNext = &available_feedback_dynamic;
-    vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
-    available_min_lod.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceFeatures2 available_features2{};
-    available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_min_lod;
+    available_features2.pNext = &available_provoking_vertex;
     m_physical_device.getFeatures2(&available_features2);
-    Require("VulkanHarness", "dispatch",
-            available_features.shaderStorageImageWriteWithoutFormat == true,
-            "shaderStorageImageWriteWithoutFormat is not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features.shaderImageGatherExtended == true &&
-                available_derivatives.computeDerivativeGroupQuads == true,
-            "image gather or compute derivative quads are not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features11.storageBuffer16BitAccess == true &&
-                available_features12.storageBuffer8BitAccess == true,
-            "8-bit and 16-bit storage buffer access are not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features12.timelineSemaphore == true,
-            "timeline semaphores are not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features13.dynamicRendering == true,
-            "dynamic rendering is not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features13.synchronization2 == true,
-            "synchronization2 is not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features.sampleRateShading == true,
-            "sample-rate shading is not supported");
-    Require("VulkanHarness", "dispatch", available_features.shaderInt64 == true,
-            "shaderInt64 is not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features12.bufferDeviceAddress == true,
-            "bufferDeviceAddress is not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features12.shaderSampledImageArrayNonUniformIndexing == true,
-            "nonuniform sampled image indexing is not supported");
-    Require("VulkanHarness", "dispatch", available_min_lod.minLod == true,
-            "image view minimum LOD is not supported");
-    Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
-            "vertex layer output is not supported");
-    m_rasterization_supported = available_features.fillModeNonSolid &&
-                                available_features.tessellationShader &&
-                                available_features.depthBounds &&
-                                available_depth_clip.depthClipEnable &&
-                                available_clip_control.depthClipControl &&
-                                available_color_write.colorWriteEnable &&
+    m_rasterization_supported = caps.depth_bounds && caps.depth_clip_enable &&
+                                caps.color_write_enable &&
                                 available_feedback_layout.attachmentFeedbackLoopLayout &&
                                 available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
                                 available_provoking_vertex.provokingVertexLast;
@@ -18063,83 +18045,97 @@ private:
     device_info.sType = vk::StructureType::eDeviceCreateInfo;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
+    // Each optional feature is enabled, and its struct chained, only when the device has it:
+    // asking for a feature the device lacks fails device creation.
+    void *chain = nullptr;
+    const auto link = [&chain](auto &features) {
+      features.pNext = chain;
+      chain = &features;
+    };
     auto device_features11 = WindowContext::RequiredVulkan11Features();
+    link(device_features11);
     auto device_features12 = WindowContext::RequiredVulkan12Features();
-    device_features12.shaderSharedInt64Atomics = true;
-    vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
-    workgroup_layout.workgroupMemoryExplicitLayout = true;
-    device_features12.pNext = &device_features11;
-    device_features11.pNext = &workgroup_layout;
-    vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic64{};
-    image_atomic64.shaderImageInt64Atomics = true;
-    workgroup_layout.pNext = &image_atomic64;
-    vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
-    barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
-    barycentric.pNext = &device_features12;
-    barycentric.fragmentShaderBarycentric = true;
+    device_features12.shaderBufferInt64Atomics = caps.buffer_int64_atomics;
+    device_features12.shaderSharedInt64Atomics = caps.shared_int64_atomics;
+    link(device_features12);
     vk::PhysicalDeviceVulkan13Features device_features13{};
-    device_features13.sType =
-        vk::StructureType::ePhysicalDeviceVulkan13Features;
-    device_features13.pNext = &barycentric;
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
+    link(device_features13);
+    std::vector<const char *> device_extensions{VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+    if (portability_subset) {
+      device_extensions.push_back("VK_KHR_portability_subset");
+    }
+    vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
+    if (caps.shared_int64_atomics) {
+      workgroup_layout.workgroupMemoryExplicitLayout = true;
+      link(workgroup_layout);
+      device_extensions.push_back(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME);
+    }
+    vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic64{};
+    if (caps.image_int64_atomics) {
+      image_atomic64.shaderImageInt64Atomics = true;
+      link(image_atomic64);
+      device_extensions.push_back(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+    }
+    vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
+    if (caps.fragment_barycentric) {
+      barycentric.fragmentShaderBarycentric = true;
+      link(barycentric);
+      device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+    }
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
-    derivatives.pNext = &device_features13;
-    derivatives.computeDerivativeGroupQuads = true;
-    // Requesting a feature the device does not support fails device creation, so the
-    // rasterization feature chain is only chained in when every part is available.
-    vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
+    if (caps.compute_derivatives) {
+      derivatives.computeDerivativeGroupQuads = true;
+      link(derivatives);
+      device_extensions.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+    }
+    vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
+    if (caps.image_view_min_lod) {
+      min_lod.minLod = true;
+      link(min_lod);
+      device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    }
     vk::PhysicalDeviceDepthClipControlFeaturesEXT clip_control{};
+    clip_control.depthClipControl = true;
+    link(clip_control);
+    device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
+    vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
     vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write{};
     vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT feedback_layout{};
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic{};
     vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
     if (m_rasterization_supported) {
-      depth_clip.pNext = &derivatives;
       depth_clip.depthClipEnable = true;
-      clip_control.pNext = &depth_clip;
-      clip_control.depthClipControl = true;
-      color_write.pNext = &clip_control;
+      link(depth_clip);
       color_write.colorWriteEnable = true;
-      feedback_layout.pNext = &color_write;
+      link(color_write);
       feedback_layout.attachmentFeedbackLoopLayout = true;
-      feedback_dynamic.pNext = &feedback_layout;
+      link(feedback_layout);
       feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
-      provoking_vertex.pNext = &feedback_dynamic;
-      provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
-    }
-    vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
-    min_lod.minLod = true;
-    min_lod.pNext = m_rasterization_supported
-                        ? static_cast<void *>(&provoking_vertex)
-                        : static_cast<void *>(&derivatives);
-    device_info.pNext = &min_lod;
-    vk::PhysicalDeviceFeatures device_features{};
-    device_features.shaderStorageImageWriteWithoutFormat = true;
-    device_features.shaderImageGatherExtended = true;
-    device_features.sampleRateShading = true;
-    device_features.shaderInt64 = true;
-    device_features.shaderFloat64 = available_features.shaderFloat64;
-    device_features.fillModeNonSolid = m_rasterization_supported;
-    device_features.tessellationShader = m_rasterization_supported;
-    device_features.depthBounds = m_rasterization_supported;
-    device_info.pEnabledFeatures = &device_features;
-    std::vector<const char *> device_extensions{
-        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-        VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
-        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
-        VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-        VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
-        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
-    if (m_rasterization_supported) {
+      link(feedback_dynamic);
+      provoking_vertex.provokingVertexLast = true;
+      link(provoking_vertex);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
-      device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
+    device_info.pNext = chain;
+    vk::PhysicalDeviceFeatures device_features{};
+    device_features.shaderStorageImageWriteWithoutFormat = true;
+    device_features.shaderImageGatherExtended = true;
+    device_features.sampleRateShading = true;
+    device_features.shaderInt64 = true;
+    device_features.shaderFloat64 = caps.float64;
+    device_features.fillModeNonSolid = true;
+    device_features.tessellationShader = true;
+    device_features.depthClamp = caps.depth_clamp;
+    device_features.depthBounds = caps.depth_bounds;
+    device_features.shaderCullDistance = caps.cull_distance;
+    device_info.pEnabledFeatures = &device_features;
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.data();
@@ -18470,6 +18466,16 @@ private:
   std::unique_ptr<RenderContext> m_renderer;
 };
 
+// Cases whose result on the GPU differs from the expected one. A wrong result does not stop the
+// run: every such case is reported, and the run fails at its end.
+std::vector<std::string> g_wrong_results;
+
+void ReportWrongResult(const char *name, const char *stage, const std::string &message) {
+  std::fprintf(stderr, "ShaderRecompilerComputeTests: %s failed at %s: %s\n", name, stage,
+               message.c_str());
+  g_wrong_results.emplace_back(name);
+}
+
 void CompareWords(const TestCase &test, const char *stage,
                   const std::vector<u32> &expected,
                   const std::vector<u32> &actual) {
@@ -18495,7 +18501,7 @@ void CompareWords(const TestCase &test, const char *stage,
     out << (i == 0 ? "" : ", ") << Hex(actual[i]);
   }
   out << "]";
-  Fail(test.name, stage, out.str());
+  ReportWrongResult(test.name, stage, out.str());
 }
 
 void CompareGraphicsWords(const GraphicsCase &test,
@@ -18513,11 +18519,22 @@ void CompareGraphicsWords(const GraphicsCase &test,
     out << (i == 0 ? "" : ", ") << Hex(actual[i]);
   }
   out << "]";
-  Fail(test.name, "graphics readback", out.str());
+  ReportWrongResult(test.name, "graphics readback", out.str());
 }
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
+  const auto wrong_before = g_wrong_results.size();
+  // First for a host with every capability: this checks the translation on any device. Then, to
+  // run it, for the device at hand, when that device differs.
   auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u);
+  if (vulkan != nullptr && !test.compile_only) {
+    if (vulkan->CannotRun("compute", test.name, compiled.program)) {
+      return;
+    }
+    if (vulkan->Host() != HostGpu::Full()) {
+      compiled = CompileCase(test, vulkan->SubgroupSize(), vulkan->Host());
+    }
+  }
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
     Require(test.name, "resource specialization",
@@ -18649,7 +18666,8 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   vulkan->DestroyBuffer(&gds_buffer);
   vulkan->DestroyBuffer(&buffer);
   CompareWords(test, "readback", test.expected, actual);
-  std::printf("[compute] %-32s ok\n", test.name);
+  std::printf("[compute] %-32s %s\n", test.name,
+              g_wrong_results.size() == wrong_before ? "ok" : "WRONG RESULT");
 }
 
 void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
@@ -18658,9 +18676,14 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
     return;
   }
   auto compiled = CompileFragmentCase(test);
+  if (vulkan->CannotRun("graphics", test.name, compiled.program)) {
+    return;
+  }
+  const auto wrong_before = g_wrong_results.size();
   auto actual = vulkan->RenderFragment(test, compiled);
   CompareGraphicsWords(test, actual);
-  std::printf("[graphics] %-31s ok\n", test.name);
+  std::printf("[graphics] %-31s %s\n", test.name,
+              g_wrong_results.size() == wrong_before ? "ok" : "WRONG RESULT");
 }
 
 enum class CoverageClass {
@@ -40877,7 +40900,8 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
-int main(int argc, char **argv) {
+// Runs the selected cases. Wrong results are collected in g_wrong_results, for every selector.
+int RunSelectedCases(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -41841,6 +41865,26 @@ int main(int argc, char **argv) {
     std::printf("ShaderRecompilerComputeTests: %u graphics cases skipped\n",
                 vulkan.SkippedCaseCount());
   }
-  std::printf("ShaderRecompilerComputeTests: all cases passed\n");
+  if (vulkan.NotRunCaseCount() > 0) {
+    std::printf("ShaderRecompilerComputeTests: %u cases not run on this device, which lacks a "
+                "capability they need\n",
+                vulkan.NotRunCaseCount());
+  }
+  if (g_wrong_results.empty()) {
+    std::printf("ShaderRecompilerComputeTests: all cases passed\n");
+  }
   return 0;
+}
+
+int main(int argc, char **argv) {
+  const int result = RunSelectedCases(argc, argv);
+  if (result != 0 || Libs::Graphics::g_wrong_results.empty()) {
+    return result;
+  }
+  std::printf("ShaderRecompilerComputeTests: %zu cases gave a wrong result:\n",
+              Libs::Graphics::g_wrong_results.size());
+  for (const auto &name : Libs::Graphics::g_wrong_results) {
+    std::printf("  %s\n", name.c_str());
+  }
+  return 1;
 }

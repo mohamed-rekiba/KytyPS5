@@ -607,6 +607,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
+	if (Spirv::UsesSingleLaneModel(options.stage, options.host) &&
+	    IR::LowerLaneOpsToSingleLane(ir) != 0u) {
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	LowerTessellationMemory(ir, options);
 	std::string cfg_dump;
 	if (options.dump_ir) {
@@ -683,7 +690,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, options.input_info);
+	ir.mesh_emulated = ir.stage == ShaderType::Mesh && options.input_info.vertex->mesh.emulated;
+	auto spirv = Spirv::EmitProgram(ir, options.input_info, options.host);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,
@@ -692,7 +700,12 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
 	CompileResult result;
-	result.spirv   = std::move(spirv);
+	result.spirv = std::move(spirv);
+	if (ir.stage == ShaderType::Mesh && options.input_info.vertex->mesh.emulated) {
+		auto vertex              = Spirv::EmitMeshEmulationVertexProgram(ir, options.input_info);
+		result.mesh_vertex_spirv = std::move(vertex.spirv);
+		result.mesh_slot_words   = vertex.slot_words;
+	}
 	result.program = std::move(ir);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(translated.decoded_dump);

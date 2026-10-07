@@ -19,6 +19,7 @@
 #include <map>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -80,9 +81,12 @@ struct SpirvRequirements {
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 
 struct EmitterState {
-	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
-	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
-	      program(program_), input_info(input_info_),
+	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_,
+	             const HostGpu& host_)
+	    : builder(program_.stage == ShaderType::Mesh && !input_info_.vertex->mesh.emulated
+	                  ? 0x00010400u
+	                  : 0x00010300u),
+	      program(program_), input_info(input_info_), host(host_),
 	      requirements(AnalyzeProgramRequirements(program_)) {
 		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
 			lds_storage_class = spv::StorageClassWorkgroup;
@@ -95,6 +99,11 @@ struct EmitterState {
 	Builder                                          builder;
 	const IR::Program&                               program;
 	ShaderStageInputInfo                             input_info;
+	HostGpu                                          host;
+	// The stage runs one guest lane per host invocation and the host has no subgroup operations
+	// in it (see UsesSingleLaneModel). The lane is lane 0, every lane holds its values, and a
+	// ballot is the predicate in every bit.
+	bool                                             single_lane     = false;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;
@@ -371,6 +380,7 @@ void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
                            uint32_t cull_distance_count);
 void     EmitMeshEntryPoint(EmitterState& state);
+void     EmitMeshComputeEntryPoint(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
@@ -390,6 +400,8 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind);
+bool     UsesDepthBounds(const EmitterState& state);
+bool     MeshEmulated(const EmitterState& state);
 
 const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t location);
 

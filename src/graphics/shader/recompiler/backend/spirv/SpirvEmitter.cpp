@@ -18,6 +18,125 @@ namespace {
 	std::abort();
 }
 
+// The host stage that runs a program, as a VkShaderStageFlagBits value.
+uint32_t HostStageBit(ShaderType stage, bool mesh_emulated = false) {
+	if (stage == ShaderType::Mesh && mesh_emulated) {
+		return 0x20u; // a compute shader
+	}
+	switch (stage) {
+		case ShaderType::Vertex:
+		case ShaderType::Local: return 0x1u;
+		case ShaderType::TessellationControl: return 0x2u;
+		case ShaderType::TessellationEvaluation: return 0x4u;
+		case ShaderType::Pixel: return 0x10u;
+		case ShaderType::Compute: return 0x20u;
+		case ShaderType::Mesh: return 0x80u;
+		default: return 0u;
+	}
+}
+
+} // namespace
+
+bool UsesSingleLaneModel(ShaderType stage, const HostGpu& host) {
+	const bool one_lane_per_invocation = stage == ShaderType::Vertex ||
+	                                     stage == ShaderType::Local ||
+	                                     stage == ShaderType::TessellationEvaluation;
+	return one_lane_per_invocation &&
+	       (host.capabilities.subgroup_supported_stages & HostStageBit(stage)) == 0u;
+}
+
+std::optional<MissingCapability> FindMissingCapability(const IR::Program& program,
+                                                       const HostGpu&     host) {
+	const auto  requirements = Emitter::AnalyzeProgramRequirements(program);
+	const auto& caps         = host.capabilities;
+	// Compute shared memory that is kept in a device buffer is a buffer for this purpose.
+	const bool shared_in_buffer =
+	    IR::FindBinding(program.bindings, IR::DescriptorBindingKind::SharedMemory) != nullptr;
+	if (!caps.buffer_int64_atomics && (requirements.buffer_int64_atomics ||
+	                                   (requirements.shared_int64_atomics && shared_in_buffer))) {
+		return MissingCapability {"64-bit buffer atomics", "shaderBufferInt64Atomics"};
+	}
+	if (!caps.shared_int64_atomics && requirements.shared_int64_atomics && !shared_in_buffer) {
+		return MissingCapability {"64-bit atomics on compute shared memory",
+		                          "shaderSharedInt64Atomics with workgroupMemoryExplicitLayout"};
+	}
+	if (!caps.image_int64_atomics &&
+	    std::ranges::any_of(program.info.images,
+	                        [](const IR::ImageResource& image) { return image.atomic64; })) {
+		return MissingCapability {"64-bit image atomics", "shaderImageInt64Atomics"};
+	}
+	if (!caps.float64 && requirements.float64) {
+		return MissingCapability {"64-bit floating point", "shaderFloat64"};
+	}
+	if (!caps.compute_derivatives && requirements.compute_derivatives &&
+	    program.stage == ShaderType::Compute) {
+		return MissingCapability {"derivatives in a compute shader", "computeDerivativeGroupQuads"};
+	}
+	const bool subgroups = requirements.subgroup_ballot || requirements.subgroup_barrier ||
+	                       requirements.subgroup_shuffle ||
+	                       requirements.subgroup_local_invocation_id;
+	// A wave barrier has no single-lane form.
+	const bool single_lane =
+	    UsesSingleLaneModel(program.stage, host) && !requirements.subgroup_barrier;
+	if (subgroups && !single_lane &&
+	    (caps.subgroup_supported_stages & HostStageBit(program.stage, program.mesh_emulated)) ==
+	        0u) {
+		return MissingCapability {"subgroup operations in this stage", "subgroupSupportedStages"};
+	}
+	if (subgroups && !single_lane) {
+		// VkSubgroupFeatureFlagBits: basic 0x1, ballot 0x8, shuffle 0x10.
+		const uint32_t operations =
+		    (requirements.subgroup_local_invocation_id || requirements.subgroup_barrier ? 0x1u
+		                                                                                : 0u) |
+		    (requirements.subgroup_ballot ? 0x8u : 0u) |
+		    (requirements.subgroup_shuffle ? 0x10u : 0u);
+		if ((caps.subgroup_supported_operations & operations) != operations) {
+			return MissingCapability {"a subgroup operation (lane id, ballot or shuffle)",
+			                          "subgroupSupportedOperations"};
+		}
+	}
+	if (!caps.cull_distance &&
+	    std::ranges::any_of(program.info.outputs, [](const IR::StageOutput& output) {
+		    return output.kind == IR::StageOutputKind::CullDistance;
+	    })) {
+		return MissingCapability {"cull distance outputs", "shaderCullDistance"};
+	}
+	const auto reads = [&](auto predicate) {
+		return std::ranges::any_of(program.info.inputs, predicate);
+	};
+	const bool per_vertex  = reads([](const IR::StageInput& input) { return input.per_vertex; });
+	const bool centroid    = reads([](const IR::StageInput& input) {
+		return input.kind == IR::StageInputKind::BaryCoordSmoothCentroid;
+	});
+	const bool barycentric = centroid || reads([](const IR::StageInput& input) {
+		                         return input.kind == IR::StageInputKind::BaryCoordSmooth ||
+		                                input.kind == IR::StageInputKind::BaryCoordNoPerspective;
+	                         });
+	if (!caps.fragment_barycentric && (per_vertex || barycentric)) {
+		return MissingCapability {"barycentrics or raw vertex values", "fragmentShaderBarycentric"};
+	}
+	if (host.faults.no_per_vertex_inputs && per_vertex) {
+		return MissingCapability {"raw vertex values in a pixel shader", "PerVertexKHR inputs"};
+	}
+	if (host.faults.no_centroid_barycentric && centroid) {
+		return MissingCapability {"barycentrics at the centroid", "centroid BaryCoordKHR"};
+	}
+	return std::nullopt;
+}
+
+namespace {
+
+// A capability the host does not offer must not reach SPIR-V: the driver would reject the module
+// later with a message that does not say which guest shader needed it.
+void ValidateHost(const IR::Program& program, const HostGpu& host) {
+	if (const auto missing = FindMissingCapability(program, host)) {
+		EXIT("shader needs %s (%s), which the host GPU does not offer: hash=0x%016" PRIx64
+		     " stage=%u\n",
+		     missing->need, missing->name, program.shader_hash,
+		     static_cast<unsigned>(program.stage));
+	}
+}
+
 void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	using Kind                                             = IR::DescriptorBindingKind;
 	constexpr auto                               KindCount = static_cast<size_t>(Kind::Count);
@@ -337,8 +456,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	return requirements;
 }
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info) {
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  const HostGpu& host) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -354,7 +473,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
 	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
 	IR::ValidateProgram(program, true);
-	EmitterState state(program, input_info);
+	EmitterState state(program, input_info, host);
+	state.single_lane = UsesSingleLaneModel(program.stage, host);
+	ValidateHost(program, host);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
@@ -362,8 +483,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	        : 1u;
 	DefineModule(state);
 	EmitProgram(state);
-	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
-	                            "main", state.interface_variables);
+	state.builder.AddEntryPoint(MeshEmulated(state) ? spv::ExecutionModelGLCompute
+	                                                : ExecutionModelForStage(state.program.stage),
+	                            state.main_func, "main", state.interface_variables);
 
 	return state.builder.Build();
 }
