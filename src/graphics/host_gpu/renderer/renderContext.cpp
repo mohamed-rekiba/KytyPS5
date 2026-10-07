@@ -163,7 +163,8 @@ void RenderContext::PrepareBda(bool shader_writes_addresses) {
 		return;
 	}
 	KYTY_PROFILER_BLOCK("PrepareBda: written ranges");
-	// The log names a range once for each write: merged, each buffer is visited once.
+	// The log names a range once for each write. Overlapping and adjacent ranges are merged, so
+	// a buffer is visited once for each run of written bytes, not once for each write.
 	std::ranges::sort(m_bda_cpu_writes, {}, &GuestRange::address);
 	size_t merged = 0;
 	for (const auto& write: m_bda_cpu_writes) {

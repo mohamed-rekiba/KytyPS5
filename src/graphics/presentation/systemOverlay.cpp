@@ -789,10 +789,6 @@ struct SystemOverlay::Impl {
 		info.DescriptorPoolSize           = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE;
 		info.MinImageCount                = image_count;
 		info.ImageCount                   = image_count;
-		buffer_sets                       = image_count;
-		vertex_high_water                 = 0;
-		index_high_water                  = 0;
-		growing_records                   = 0;
 		info.UseDynamicRendering          = true;
 		info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
 		info.PipelineInfoMain.PipelineRenderingCreateInfo.sType =
@@ -801,6 +797,9 @@ struct SystemOverlay::Impl {
 		info.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &color_format;
 		info.CheckVkResultFn = CheckVulkanResult;
 		EXIT_IF(!ImGui_ImplVulkan_Init(&info));
+		set_vertices.assign(image_count, 0);
+		set_indices.assign(image_count, 0);
+		set_index = 0;
 		vulkan_initialized = true;
 	}
 
@@ -1287,15 +1286,15 @@ struct SystemOverlay::Impl {
 		};
 		// The backend replaces a vertex or index buffer that is too small and destroys the old
 		// one at once. Each command buffer committed while it lived holds it (see
-		// queueCommits.h), so the queue is drained first, once for each of its buffer sets.
-		if (draw_data->TotalVtxCount > vertex_high_water ||
-		    draw_data->TotalIdxCount > index_high_water) {
-			vertex_high_water = std::max(vertex_high_water, draw_data->TotalVtxCount);
-			index_high_water  = std::max(index_high_water, draw_data->TotalIdxCount);
-			growing_records   = buffer_sets;
-		}
-		if (growing_records > 0) {
-			growing_records--;
+		// queueCommits.h), so the queue is drained first. The backend takes its buffer sets in
+		// turn, one for each call, and grows only the set it takes: the same is tracked here.
+		set_index      = (set_index + 1u) % static_cast<uint32_t>(set_vertices.size());
+		auto& vertices = set_vertices[set_index];
+		auto& indices  = set_indices[set_index];
+		if (draw_data->TotalVtxCount > 0 &&
+		    (draw_data->TotalVtxCount > vertices || draw_data->TotalIdxCount > indices)) {
+			vertices = std::max(vertices, draw_data->TotalVtxCount);
+			indices  = std::max(indices, draw_data->TotalIdxCount);
 			graphics.WithQueueIdle(render);
 		} else {
 			Common::LockGuard queue_lock(graphics.queue_mutex);
@@ -1316,11 +1315,11 @@ struct SystemOverlay::Impl {
 	GraphicContext&                       graphics;
 	ImGuiContext*                         imgui_context      = nullptr;
 	bool                                  vulkan_initialized = false;
-	// The backend's vertex and index buffer sets, and the largest draw they held (see Record).
-	uint32_t                                    buffer_sets        = 0;
-	int                                         vertex_high_water  = 0;
-	int                                         index_high_water   = 0;
-	uint32_t                                    growing_records    = 0;
+	// The vertices and indices each of the backend's buffer sets holds, and the set it took
+	// last (see Record).
+	std::vector<int>                      set_vertices;
+	std::vector<int>                      set_indices;
+	uint32_t                              set_index          = 0;
 	bool                                  shift              = false;
 	bool                                  symbol_mode        = false;
 	bool                                  focus_pending      = true;

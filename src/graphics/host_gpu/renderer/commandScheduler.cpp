@@ -149,6 +149,10 @@ void CommandScheduler::Shutdown() {
 	if (m_priority_thread.joinable()) {
 		m_priority_thread.join();
 	}
+	m_graphics.WithQueueIdle([this] {
+		std::lock_guard lock(m_operation_mutex);
+		m_retired_while_draining.clear();
+	});
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
@@ -436,8 +440,11 @@ void CommandScheduler::RetireCallbackState(Common::UniqueFunction<void>&& callba
 		m_pending_operations.push(
 		    {[state = std::move(callback)]() mutable { state = {}; }, CurrentTick()});
 		m_open_operations++;
+		return;
 	}
-	// During shutdown every submission has retired, so the callback is destroyed in place.
+	// During shutdown the other scheduler and the presents may still run command buffers that
+	// hold these resources: Shutdown destroys them once the queue is idle.
+	m_retired_while_draining.push_back(std::move(callback));
 }
 
 void CommandScheduler::DrainPriorityOperations() {
