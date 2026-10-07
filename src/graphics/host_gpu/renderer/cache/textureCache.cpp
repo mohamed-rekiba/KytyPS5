@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -1570,12 +1571,12 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 }
 
 void TextureCache::MarkGpuWritten(ImageId id) {
-	m_slot_images[id].NoteContentWrite();
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id) {
 		EXIT("TextureCache: cannot mark an unavailable image GPU-written\n");
 	}
+	image.NoteContentWrite();
 	TrackImage(id);
 	CommitGpuWrite(image);
 	if (image.info.HasStencil()) {
@@ -1973,6 +1974,72 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
 	return true;
+}
+
+void TextureCache::SaveGpuWrites(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return;
+	}
+	// TODO: a stencil plane (depth_id) the GPU wrote is not saved: no path downloads a stencil
+	// plane to guest memory yet.
+	const auto any_unsaved = [&] {
+		for (const auto id: FindImagesInRegion(address, size, false)) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image != nullptr && image->registered && !image->depth_id &&
+			    image->SafeToDownload()) {
+				return true;
+			}
+		}
+		return false;
+	};
+	{
+		std::scoped_lock lock {m_lock};
+		if (!any_unsaved()) {
+			return;
+		}
+	}
+	// As for a buffer read-back: a completion that runs off the GPU thread cannot wait for the
+	// GPU thread. Only when there is something to save: a completion may write guest memory.
+	if (CommandScheduler::InCompletionOffGpuThread()) {
+		EXIT("unsupported texture save from an asynchronous GPU completion, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     address, size);
+	}
+	std::optional<uint64_t> tick;
+	auto                    round = [&] {
+        std::scoped_lock lock {m_lock};
+        for (const auto id: FindImagesInRegion(address, size, false)) {
+            const auto* image = m_slot_images.try_get(id);
+            if (image != nullptr && image->registered && !image->depth_id &&
+                image->SafeToDownload() && DownloadImageMemory(id)) {
+                tick = m_scheduler.CurrentTick();
+            }
+        }
+        if (tick) {
+            m_scheduler.Flush();
+        }
+	};
+	const bool on_gpu_thread = GuestGpu::IsGpuThread();
+	if (on_gpu_thread) {
+		round();
+	} else if (!m_scheduler.Context().GetGpu().TrySendCommandSync(round)) {
+		// The GPU thread takes no more work: the emulator is shutting down. Unlike a buffer
+		// read-back, this thread can go on: it is about to write, and losing the texture's GPU
+		// writes at shutdown harms nothing.
+		return;
+	}
+	if (!tick) {
+		return;
+	}
+	// One round, not a loop as for buffers: a downloaded image stays GPU-modified, so a loop
+	// would download it again without end. The download writes guest memory when its submission
+	// ends; that comes before the write.
+	if (on_gpu_thread) {
+		m_scheduler.Wait(*tick);
+	} else if (!m_scheduler.WaitSubmitted(*tick)) {
+		return;
+	}
+	m_scheduler.WaitPriorityOperations(*tick);
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {

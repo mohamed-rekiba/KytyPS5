@@ -639,6 +639,8 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
+	// The shader has a DS_ORDERED_COUNT: it adds once per wave, so it needs real waves.
+	bool                          uses_ordered_count  = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; };

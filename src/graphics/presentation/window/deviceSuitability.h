@@ -16,6 +16,8 @@ namespace Libs::Graphics {
 struct DeviceFacts {
 	std::vector<std::string> extensions;
 	HostDriver               driver = HostDriver::Other;
+	// VkPhysicalDeviceProperties::vendorID is Apple's.
+	bool apple_gpu = false;
 	// VkPhysicalDeviceVulkan11Properties::subgroupSupportedStages.
 	uint32_t subgroup_supported_stages = 0;
 	// VkPhysicalDeviceVulkan11Properties::subgroupSupportedOperations.
@@ -39,6 +41,8 @@ struct DeviceFacts {
 	bool shader_image_gather_extended              = false;
 	bool independent_blend                         = false;
 	bool dual_src_blend                            = false;
+	// VK_FORMAT_A2B10G10R10_USCALED_PACK32 can be a vertex attribute (not on Metal).
+	bool packed_scaled_vertex_format               = false;
 	bool tessellation_shader                       = false;
 	bool shader_int64                              = false;
 	bool shader_float64                            = false;

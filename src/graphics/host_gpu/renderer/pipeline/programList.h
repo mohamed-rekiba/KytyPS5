@@ -89,6 +89,18 @@ private:
 
 } // namespace ProgramListDetail
 
+// The offset of the last member of a struct that a record holds as bytes. With the struct's size
+// it signs the layout: a field added before the last member moves it, also when the field goes
+// into padding and the size stays the same. Not seen: a field in the padding after the last
+// member, or two fields of one size that change places. Measured on an object, because offsetof
+// needs a standard-layout struct and the input infos inherit members.
+template <typename T, typename M>
+[[nodiscard]] size_t RecordLastOffset(M T::* last) {
+	static const T object {};
+	return static_cast<size_t>(reinterpret_cast<const char*>(&(object.*last)) -
+	                           reinterpret_cast<const char*>(&object));
+}
+
 // Appends the record to `out`: its length, its bytes, and a checksum of the bytes.
 inline void AppendProgramRecord(std::vector<uint8_t>& out, const ProgramRecord& record) {
 	std::vector<uint8_t>   body;

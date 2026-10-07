@@ -431,6 +431,10 @@ VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint3
 		case Prospero::BufferFormat::k16_16_16_16SInt:
 		case Prospero::BufferFormat::k32_32_32SInt:
 		case Prospero::BufferFormat::k32_32_32_32SInt: return VertexInputScalarKind::Sint;
+		case Prospero::BufferFormat::k10_10_10_2UScaled:
+			return state.host.capabilities.packed_scaled_vertex_input
+			           ? VertexInputScalarKind::Float
+			           : VertexInputScalarKind::Uscaled1010102;
 		default: return VertexInputScalarKind::Float;
 	}
 }
@@ -442,7 +446,8 @@ uint32_t VertexParameterComponentCount(const InputBinding& input) {
 uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind) {
 	switch (kind) {
 		case VertexInputScalarKind::Sint: return TypeI32(state);
-		case VertexInputScalarKind::Uint: return TypeU32(state);
+		case VertexInputScalarKind::Uint:
+		case VertexInputScalarKind::Uscaled1010102: return TypeU32(state);
 		case VertexInputScalarKind::Float:
 		default: return TypeF32(state);
 	}
@@ -583,9 +588,11 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::Parameter:
 				if (state.program.stage == ShaderType::Vertex ||
 				    state.program.stage == ShaderType::Local) {
-					type = VertexParameterScalarType(
-					    state, VertexParameterScalarKind(state, input.location));
-					const auto components = VertexParameterComponentCount(input);
+					const auto kind = VertexParameterScalarKind(state, input.location);
+					type            = VertexParameterScalarType(state, kind);
+					const auto components = kind == VertexInputScalarKind::Uscaled1010102
+					                            ? 1u
+					                            : VertexParameterComponentCount(input);
 					if (components > 1u) {
 						type = state.builder.Type(spv::OpTypeVector, type, components);
 					}
@@ -634,7 +641,14 @@ void DefineInputs(EmitterState& state) {
 		state.builder.AddAnnotation(spv::OpDecorate, state.helper_invocation_variable,
 		                            spv::DecorationBuiltIn, spv::BuiltInHelperInvocation);
 	}
-	if (state.program.info.subgroup_local_invocation_id && !state.single_lane) {
+	if (state.program.info.subgroup_local_invocation_id && !state.single_lane &&
+	    LaneIndexFromScan(state)) {
+		// Set at the entry, where every invocation is active (see EmitProgram).
+		state.subgroup_local_invocation_id_variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate);
+		state.builder.AddName(state.subgroup_local_invocation_id_variable, "lane_index");
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
+	} else if (state.program.info.subgroup_local_invocation_id && !state.single_lane) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -724,12 +738,15 @@ void DefineOutputs(EmitterState& state) {
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
-				const bool uint_output =
-				    binding.kind == IR::StageOutputKind::Mrt &&
-				    state.program.stage == ShaderType::Pixel &&
-				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
-				    state.input_info.pixel->target_output_mode[binding.index] == 7u;
-				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+				const auto output_class =
+				    binding.kind == IR::StageOutputKind::Mrt && state.program.stage == ShaderType::Pixel
+				        ? MrtOutputClass(state, binding.index)
+				        : ShaderColorNumberClass::Float;
+				const auto type = output_class == ShaderColorNumberClass::Uint
+				                      ? TypeU32Vector(state, 4)
+				                  : output_class == ShaderColorNumberClass::Sint
+				                      ? TypeI32Vector(state, 4)
+				                      : TypeF32Vector(state, 4);
 				if (binding.kind == IR::StageOutputKind::Parameter && copies != nullptr) {
 					// The pixel shader does not read this parameter where a copy of another
 					// one goes: the copy takes the location.
@@ -884,6 +901,8 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.float64) {
 		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
 		                     state.input_info.compute->float_mode != 0xc0);
+	}
+	if (state.program.info.float64 && !state.soft_float64) {
 		// Use native rounding for MODE=0xc0, consistent with ordinary FP32 arithmetic.
 		state.builder.RequireCapability(spv::CapabilityFloat64);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
@@ -915,9 +934,11 @@ void DefineModule(EmitterState& state) {
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
 		}
+		// Not with the depth-bounds test in the shader: early tests would write stencil and count
+		// occlusion for fragments the test then discards.
 		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
 		    !state.input_info.pixel->ps_depth_export_enable &&
-		    !state.input_info.pixel->ps_sample_mask_export_enable) {
+		    !state.input_info.pixel->ps_sample_mask_export_enable && !UsesDepthBounds(state)) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
 		}
 	}

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <spirv/unified1/GLSL.std.450.h>
@@ -63,6 +64,28 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
+// The 64-bit float operations, done on 64-bit integers on a host without 64-bit floats.
+enum class SoftFloat64Op : uint8_t {
+	Add,
+	Mul,
+	Fma,
+	Recip,
+	Min,
+	Max,
+	Floor,
+	Ceil,
+	Trunc,
+	Fract,
+	OrdEqual,
+	OrdLessThanEqual,
+	OrdGreaterThanEqual,
+	FromS32,
+	FromU32,
+	FromF32,
+	ToF32,
+	Count,
+};
+
 struct BufferDefinition {
 	uint32_t variable             = 0;
 	uint32_t type                 = 0;
@@ -91,6 +114,7 @@ struct EmitterState {
 		    input_info.compute != nullptr && input_info.compute->lds_storage) {
 			lds_storage_class = spv::StorageClassStorageBuffer;
 		}
+		soft_float64 = program.info.float64 && !host.capabilities.float64;
 	}
 
 	Builder                                          builder;
@@ -101,6 +125,10 @@ struct EmitterState {
 	// in it (see UsesSingleLaneModel). The lane is lane 0, every lane holds its values, and a
 	// ballot is the predicate in every bit.
 	bool                                             single_lane     = false;
+	// The host has no 64-bit floats: a 64-bit float is a 64-bit integer, and each operation on it
+	// calls a function of softFloat64.h (see DefineSoftFloat64).
+	bool                                             soft_float64    = false;
+	std::array<uint32_t, static_cast<size_t>(SoftFloat64Op::Count)> soft_float64_functions {};
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;
@@ -183,6 +211,9 @@ uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components);
 uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
+// The number type of the pixel shader's output to colour target `index`: the target's own (Metal
+// needs it), or unsigned for an integer export (UINT16) into a float target.
+ShaderColorNumberClass MrtOutputClass(const EmitterState& state, uint32_t index);
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
@@ -269,7 +300,9 @@ struct ValueEmitContext {
 	uint32_t                                                           half       = 0;
 };
 
-enum class VertexInputScalarKind { Float, Sint, Uint };
+// Uscaled1010102: the attribute's packed 32-bit word, unpacked by the shader, on a host that cannot
+// fetch packed 10-10-10-2 scaled values (HostCapabilities::packed_scaled_vertex_input).
+enum class VertexInputScalarKind { Float, Sint, Uint, Uscaled1010102 };
 
 constexpr uint32_t NoImageComponent = 0xffffffffu;
 
@@ -394,6 +427,9 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind);
 bool     UsesDepthBounds(const EmitterState& state);
 bool     MeshEmulated(const EmitterState& state);
+// A vertex stage that uses subgroup operations on a device without subgroup built-ins there
+// (DriverFaults::vertex_subgroups_unreported): the lane index comes from a scan.
+bool     LaneIndexFromScan(const EmitterState& state);
 
 const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t location);
 
@@ -534,6 +570,11 @@ void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
 void DefineBvhIntersect(EmitterState& state);
+// Defines the functions for the 64-bit float operations the shader uses, when soft_float64.
+void DefineSoftFloat64(EmitterState& state);
+// Calls the function of `op`; the arguments and result are integers (see softFloat64.h).
+uint32_t EmitSoftFloat64(EmitterState& state, SoftFloat64Op op,
+                         std::initializer_list<uint32_t> args);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 
 // These templates accept local lambdas from several emitter translation units.

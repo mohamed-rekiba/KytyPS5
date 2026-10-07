@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -137,6 +138,10 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
 }
 
+bool LaneIndexFromScan(const EmitterState& state) {
+	return Spirv::LaneIndexFromScan(state.program.stage, state.host);
+}
+
 bool MeshEmulated(const EmitterState& state) {
 	return state.program.stage == ShaderType::Mesh && state.input_info.vertex->mesh.emulated;
 }
@@ -196,8 +201,23 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 
 uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding& input,
                                          uint32_t component) {
-	const auto count = VertexParameterComponentCount(input);
 	const auto kind  = VertexParameterScalarKind(state, input.location);
+	if (kind == VertexInputScalarKind::Uscaled1010102) {
+		// Fields at bits 0, 10, 20 and 30, 10 bits wide but the last, 2. As floats.
+		EXIT_IF(component > 3u);
+		const auto word  = state.builder.AllocateId();
+		const auto field = state.builder.AllocateId();
+		const auto value = state.builder.AllocateId();
+		const auto bits  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), word, input.variable_id);
+		state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), field, word,
+		                          ConstantU32(state, component * 10u),
+		                          ConstantU32(state, component == 3u ? 2u : 10u));
+		state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), value, field);
+		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+		return bits;
+	}
+	const auto count = VertexParameterComponentCount(input);
 	const auto scalar_type = VertexParameterScalarType(state, kind);
 	uint32_t   raw         = state.builder.AllocateId();
 	if (count == 1u) {

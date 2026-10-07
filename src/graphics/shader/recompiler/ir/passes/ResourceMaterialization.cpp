@@ -1239,10 +1239,30 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 
+bool ResourceSpecializationFits(const ShaderInfo&             info,
+                                const ResourceSpecialization& specialization) {
+	// Each entry past the shader's own resources is a copy of one of them; every indirect root
+	// is an entry.
+	const auto fits = [](const auto& sources, size_t original_count, uint32_t no_root) {
+		if (original_count > sources.size()) {
+			return false;
+		}
+		for (size_t index = 0; index < sources.size(); index++) {
+			const auto root = sources[index].indirect_root;
+			if ((index >= original_count && root >= original_count) ||
+			    (root != no_root && root >= sources.size())) {
+				return false;
+			}
+		}
+		return true;
+	};
+	return fits(specialization.buffers, info.buffers.size(), BufferResource::NoIndirectBuffer) &&
+	       fits(specialization.images, info.images.size(), ImageResource::NoIndirectImage);
+}
+
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete);
-	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||
-	        program.info.images.size() > specialization.images.size());
+	EXIT_IF(!ResourceSpecializationFits(program.info, specialization));
 
 	auto& buffers = program.info.buffers;
 	const auto original_buffer_count = buffers.size();

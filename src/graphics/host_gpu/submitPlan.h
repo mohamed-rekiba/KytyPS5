@@ -13,6 +13,8 @@ namespace Libs::Graphics {
 // therefore merged into one host submission until one of these holds:
 //   - a completion callback waits for the open submission (an end-of-pipe interrupt, a flip);
 //   - the GPU thread is about to wait for the guest, so nothing more would join;
+//   - many deferred operations (resource destructions) wait for the open submission: they hold
+//     their resources until it completes;
 //   - the open submission holds enough draws and dispatches, or its first command is old enough,
 //     so that the GPU is not left idle while the CPU records.
 // Points that need the submission for correctness (a read-back of bytes the open submission writes,
@@ -22,6 +24,8 @@ struct SubmitState {
 	uint32_t open_work = 0;
 	// Completion callbacks queued for the open command buffer's tick.
 	uint32_t open_callbacks = 0;
+	// Deferred operations queued for the open command buffer's tick.
+	uint32_t open_operations = 0;
 	// Any command was recorded in the open command buffer (transfers count, draws count).
 	bool open_used = false;
 	// Microseconds since the first command went into the open command buffer.
@@ -36,6 +40,8 @@ enum class SubmitReason : uint8_t {
 	Callbacks,
 	// The GPU thread is about to wait; what is recorded goes to the GPU now.
 	Idle,
+	// Many deferred operations wait for the open submission.
+	Operations,
 	// Enough draws and dispatches are recorded.
 	Work,
 	// The first command has waited long enough.
@@ -48,9 +54,12 @@ enum class SubmitReason : uint8_t {
 // gave 16 to 17 fps; 32 draws or 0.5 ms was no faster.
 inline constexpr uint32_t SUBMIT_WORK_LIMIT  = 128;
 inline constexpr uint64_t SUBMIT_AGE_LIMIT_US = 2000;
+// Past this many, the operations of the open submission no longer wait for the other limits.
+inline constexpr uint32_t SUBMIT_OPERATION_LIMIT = 4096;
 
 [[nodiscard]] constexpr SubmitReason PlanSubmit(const SubmitState& state) noexcept {
-	if (!state.open_used && state.open_callbacks == 0) {
+	const bool many_operations = state.open_operations >= SUBMIT_OPERATION_LIMIT;
+	if (!state.open_used && state.open_callbacks == 0 && !many_operations) {
 		return SubmitReason::None;
 	}
 	if (state.open_callbacks != 0) {
@@ -58,6 +67,9 @@ inline constexpr uint64_t SUBMIT_AGE_LIMIT_US = 2000;
 	}
 	if (state.about_to_wait) {
 		return SubmitReason::Idle;
+	}
+	if (many_operations) {
+		return SubmitReason::Operations;
 	}
 	if (state.open_work >= SUBMIT_WORK_LIMIT) {
 		return SubmitReason::Work;

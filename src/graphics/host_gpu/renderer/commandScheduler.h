@@ -68,6 +68,9 @@ public:
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// A completion runs on the priority thread, off the GPU thread: it cannot wait for work the
+	// GPU thread does, such as a read-back.
+	[[nodiscard]] static bool InCompletionOffGpuThread() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -120,6 +123,9 @@ private:
 	// What the open command buffer holds, for SubmitIfDue. Reset at every submission.
 	uint32_t                              m_open_work      = 0;
 	uint32_t                              m_open_callbacks = 0;
+	// Deferred operations queued for the open command buffer. Under m_operation_mutex: any
+	// thread queues them. Reset at every submission.
+	uint32_t                              m_open_operations = 0;
 	std::chrono::steady_clock::time_point m_open_since {};
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 	void RetireCallbackState(Common::UniqueFunction<void>&& callback);

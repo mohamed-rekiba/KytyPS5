@@ -68,6 +68,8 @@ struct ConfigOptions {
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
+	// Empty: the host's per-user cache folder (cacheFolder.h).
+	std::filesystem::path  pipeline_cache_folder;
 	bool                   command_buffer_dump_enabled = false;
 	std::filesystem::path  command_buffer_dump_folder  = "_Buffers";
 	bool                   graphics_debug_dump_enabled = false;
@@ -119,6 +121,7 @@ bool                   PipelineWaitEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
+std::filesystem::path  GetPipelineCacheFolder();
 
 bool                  CommandBufferDumpEnabled();
 std::filesystem::path GetCommandBufferDumpFolder();

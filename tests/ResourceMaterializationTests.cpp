@@ -664,6 +664,39 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
+// A program list keeps the specialization a draw gave. The translator of another build may find
+// other resources in the same shader; such a specialization is refused, not applied.
+void TestSpecializationFitsTheShader() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ShaderInfo info;
+  info.buffers.resize(2);
+  info.images.resize(1);
+  ResourceSpecialization specialization;
+  specialization.buffers.resize(2);
+  specialization.images.resize(1);
+  Check(ResourceSpecializationFits(info, specialization),
+        "a specialization of the shader's own resources was refused");
+
+  // An entry past the shader's resources is a copy of one of them.
+  specialization.buffers.push_back({.indirect_root = 1});
+  Check(ResourceSpecializationFits(info, specialization),
+        "an indirect buffer of one of the shader's buffers was refused");
+  specialization.buffers.back().indirect_root = 2;
+  Check(!ResourceSpecializationFits(info, specialization),
+        "an indirect buffer whose root is not one of the shader's buffers was accepted");
+  specialization.buffers.pop_back();
+
+  // The shader has more resources than the record holds.
+  info.images.resize(2);
+  Check(!ResourceSpecializationFits(info, specialization),
+        "a specialization with fewer images than the shader was accepted");
+  info.images.resize(1);
+
+  specialization.images[0].indirect_root = 4;
+  Check(!ResourceSpecializationFits(info, specialization),
+        "an image whose indirect root is past the images was accepted");
+}
+
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
@@ -675,6 +708,7 @@ int main() {
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestSpecializationFitsTheShader();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

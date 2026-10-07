@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/pipelineUse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -235,8 +236,8 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	// The frame in which each render target was last drawn into. A target is an image slot with
 	// its generation (so a slot given to a new image does not inherit the frame of the old one)
-	// and, for colour, the mip level and array layer (a face of a cube map or a layer of an atlas
-	// drawn once is not covered by draws into the others).
+	// and the mip level and array layer (a face of a cube map, a layer of an atlas or a cascade of
+	// a shadow map drawn once is not covered by draws into the others).
 	// One target of a draw: an image (slot and generation), a mip and a layer. Exact, no hash.
 	struct TargetId {
 		uint64_t image = 0;
@@ -255,7 +256,7 @@ private:
 	static TargetId TargetKey(ImageId image, uint32_t mip = 0, uint32_t layer = 0) {
 		return {ImageIdentity(image), mip, layer};
 	}
-	std::unordered_map<TargetId, uint64_t, TargetIdHash> m_target_frames;
+	std::unordered_map<TargetId, TargetHistory, TargetIdHash> m_target_frames;
 	// Buffers a draw uses on the GPU alone, within one submission (a depth snapshot, the records
 	// of an emulated mesh draw). Kept and used again once the GPU has passed the submission that
 	// used them: creating and destroying one per draw cost 0.45 ms each on MoltenVK.
@@ -279,6 +280,7 @@ private:
 	DepthSnapshot              m_depth_snapshot;
 	Buffer&                    AcquireScratch(uint64_t bytes);
 	static TargetId TargetKey(const RenderColorInfo& color);
+	static TargetId TargetKey(const RenderDepthInfo& depth);
 	uint64_t                               m_frame = 0;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;

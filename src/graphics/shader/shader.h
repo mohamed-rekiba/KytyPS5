@@ -169,6 +169,16 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
 enum class ShaderPixelParameterMode : uint8_t { FirstVertex, LastVertex, Rectangle };
 
+// The numbers a colour target holds. A pixel shader output must have the target's type: Metal
+// refuses to build a pipeline that writes floats into an integer target, which AMD hardware takes.
+enum class ShaderColorNumberClass : uint8_t { Float, Uint, Sint };
+
+// What a pixel shader needs to know of a colour target it exports to.
+struct ShaderColorTarget {
+	Prospero::ColorComponentMapping export_mapping;
+	ShaderColorNumberClass          number_class = ShaderColorNumberClass::Float;
+};
+
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
@@ -181,6 +191,7 @@ struct ShaderPixelInputInfo {
 	uint8_t                                        target_output_mode[8]        = {};
 	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
+	std::array<ShaderColorNumberClass, 8>          target_number_class          = {};
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;

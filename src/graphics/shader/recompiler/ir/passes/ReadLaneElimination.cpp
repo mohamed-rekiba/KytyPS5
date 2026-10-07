@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
+#include <mutex>
 
 #include <queue>
 
@@ -153,10 +155,9 @@ Block::iterator PositionOf(Inst* inst) {
 // V_WRITELANE put a scalar into one lane. A compiler keeps scalars it has no register for in the
 // lanes of a vector register, so the value must come back exactly: through the writes to other
 // lanes, and through the merges that masked writes and joining paths leave behind.
-// Every value that holds, or is computed from, a register with a lane write. Such a value may
-// differ from lane to lane, so only the operations LaneOfUniformRegister follows give a lane of
-// it back exactly.
-std::unordered_set<const Inst*> ValuesWithLaneWrites(const Program& program) {
+// Every value that `seed` picks, and every value computed from one.
+template <typename Seed>
+std::unordered_set<const Inst*> ValuesComputedFrom(const Program& program, Seed&& seed) {
 	std::unordered_set<const Inst*> tainted;
 	for (bool changed = true; changed;) {
 		changed = false;
@@ -165,7 +166,7 @@ std::unordered_set<const Inst*> ValuesWithLaneWrites(const Program& program) {
 				if (tainted.contains(&inst)) {
 					continue;
 				}
-				bool taint = inst.GetOpcode() == ValueOpcode::WriteLane;
+				bool taint = seed(inst);
 				for (size_t index = 0; !taint && index < inst.NumArgs(); index++) {
 					const auto* argument = inst.Arg(index).Resolve().TryInstruction();
 					taint                = argument != nullptr && tainted.contains(argument);
@@ -178,6 +179,49 @@ std::unordered_set<const Inst*> ValuesWithLaneWrites(const Program& program) {
 		}
 	}
 	return tainted;
+}
+
+// Every value that holds, or is computed from, a register with a lane write. Such a value may
+// differ from lane to lane, so only the operations LaneOfUniformRegister follows give a lane of
+// it back exactly.
+std::unordered_set<const Inst*> ValuesWithLaneWrites(const Program& program) {
+	return ValuesComputedFrom(
+	    program, [](const Inst& inst) { return inst.GetOpcode() == ValueOpcode::WriteLane; });
+}
+
+// Every value computed from what differs between invocations: a vector register's first value,
+// a builtin, an attribute. A value that differs only through a branch on such a value is not
+// found.
+std::unordered_set<const Inst*> PerInvocationValues(const Program& program) {
+	return ValuesComputedFrom(program, [](const Inst& inst) {
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::GetVectorRegister:
+			case ValueOpcode::GetBuiltin:
+			case ValueOpcode::GetAttribute:
+			case ValueOpcode::GetInterpolationParameter:
+			case ValueOpcode::GetTessellationAttribute:
+			case ValueOpcode::GetThreadBitScalarRegister:
+			case ValueOpcode::LaneId: return true;
+			default: return false;
+		}
+	});
+}
+
+// Once per shader: its permutations are translated one by one, on several threads.
+void ReportFirstLaneRead(const Program& program) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> reported;
+	{
+		std::lock_guard lock(mutex);
+		if (!reported.insert(program.shader_hash).second) {
+			return;
+		}
+	}
+	std::fprintf(stderr,
+	             "shader reads the first lane of a value that differs between invocations, in "
+	             "the single-lane model: each invocation reads its own (hash=0x%016" PRIx64
+	             " stage=%u)\n",
+	             program.shader_hash, static_cast<unsigned>(program.stage));
 }
 
 [[noreturn]] void StopAtInexactLaneRead(const Program& program, const char* what) {
@@ -266,6 +310,15 @@ uint32_t LowerLaneOpsToSingleLane(Program& program) {
 	std::unordered_map<uint32_t, std::unordered_map<Inst*, Value>> known;
 	const auto         with_lane_writes = ValuesWithLaneWrites(program);
 	const LaneLowering lowering {program, with_lane_writes};
+	// Before any lane operation is rewritten: a LaneId turns into 0 below.
+	const bool reads_first_lane = std::ranges::any_of(program.blocks, [](const Block* block) {
+		return std::ranges::any_of(*block, [](const Inst& inst) {
+			return inst.GetOpcode() == ValueOpcode::ReadFirstLane;
+		});
+	});
+	const auto per_invocation =
+	    reads_first_lane ? PerInvocationValues(program) : std::unordered_set<const Inst*> {};
+	bool reported = false;
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
 			auto& inst = *it;
@@ -287,10 +340,20 @@ uint32_t LowerLaneOpsToSingleLane(Program& program) {
 					replaced++;
 					break;
 				}
-				case ValueOpcode::ReadFirstLane:
+				case ValueOpcode::ReadFirstLane: {
+					// Each invocation reads its own value. That is exact for a value every lane
+					// holds, and for the usual loop that takes one lane's value at a time. Only a
+					// value broadcast from the first lane to the others comes out different.
+					// Which one this read is cannot be seen here: it is reported, once per shader.
+					const auto* source = inst.Arg(0).Resolve().TryInstruction();
+					if (!reported && source != nullptr && per_invocation.contains(source)) {
+						reported = true;
+						ReportFirstLaneRead(program);
+					}
 					inst.ReplaceUsesWith(inst.Arg(0));
 					replaced++;
 					break;
+				}
 				case ValueOpcode::LaneId:
 					inst.ReplaceUsesWith(Value(0u));
 					replaced++;

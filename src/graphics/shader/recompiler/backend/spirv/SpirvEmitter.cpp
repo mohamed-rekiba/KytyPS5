@@ -34,14 +34,30 @@ uint32_t HostStageBit(ShaderType stage, bool mesh_emulated = false) {
 	}
 }
 
+// The host has subgroup operations in the stage. The vertex support of
+// DriverFaults::vertex_subgroups_unreported is measured for vertex functions only, not for the
+// vertex stage of a tessellation pipeline.
+bool StageHasSubgroups(ShaderType stage, const HostGpu& host, bool mesh_emulated = false) {
+	if (stage == ShaderType::Local && host.faults.vertex_subgroups_unreported) {
+		return false;
+	}
+	return (host.capabilities.subgroup_supported_stages & HostStageBit(stage, mesh_emulated)) != 0u;
+}
+
 } // namespace
 
 bool UsesSingleLaneModel(ShaderType stage, const HostGpu& host) {
 	const bool one_lane_per_invocation = stage == ShaderType::Vertex ||
 	                                     stage == ShaderType::Local ||
 	                                     stage == ShaderType::TessellationEvaluation;
-	return one_lane_per_invocation &&
-	       (host.capabilities.subgroup_supported_stages & HostStageBit(stage)) == 0u;
+	return one_lane_per_invocation && !StageHasSubgroups(stage, host);
+}
+
+bool LaneIndexFromScan(ShaderType stage, const HostGpu& host) {
+	const bool vertex_stage = stage == ShaderType::Vertex || stage == ShaderType::Local ||
+	                          stage == ShaderType::TessellationEvaluation;
+	return host.faults.vertex_subgroups_unreported && vertex_stage &&
+	       !UsesSingleLaneModel(stage, host);
 }
 
 std::optional<MissingCapability> FindMissingCapability(const IR::Program& program,
@@ -65,9 +81,6 @@ std::optional<MissingCapability> FindMissingCapability(const IR::Program& progra
 	                        [](const IR::ImageResource& image) { return image.atomic64; })) {
 		return MissingCapability {"64-bit image atomics", "shaderImageInt64Atomics"};
 	}
-	if (!caps.float64 && requirements.float64) {
-		return MissingCapability {"64-bit floating point", "shaderFloat64"};
-	}
 	if (!caps.compute_derivatives && requirements.compute_derivatives &&
 	    program.stage == ShaderType::Compute) {
 		return MissingCapability {"derivatives in a compute shader", "computeDerivativeGroupQuads"};
@@ -79,9 +92,13 @@ std::optional<MissingCapability> FindMissingCapability(const IR::Program& progra
 	const bool single_lane =
 	    UsesSingleLaneModel(program.stage, host) && !requirements.subgroup_barrier;
 	if (subgroups && !single_lane &&
-	    (caps.subgroup_supported_stages & HostStageBit(program.stage, program.mesh_emulated)) ==
-	        0u) {
+	    !StageHasSubgroups(program.stage, host, program.mesh_emulated)) {
 		return MissingCapability {"subgroup operations in this stage", "subgroupSupportedStages"};
+	}
+	// One invocation is not a wave: DS_ORDERED_COUNT would add once per invocation.
+	if (program.uses_ordered_count && UsesSingleLaneModel(program.stage, host)) {
+		return MissingCapability {"DS_ORDERED_COUNT without subgroup operations in this stage",
+		                          "subgroupSupportedStages"};
 	}
 	if (subgroups && !single_lane) {
 		// VkSubgroupFeatureFlagBits: basic 0x1, ballot 0x8, shuffle 0x10.
@@ -89,13 +106,20 @@ std::optional<MissingCapability> FindMissingCapability(const IR::Program& progra
 		    (requirements.subgroup_local_invocation_id || requirements.subgroup_barrier ? 0x1u
 		                                                                                : 0u) |
 		    (requirements.subgroup_ballot ? 0x8u : 0u) |
-		    (requirements.subgroup_shuffle ? 0x10u : 0u);
+		    (requirements.subgroup_shuffle ? 0x10u : 0u) |
+		    // arithmetic 0x4, for a lane index from a scan
+		    (requirements.subgroup_local_invocation_id && LaneIndexFromScan(program.stage, host)
+		         ? 0x4u
+		         : 0u);
 		if ((caps.subgroup_supported_operations & operations) != operations) {
-			return MissingCapability {"a subgroup operation (lane id, ballot or shuffle)",
+			return MissingCapability {"a subgroup operation (lane id, ballot, shuffle or scan)",
 			                          "subgroupSupportedOperations"};
 		}
 	}
-	if (!caps.cull_distance &&
+	// An emulated mesh program writes its cull distances to the record buffer, and the replay
+	// shader rejects the primitives itself: no host cull distances.
+	const bool replays_cull = program.stage == ShaderType::Mesh && program.mesh_emulated;
+	if (!caps.cull_distance && !replays_cull &&
 	    std::ranges::any_of(program.info.outputs, [](const IR::StageOutput& output) {
 		    return output.kind == IR::StageOutputKind::CullDistance;
 	    })) {

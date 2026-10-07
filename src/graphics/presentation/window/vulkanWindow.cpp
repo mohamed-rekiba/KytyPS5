@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/vertexSubgroupProbe.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -191,6 +192,7 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	}
 	facts.driver =
 	    properties12.driverID == vk::DriverId::eMoltenvk ? HostDriver::MoltenVk : HostDriver::Other;
+	facts.apple_gpu = properties2.properties.vendorID == 0x106bu;
 	facts.subgroup_supported_stages =
 	    static_cast<vk::ShaderStageFlags::MaskType>(properties11.subgroupSupportedStages);
 	facts.subgroup_supported_operations =
@@ -237,6 +239,10 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	facts.synchronization2            = features13.synchronization2 == VK_TRUE;
 
 	facts.color_write_enable          = color_write.colorWriteEnable == VK_TRUE;
+	facts.packed_scaled_vertex_format =
+	    static_cast<bool>(device.getFormatProperties(vk::Format::eA2B10G10R10UscaledPack32)
+	                          .bufferFeatures &
+	                      vk::FormatFeatureFlagBits::eVertexBuffer);
 	facts.depth_clip_control          = depth_clip_control.depthClipControl == VK_TRUE;
 	facts.depth_clip_enable           = depth_clip_enable.depthClipEnable == VK_TRUE;
 	facts.image_view_min_lod          = min_lod.minLod == VK_TRUE;
@@ -1045,6 +1051,17 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+
+	// The vertex subgroup operations the driver does not report work only after this device has
+	// run them (see vertexSubgroupProbe.h).
+	if (graphic_ctx.host.faults.vertex_subgroups_unreported) {
+		const bool confirmed = ProbeVertexSubgroups(graphic_ctx);
+		ApplyVertexSubgroupProbe(graphic_ctx.host, confirmed);
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Host GPU: vertex subgroup operations {}\n",
+		    confirmed ? "passed their probe: a vertex wave is one SIMD group"
+		              : "failed their probe: a vertex wave is one vertex"));
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

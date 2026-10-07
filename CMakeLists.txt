@@ -438,6 +438,17 @@ add_executable(video_out_resolution_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(video_out_resolution_tests PRIVATE ${inc_headers})
 
+add_executable(cache_folder_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CacheFolderTests.cpp"
+)
+target_include_directories(cache_folder_tests PRIVATE ${inc_headers})
+
+add_executable(file_lock_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FileLockTests.cpp"
+)
+target_include_directories(file_lock_tests PRIVATE ${inc_headers})
+target_link_libraries(file_lock_tests common)
+
 add_executable(host_lowering_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/HostLoweringTests.cpp"
 )
@@ -478,6 +489,11 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
+
+add_executable(soft_float64_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SoftFloat64Tests.cpp"
+)
+target_include_directories(soft_float64_tests PRIVATE ${inc_headers})
 
 add_executable(program_list_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ProgramListTests.cpp"
@@ -676,6 +692,8 @@ if(BUILD_TESTING)
 	add_test(NAME submit_plan COMMAND $<TARGET_FILE:submit_plan_tests>)
 	add_test(NAME depth_snapshot_plan COMMAND $<TARGET_FILE:depth_snapshot_plan_tests>)
 	add_test(NAME video_out_resolution COMMAND $<TARGET_FILE:video_out_resolution_tests>)
+	add_test(NAME cache_folder COMMAND $<TARGET_FILE:cache_folder_tests>)
+	add_test(NAME file_lock COMMAND $<TARGET_FILE:file_lock_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME metadata_fill COMMAND $<TARGET_FILE:metadata_fill_tests>)
 	add_test(NAME fence_retirement COMMAND $<TARGET_FILE:fence_retirement_tests>)
@@ -687,6 +705,7 @@ if(BUILD_TESTING)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME program_list COMMAND $<TARGET_FILE:program_list_tests>)
+	add_test(NAME soft_float64 COMMAND $<TARGET_FILE:soft_float64_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -761,6 +780,8 @@ if(BUILD_TESTING)
 		submit_plan_tests
 		depth_snapshot_plan_tests
 		video_out_resolution_tests
+		cache_folder_tests
+		file_lock_tests
 		image_page_table_tests
 		metadata_fill_tests
 		fence_retirement_tests
@@ -772,6 +793,7 @@ if(BUILD_TESTING)
 		bit_array_tests
 		lru_cache_tests
 		program_list_tests
+		soft_float64_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests

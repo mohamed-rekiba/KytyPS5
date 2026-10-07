@@ -8,6 +8,7 @@ namespace {
 
 using Libs::Graphics::PlanSubmit;
 using Libs::Graphics::SUBMIT_AGE_LIMIT_US;
+using Libs::Graphics::SUBMIT_OPERATION_LIMIT;
 using Libs::Graphics::SUBMIT_WORK_LIMIT;
 using Libs::Graphics::SubmitReason;
 using Libs::Graphics::SubmitState;
@@ -83,9 +84,28 @@ void TestReasonsInOrder() {
 	      "work without a recorded command is a contradiction and submits nothing");
 }
 
+void TestManyDeferredOperationsSubmit() {
+	Check(PlanSubmit({.open_operations = SUBMIT_OPERATION_LIMIT - 1, .open_used = true}) ==
+	          SubmitReason::None,
+	      "below the operation limit the buffer stays open");
+	Check(PlanSubmit({.open_operations = SUBMIT_OPERATION_LIMIT, .open_used = true}) ==
+	          SubmitReason::Operations,
+	      "the operation limit submits: the operations wait for this submission");
+	Check(PlanSubmit({.open_operations = SUBMIT_OPERATION_LIMIT}) == SubmitReason::Operations,
+	      "an empty command buffer also goes, so that its operations can run");
+	Check(PlanSubmit({.open_work      = SUBMIT_WORK_LIMIT,
+	                  .open_operations = SUBMIT_OPERATION_LIMIT,
+	                  .open_used      = true}) == SubmitReason::Operations,
+	      "the operation limit comes before the work limit");
+	Check(PlanSubmit({.open_operations = SUBMIT_OPERATION_LIMIT, .about_to_wait = true}) ==
+	          SubmitReason::Idle,
+	      "the thread's wait comes before the operation limit");
+}
+
 } // namespace
 
 int main() {
+	TestManyDeferredOperationsSubmit();
 	TestReasonsInOrder();
 	TestAnEmptyCommandBufferIsNeverSubmitted();
 	TestAFewDrawsAreHeldBack();

@@ -15,6 +15,7 @@ using Libs::Graphics::PipelineRecord;
 using Libs::Graphics::ReadPipelineRecords;
 using Libs::Graphics::ProgramRecord;
 using Libs::Graphics::ReadProgramRecords;
+using Libs::Graphics::RecordLastOffset;
 
 void Check(bool value, const char* message) {
 	if (!value) {
@@ -116,12 +117,35 @@ void TestDamagedRecord() {
 
 } // namespace
 
+// A field added into padding keeps the size of a struct. The list's signature must still change:
+// records from the old layout put each later field's byte in the wrong place.
+struct LayoutBefore {
+	uint32_t value = 0;
+	bool     first = false;
+	bool     last  = false;
+};
+struct LayoutAfter {
+	uint32_t value = 0;
+	bool     first = false;
+	bool     added = false;
+	bool     last  = false;
+};
+
+void TestLayoutChangeInPadding() {
+	static_assert(sizeof(LayoutBefore) == sizeof(LayoutAfter));
+	Check(RecordLastOffset(&LayoutBefore::last) != RecordLastOffset(&LayoutAfter::last),
+	      "a field added into padding left the layout unchanged");
+	Check(RecordLastOffset(&LayoutBefore::last) == 5 && RecordLastOffset(&LayoutBefore::value) == 0,
+	      "a member offset is wrong");
+}
+
 int main() {
 	TestRoundTrip();
 	TestEqualRecordsGiveEqualBytes();
 	TestCutOffTail();
 	TestDamagedRecord();
 	TestPipelineRoundTrip();
+	TestLayoutChangeInPadding();
 	std::puts("ProgramListTests: all cases passed");
 	return 0;
 }
