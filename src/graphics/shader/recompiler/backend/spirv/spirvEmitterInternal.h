@@ -76,6 +76,8 @@ struct SpirvRequirements {
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
 	bool float64                      = false;
+	// The shader moves an append or consume counter.
+	bool append_consume = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
@@ -158,6 +160,8 @@ struct EmitterState {
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
+	// gl_HelperInvocation, in a pixel shader that moves an append or consume counter.
+	uint32_t                                       helper_invocation_variable            = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
 	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;

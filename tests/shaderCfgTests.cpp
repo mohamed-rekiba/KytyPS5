@@ -8113,6 +8113,39 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// One lane moves an append counter for all the lanes of its subgroup. In a pixel shader a lane may
+// be a helper pixel, whose atomic changes nothing and returns no defined value: the lane that
+// moves the counter is chosen among the real pixels.
+void TestPixelAppendIsDoneByARealPixel() {
+  constexpr uint32_t kBuiltInHelperInvocation = 23u;
+  const uint32_t shader[] = {
+      EncodeSMovB32(124, 129), // m0 = one counter
+      EncodeDs0(0x3e),         // ds_append
+      EncodeDs1(0, 0, 0),
+      EncodeExp0(0x00, 0xf),
+      EncodeExp1(0, 0, 0, 0),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo pixel{};
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  const auto result = RecompileForTest(shader, options);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvHasDecorationValue(result.spirv, 11u, kBuiltInHelperInvocation),
+        "a pixel shader that appends does not know which lanes are helper pixels");
+  Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%gl_HelperInvocation") &&
+            SpirvInstructionOpcodeCount(result.spirv, 339u) >= 2u,
+        "the appending lane is not chosen from a ballot of the real pixels");
+
+  // No other stage has helper lanes.
+  const uint32_t compute_shader[] = {EncodeSMovB32(124, 129), EncodeDs0(0x3e),
+                                     EncodeDs1(0, 0, 0), 0xbf810000u};
+  const auto compute =
+      RecompileForTest(compute_shader, MakeCompileOptions(ShaderType::Compute));
+  Check(!SpirvHasDecorationValue(compute.spirv, 11u, kBuiltInHelperInvocation),
+        "a compute shader asked for helper pixels");
+}
+
 void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(124, 129), // m0 = one counter
@@ -10160,6 +10193,34 @@ void TestCoherentLoadOnAHostThatReusesVolatileLoads() {
   const auto other = RecompileForTest(plain_shader, options);
   Check(SpirvInstructionOpcodeCount(other.spirv, kOpAtomicLoad) == 0u,
         "a load without GLC became atomic");
+}
+
+// A legacy multiply-add rounds its product before the add. The translation keeps the two apart
+// with a denormal flush on the product's bits, and marks them NoContraction. On a host where the
+// mark is slow it is left out: the flush alone keeps a compiler from fusing them.
+void TestMadWithoutTheNoContractionMarkWhereItIsSlow() {
+  const uint32_t shader[] = {
+      0xd5410004u, 0x20121301u, // v_mad_f32 v4, -v1, v9, s4
+      EncodeVop1(0x01, 0, 4 + 256), // v_mov_b32 v0, v4
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0), // position
+      EncodeSopp(0x01),
+  };
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  const auto marked = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(marked.spirv);
+  Check(DisassembleSpirvBinary(marked.spirv).find("NoContraction") != std::string::npos,
+        "a legacy multiply-add lost its NoContraction marks on an ordinary host");
+
+  options.host.faults.no_contraction_is_slow = true;
+  const auto plain = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(plain.spirv);
+  const auto source = DisassembleSpirvBinary(plain.spirv);
+  Check(source.find("NoContraction") == std::string::npos,
+        "a legacy multiply-add kept the slow mark");
+  // Still a multiply and an add, with bit work between them, and no fused operation.
+  Check(source.find("OpFMul") != std::string::npos && source.find("OpFAdd") != std::string::npos &&
+            source.find(" Fma ") == std::string::npos,
+        "a legacy multiply-add is no longer a separate multiply and add");
 }
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
@@ -15401,6 +15462,7 @@ int main() {
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
+  TestPixelAppendIsDoneByARealPixel();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
   TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
@@ -15447,6 +15509,7 @@ int main() {
   TestComputeDispatchWaveSize();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestCoherentLoadOnAHostThatReusesVolatileLoads();
+  TestMadWithoutTheNoContractionMarkWhereItIsSlow();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestHostFeaturesGateUnavailableCapabilities();

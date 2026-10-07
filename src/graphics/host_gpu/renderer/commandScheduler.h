@@ -29,6 +29,12 @@ public:
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
 	void           Finish();
+	// The open submission writes buffer memory that the CPU will read (see readbackPlan.h). The
+	// submission then ends with the barrier that makes those writes visible to the CPU.
+	void NoteWriteTheCpuReads() noexcept { m_cpu_reads_writes = true; }
+	// Waits until the host GPU has finished a submission that was made before. Any thread. False
+	// when the device no longer answers (the emulator is shutting down).
+	[[nodiscard]] bool WaitSubmitted(uint64_t tick) noexcept { return m_master.TryWait(tick); }
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
@@ -40,6 +46,9 @@ public:
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
+	// The same, also while no guest context is bound: a resource that is destroyed then, for
+	// example when the guest unmaps memory, is held by the submissions in flight like any other.
+	void                      DeferDestruction(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
@@ -77,6 +86,9 @@ private:
 
 	enum class OperationState { Open, Draining, Closed };
 
+	// Pending operations hold resources; past this many the scheduler waits for the GPU.
+	static constexpr size_t MaxPendingOperations = 4096;
+
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
@@ -85,7 +97,12 @@ private:
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
+	// Without the check that the scheduler is active: a destruction can also be deferred while it
+	// shuts down.
+	void QueueOperationInAnyState(Common::UniqueFunction<void>&& operation, bool priority);
+	bool m_cpu_reads_writes = false;
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+	void RetireCallbackState(Common::UniqueFunction<void>&& callback);
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;

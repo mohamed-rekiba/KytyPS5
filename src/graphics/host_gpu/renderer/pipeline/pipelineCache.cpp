@@ -516,7 +516,7 @@ struct PipelineCache::ProgramCache {
 	uint64_t HostWords() const {
 		const auto& c = host.capabilities;
 		const auto& f = host.faults;
-		static_assert(sizeof(HostCapabilities) == 24 && sizeof(DriverFaults) == 5,
+		static_assert(sizeof(HostCapabilities) == 24 && sizeof(DriverFaults) == 6,
 		              "a host field was added: add it to the list signature");
 		const uint32_t words[] = {
 		    c.image_view_min_lod,
@@ -539,6 +539,7 @@ struct PipelineCache::ProgramCache {
 		    f.no_per_vertex_inputs,
 		    f.no_centroid_barycentric,
 		    f.volatile_loads_are_reused,
+		    f.no_contraction_is_slow,
 		    f.pipeline_cache_load_is_slow,
 		};
 		return XXH3_64bits(words, sizeof(words));

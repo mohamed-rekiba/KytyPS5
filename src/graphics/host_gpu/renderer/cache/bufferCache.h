@@ -10,8 +10,11 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/writeWatchSet.h"
 
 #include <map>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -51,6 +54,13 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Gives the whole range new bytes, on the GPU thread. Unlike InvalidateMemory followed by a
+	// write, the bytes the GPU wrote there are not fetched first.
+	void ReplaceMemory(uint64_t vaddr, const void* data, uint64_t size);
+	// A CPU write faulted at `fault_vaddr`. Unprotects the whole aligned window around it when no
+	// page in the window holds GPU-modified data, so a run of writes costs one fault, not one per
+	// page. Pages the CPU did not write count as written, and the next GPU use uploads them.
+	void                   InvalidateWrittenMemory(uint64_t fault_vaddr, bool window_is_mapped);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
@@ -79,7 +89,29 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Moves into `ranges` the guest ranges that gained bytes the GPU has not seen since the last
+	// call: CPU write faults and new buffers. False when the log overflowed or a full pass was
+	// requested; the caller must then synchronize every buffer.
+	[[nodiscard]] bool TakeCpuWrites(std::vector<GuestRange>& ranges);
+	void               RequestFullSynchronization();
+	// A shader that writes through device addresses is being prepared. It can write any buffer,
+	// so it counts as a write of every buffer for a read-back (see readbackPlan.h).
+	void NoteAddressWrites() noexcept;
+	// The draw or dispatch that the buffers were prepared for has been recorded, or given up.
+	// Until this call a buffer that was prepared for writing counts as written by a command
+	// that is still to come: a submission can happen between preparation and recording.
+	void SettleGpuWrites() noexcept;
+	// Every CPU or GPU write that touches a watched range gives it a new generation. Writers of
+	// guest memory that do not go through the buffer cache, such as image downloads, notify it
+	// themselves.
+	[[nodiscard]] WriteWatchSet& WriteWatches() noexcept { return m_write_watches; }
 	void               ProcessFaultBuffer();
+	// Between Begin and End, uploads share one barrier before the first copy and one after the
+	// last. A barrier between two copies makes the Metal backend start a new blit encoder for
+	// each copy; a run of copies with nothing in between shares one. No draw or dispatch may be
+	// recorded inside a batch.
+	void               BeginUploadBatch();
+	void               EndUploadBatch();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
@@ -117,6 +149,16 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	static constexpr size_t  MaxCpuWriteLog = 4096;
+	// Records a range for TakeCpuWrites.
+	void RecordCpuWrite(uint64_t vaddr, uint64_t size);
+	// GPU thread. One round of a read-back, by the rule of readbackPlan.h. Returns the submission
+	// the caller must wait for before it asks again, or nothing when guest memory is current.
+	[[nodiscard]] std::optional<uint64_t> ReadBack(uint64_t vaddr, uint64_t size, bool is_write,
+	                                               bool caller_can_wait);
+	// Copies the GPU-written bytes of the range from the buffer's memory to guest memory. The
+	// last GPU-side write of the buffer must have finished.
+	[[nodiscard]] bool PublishFromBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -131,7 +173,22 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	uint64_t                                          m_address_write_tick = 0;
+	// Prepared for a GPU write that is not recorded yet. See SettleGpuWrites.
+	static constexpr size_t                           MaxUnsettledWriters = 256;
+	std::vector<BufferId>                             m_unsettled_writers;
+	bool                                              m_unsettled_everywhere = false;
+	// Only tests set this: it keeps the copy path covered on a device where the CPU can read
+	// buffer memory.
+	bool                                              m_read_back_through_gpu = false;
 	MemoryTracker                                     m_memory_tracker;
+	WriteWatchSet                                      m_write_watches;
+	// See TakeCpuWrites. Written by the fault thread and the GPU thread.
+	bool                                              m_upload_batch_open    = false;
+	bool                                              m_upload_batch_started = false;
+	std::mutex                                        m_cpu_write_log_mutex;
+	std::vector<GuestRange>                           m_cpu_write_log;
+	bool                                              m_cpu_writes_need_full_pass = true;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

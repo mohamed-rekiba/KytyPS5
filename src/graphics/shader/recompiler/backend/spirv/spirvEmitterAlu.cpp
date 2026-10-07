@@ -120,13 +120,39 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 
 } // namespace
 
+namespace {
+
+// Keeps a compiler from merging the operation with a neighbour. On a host where the mark is slow
+// it is left out, and the caller says why the result is exact without it.
+void MarkNoContraction(EmitterState& state, uint32_t result) {
+	if (!state.host.faults.no_contraction_is_slow) {
+		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	}
+}
+
+} // namespace
+
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto result = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
-	state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	// Without the mark: a fused multiply-add is one operation already, and has no part a compiler
+	// could merge with a neighbour.
+	MarkNoContraction(state, result);
 	return result;
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	if (state.host.faults.no_contraction_is_slow) {
+		// The marks below are slow on this host. So the product goes to the sum through the
+		// denormal flush of legacy MAD/MAC, which works on its bits, and the operands come out of
+		// the same flush. No multiply then feeds an add directly, and there is nothing for a
+		// compiler to fuse.
+		a = EmitFlushF32DenormToSignedZero(state, a);
+		b = EmitFlushF32DenormToSignedZero(state, b);
+		c = EmitFlushF32DenormToSignedZero(state, c);
+		const auto product = EmitFPMul32(state, a, b);
+		const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
+		return EmitFlushF32DenormToSignedZero(state, sum);
+	}
 	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
 	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
 	// a = EmitFlushF32DenormToSignedZero(state, a);

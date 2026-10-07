@@ -406,6 +406,16 @@ add_executable(device_suitability_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(device_suitability_tests PRIVATE ${inc_headers})
 
+add_executable(write_heat_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/WriteHeatTests.cpp"
+)
+target_include_directories(write_heat_tests PRIVATE ${inc_headers})
+
+add_executable(readback_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ReadbackPlanTests.cpp"
+)
+target_include_directories(readback_plan_tests PRIVATE ${inc_headers})
+
 add_executable(host_lowering_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/HostLoweringTests.cpp"
 )
@@ -584,6 +594,15 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+add_executable(metadata_fill_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MetadataFillTests.cpp"
+)
+target_include_directories(metadata_fill_tests PRIVATE ${inc_headers})
+add_executable(fence_retirement_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FenceRetirementTests.cpp"
+)
+target_include_directories(fence_retirement_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -635,7 +654,11 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME device_suitability COMMAND $<TARGET_FILE:device_suitability_tests>)
 	add_test(NAME host_lowering COMMAND $<TARGET_FILE:host_lowering_tests>)
+	add_test(NAME write_heat COMMAND $<TARGET_FILE:write_heat_tests>)
+	add_test(NAME readback_plan COMMAND $<TARGET_FILE:readback_plan_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
+	add_test(NAME metadata_fill COMMAND $<TARGET_FILE:metadata_fill_tests>)
+	add_test(NAME fence_retirement COMMAND $<TARGET_FILE:fence_retirement_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
@@ -716,7 +739,11 @@ if(BUILD_TESTING)
 		scalar_provenance_tests
 		device_suitability_tests
 		host_lowering_tests
+		write_heat_tests
+		readback_plan_tests
 		image_page_table_tests
+		metadata_fill_tests
+		fence_retirement_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests

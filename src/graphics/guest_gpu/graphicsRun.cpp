@@ -134,6 +134,29 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	done.acquire();
 }
 
+bool GuestGpu::TrySendCommandSync(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (IsGpuThread()) {
+		command();
+		return true;
+	}
+	std::binary_semaphore done {0};
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		if (!m_accepting) {
+			return false;
+		}
+		m_commands.push_back([operation = std::move(command), &done]() mutable {
+			operation();
+			done.release();
+		});
+		m_pending_commands.fetch_add(1, std::memory_order_release);
+		m_work_available.Signal();
+	}
+	done.acquire();
+	return true;
+}
+
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
                       std::span<const uint32_t> constant_commands) {
 	if (draw_commands.empty()) {
@@ -750,6 +773,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		// Whatever the packet prepared buffers for has been recorded by now.
+		m_renderer.GetBufferCache().SettleGpuWrites();
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -1233,18 +1258,7 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
-
-	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
-	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-
-	vk::DependencyInfo dependency {};
-	dependency.memoryBarrierCount = 1;
-	dependency.pMemoryBarriers    = &barrier;
-	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	CurrentBuffer().RequestGlobalBarrier();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

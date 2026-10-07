@@ -123,6 +123,39 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+namespace {
+
+constexpr auto DataWriteAccess = vk::AccessFlagBits2::eTransferWrite |
+                                 vk::AccessFlagBits2::eShaderWrite |
+                                 vk::AccessFlagBits2::eMemoryWrite;
+
+// Layouts in which every aspect a sampler may read is read-only.
+[[nodiscard]] bool SampledAspectsAreReadOnly(vk::ImageLayout layout) {
+	return layout == vk::ImageLayout::eShaderReadOnlyOptimal ||
+	       layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+	       layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal ||
+	       layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
+}
+
+// A new use of an image in the layout it already has, where neither the earlier uses nor the new
+// one write the aspects a sampler reads: an attachment use and a sampler read then do not depend
+// on each other. No barrier is needed and the accesses add up. Without this, a read-only depth
+// buffer that is tested and sampled by alternate draws gets a barrier, and so a new render pass,
+// on every draw.
+template <typename State>
+[[nodiscard]] bool JoinWithoutBarrier(State& state, vk::ImageLayout layout, vk::AccessFlags2 access,
+                                      vk::PipelineStageFlags2 stage) {
+	if (state.layout != layout || !SampledAspectsAreReadOnly(layout) ||
+	    static_cast<bool>((state.access_mask | access) & DataWriteAccess)) {
+		return false;
+	}
+	state.access_mask |= access;
+	state.pl_stage |= stage;
+	return true;
+}
+
+} // namespace
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
@@ -160,6 +193,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				                              vk::AccessFlagBits2::eMemoryWrite;
 				const bool     repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access);
+				if (JoinWithoutBarrier(subresource_state, destination_layout, destination_access,
+				                       destination_stage)) {
+					continue;
+				}
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -193,6 +230,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    !repeated_write) {
+			return {};
+		}
+		if (JoinWithoutBarrier(state, destination_layout, destination_access, destination_stage)) {
 			return {};
 		}
 

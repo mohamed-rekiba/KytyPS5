@@ -160,6 +160,11 @@ struct BufferCacheTestAccess {
     cache.m_critical_gc_memory = critical;
   }
 
+  // The copy path of a read-back, also where the CPU can read buffer memory.
+  static void ReadBackThroughGpu(BufferCache &cache, bool enabled) {
+    cache.m_read_back_through_gpu = enabled;
+  }
+
   static StreamBuffer &DownloadBuffer(BufferCache &cache) {
     return cache.m_download_buffer;
   }
@@ -2235,6 +2240,9 @@ public:
             scheduler.CurrentTick() == first_tick + 1 &&
                 scheduler.IsFree(first_tick) && completed == 0,
             "timeline wait released a resource in the middle of an operation");
+    // The timeline semaphore can signal before the submission's fence; a deferred operation
+    // runs only once the fence says the submission retired (see masterSemaphore.h).
+    scheduler.GetMasterSemaphore().WaitRetired(first_tick);
     scheduler.PopPendingOperations();
     Require("SchedulerTimeline", "first tick", completed == 1,
             "operation boundary did not release its deferred operation");
@@ -2263,6 +2271,7 @@ public:
             scheduler.CurrentTick() == implicit_flush_tick + 1 &&
                 scheduler.IsFree(implicit_flush_tick) && completed == 2,
             "waiting for the current tick released a deferred resource");
+    scheduler.GetMasterSemaphore().WaitRetired(implicit_flush_tick);
     scheduler.PopPendingOperations();
     Require("SchedulerTimeline", "implicit boundary", completed == 3,
             "operation boundary did not release the implicit tick callback");
@@ -3438,6 +3447,74 @@ public:
             "fixed processor-fault allocation failed");
     resources.MapMemory(fault_base, fault_size);
 
+    // A guest thread reads back a GPU write that is still in the open
+    // submission. That thread does the waiting; the GPU thread stays free.
+    // An older guest-memory callback is held here to keep the read-back
+    // waiting long enough to see that.
+    {
+      constexpr uint64_t waited_address = fault_base + 0xe000;
+      constexpr uint32_t waited_stale = 0x600dcafeu;
+      constexpr uint32_t waited_value = 0x0c0ffee0u;
+      auto &cache = resources.GetBufferCache();
+      Libs::LibKernel::Memory::WriteBacking(waited_address, &waited_stale,
+                                            sizeof(waited_stale));
+      std::binary_semaphore callback_entered{0};
+      std::binary_semaphore release_callback{0};
+      bool waited_cpu_readable = false;
+      gpu.SendCommandSync([&] {
+        scheduler.DeferPriorityOperation([&] {
+          callback_entered.release();
+          release_callback.acquire();
+        });
+        // Bound for writing first: a fill of memory the GPU does not own is
+        // done on the CPU.
+        (void)cache.ObtainBuffer(waited_address, sizeof(waited_value), true,
+                                 false);
+        cache.FillBuffer(waited_address, sizeof(waited_value), waited_value,
+                         false);
+        cache.SettleGpuWrites();
+        waited_cpu_readable =
+            !cache.GetBuffer(cache.FindBuffer(waited_address,
+                                              sizeof(waited_value)))
+                 .Mapped()
+                 .empty();
+      });
+      std::atomic<bool> readback_returned{false};
+      std::jthread reader([&] {
+        cache.ReadMemory(waited_address, sizeof(waited_value));
+        readback_returned = true;
+      });
+      const bool write_submitted =
+          callback_entered.try_acquire_for(std::chrono::seconds(5));
+      Require("GpuCommandLane", "read-back submits the open write",
+              write_submitted,
+              "a read-back did not submit the write it waits for");
+      std::binary_semaphore gpu_thread_answered{0};
+      std::jthread probe([&] {
+        gpu.SendCommandSync([] {});
+        gpu_thread_answered.release();
+      });
+      const bool gpu_thread_free =
+          gpu_thread_answered.try_acquire_for(std::chrono::seconds(2));
+      const bool returned_early = readback_returned.load();
+      release_callback.release();
+      reader.join();
+      probe.join();
+      uint32_t waited_backing = 0;
+      Libs::LibKernel::Memory::TryReadBacking(waited_address, &waited_backing,
+                                              sizeof(waited_backing));
+      Require("GpuCommandLane", "read-back of a write in flight",
+              !returned_early && waited_backing == waited_value &&
+                  !cache.HasGpuDirtyBytes(waited_address,
+                                          sizeof(waited_value)),
+              "a read-back returned before the older guest-memory callback, "
+              "or without the GPU's value");
+      Require("GpuCommandLane", "read-back leaves the GPU thread free",
+              !waited_cpu_readable || gpu_thread_free,
+              "the GPU thread waited for the host GPU on behalf of a guest "
+              "thread although the CPU can read the buffer's memory");
+    }
+
     constexpr uint64_t immediate_dst = fault_base + 0x1000;
     constexpr uint64_t immediate_memory_dst = fault_base + 0x2000;
     constexpr uint64_t memory_src = fault_base + 0x4000;
@@ -4039,6 +4116,9 @@ public:
       auto &resources = context;
       auto &cache = resources.GetBufferCache();
       resources.MapMemory(base, allocation_size);
+      // The checks below are about the download ring, so they take the copy
+      // path on every device.
+      BufferCacheTestAccess::ReadBackThroughGpu(cache, true);
 
       const auto MarkGpuWrite = [&](uint64_t address, uint64_t size) {
         auto allocation = cache.ObtainBuffer(address, size, true, false);
@@ -4449,6 +4529,62 @@ public:
                   !cache.IsRegionGpuModified(base + page_outside_offset,
                                              sizeof(page_value)),
               "the next page did not publish and release ownership on its own read");
+
+      // A write the host GPU has finished is read back from the buffer's own
+      // memory where the CPU can read it: no submission, so no wait for
+      // whatever else has been recorded since.
+      // The page after it keeps its GPU bytes to itself, as on the copy path.
+      BufferCacheTestAccess::ReadBackThroughGpu(cache, false);
+      constexpr uint32_t finished_value = 0x0badf00du;
+      for (const auto offset : {page_fault_offset, page_outside_offset}) {
+        MarkGpuWrite(base + offset, sizeof(finished_value));
+        cache.FillBuffer(base + offset, sizeof(finished_value), finished_value,
+                         false);
+      }
+      // What a packet handler's return does in the emulator.
+      cache.SettleGpuWrites();
+      scheduler.Finish();
+      const bool finished_cpu_readable =
+          !cache.GetBuffer(cache.FindBuffer(base + page_fault_offset,
+                                            sizeof(finished_value)))
+               .Mapped()
+               .empty();
+      const auto finished_tick = scheduler.CurrentTick();
+      cache.ReadMemory(base + page_fault_offset, sizeof(finished_value));
+      uint32_t finished_backing = 0;
+      Libs::LibKernel::Memory::TryReadBacking(base + page_fault_offset,
+                                              &finished_backing,
+                                              sizeof(finished_backing));
+      Require(name, "finished write read back",
+              finished_backing == finished_value &&
+                  !cache.HasGpuDirtyBytes(base + page_fault_offset,
+                                          sizeof(finished_value)) &&
+                  !cache.IsRegionGpuModified(base + page_fault_offset,
+                                             sizeof(finished_value)),
+              "a finished GPU write did not reach guest memory");
+      Require(name, "finished write read back without a submission",
+              !finished_cpu_readable ||
+                  scheduler.CurrentTick() == finished_tick,
+              "the read-back of a finished write submitted the open command "
+              "buffer although the CPU can read the buffer's memory");
+      Libs::LibKernel::Memory::TryReadBacking(base + page_outside_offset,
+                                              &page_outside_backing,
+                                              sizeof(page_outside_backing));
+      Require(name, "finished write of the next page stays unpublished",
+              page_outside_backing == page_value &&
+                  cache.HasGpuDirtyBytes(base + page_outside_offset,
+                                         sizeof(finished_value)),
+              "a read-back published a page that was not asked for");
+      cache.ReadMemory(base + page_outside_offset, sizeof(finished_value));
+      Libs::LibKernel::Memory::TryReadBacking(base + page_outside_offset,
+                                              &page_outside_backing,
+                                              sizeof(page_outside_backing));
+      Require(name, "finished write of the next page read back",
+              page_outside_backing == finished_value &&
+                  !cache.HasGpuDirtyBytes(base + page_outside_offset,
+                                          sizeof(finished_value)),
+              "the next page did not publish on its own read");
+      BufferCacheTestAccess::ReadBackThroughGpu(cache, true);
 
       Libs::LibKernel::Memory::WriteBacking(base + first_offset, &first_stale,
                                             sizeof(first_stale));
