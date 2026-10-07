@@ -978,6 +978,9 @@ void EnsureConfigInitialized() {
     subsystems.Initialize<Config::Lifecycle>();
     Config::ConfigOptions options;
     options.printf_direction = Config::LogDirection::Silent;
+    // The checks read exact pixels: a draw waits for its pipeline, never left out while it is
+    // built on a worker thread.
+    options.pipeline_wait_enabled = true;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
@@ -2093,6 +2096,17 @@ public:
     m_not_run_cases++;
     std::printf("[%s] %-32s not run on this device: needs %s (%s)\n", kind, name,
                 missing->need, missing->name);
+    return true;
+  }
+  // The same for a case that needs a device feature the renderer checks itself.
+  [[nodiscard]] bool CannotRun(const char *kind, const char *name, bool available,
+                               const char *need, const char *feature) {
+    if (available) {
+      return false;
+    }
+    m_not_run_cases++;
+    std::printf("[%s] %-32s not run on this device: needs %s (%s)\n", kind, name, need,
+                feature);
     return true;
   }
   [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
@@ -4830,10 +4844,14 @@ public:
                   !cache.IsRegionRegistered(
                       base + starvation_offset +
                           (starvation_count - 1) * starvation_stride,
-                      sizeof(starvation_value)) &&
-                  !BufferCacheTestAccess::IsBufferAllocated(
-                      cache, starvation_retired),
-              "critical GC did not immediately free the skipped dirty owners");
+                      sizeof(starvation_value)),
+              "critical GC did not immediately unregister the skipped dirty owners");
+      // The buffer itself is destroyed once no submission holds it: after the open one has
+      // gone out and completed.
+      scheduler.Finish();
+      Require(name, "critical-GC starvation release",
+              !BufferCacheTestAccess::IsBufferAllocated(cache, starvation_retired),
+              "critical GC did not free the skipped dirty owners once their submission retired");
 
       constexpr uint64_t lookup_only_offset = 0x218000;
       constexpr uint64_t obtained_offset = 0x220000;
@@ -4853,8 +4871,10 @@ public:
               cache.FindBuffer(base + lookup_only_offset, residency_size) ==
                   lookup_only,
               "lookup-only discovery replaced its valid Buffer owner");
+      // A formatted read over one page: a plain read this small that the CPU wrote is copied
+      // into the stream buffer and leaves its owner alone.
       const auto [obtained_buffer, obtained_buffer_offset] = cache.ObtainBuffer(
-          base + obtained_offset, residency_size, false, false, obtained);
+          base + obtained_offset, residency_size, false, true, obtained);
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
       cache.RunGarbageCollector();
@@ -12145,68 +12165,83 @@ public:
       resources.MapMemory(base, allocation_size);
       std::vector<PipelineCache::Pipeline> descriptor_pipelines;
 
-      // The virtual-texture atlas is written as raw BC3 blocks, then sampled as BC3.
-      constexpr uint64_t block_alias_address = base + 0xf0000;
-      constexpr std::array<uint32_t, 4> block_alias_data{
-          0x01234567u, 0x89abcdefu, 0xfedcba98u, 0x76543210u};
-      const auto resolve_block_alias = [&](bool compressed) {
-        const uint32_t side = compressed ? 256 : 64;
-        const auto format = compressed ? Prospero::BufferFormat::kBc3UNorm
-                                       : Prospero::BufferFormat::k32_32_32_32UInt;
-        ShaderRecompiler::IR::DescriptorValue value{};
-        value.dword_count = 8;
-        value.dwords = {static_cast<uint32_t>(block_alias_address >> 8u),
-                        (static_cast<uint32_t>(format) << 20u) | (3u << 30u),
-                        ((side - 1u) >> 2u) | ((side - 1u) << 14u),
-                        0x90900facu, 0, 0x00700000u, 0, 0};
-        ShaderRecompiler::IR::ImageResource resource{};
-        resource.resource_class = compressed
-            ? ShaderRecompiler::IR::ImageResourceClass::Sampled
-            : ShaderRecompiler::IR::ImageResourceClass::Storage;
-        resource.numeric_class = compressed ? Prospero::TextureNumericClass::Float
-                                            : Prospero::TextureNumericClass::Uint;
-        resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-        resource.read = compressed;
-        resource.written = !compressed;
-        return RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
-      };
-      auto raw_blocks = resolve_block_alias(false);
-      (void)texture_cache.FindTexture(raw_blocks.image_id, raw_blocks.desc);
-      auto &raw_blocks_native = texture_cache.GetImage(raw_blocks.image_id);
-      raw_blocks_native.Transit(vk::ImageLayout::eTransferDstOptimal,
-                                vk::AccessFlagBits2::eTransferWrite, {},
-                                scheduler.Current().Handle());
-      vk::ClearColorValue block_clear{};
-      std::copy(block_alias_data.begin(), block_alias_data.end(),
-                block_clear.uint32.begin());
-      const vk::ImageSubresourceRange block_range{
-          vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-      scheduler.Current().Handle().clearColorImage(
-          raw_blocks_native.backing.image, vk::ImageLayout::eTransferDstOptimal,
-          &block_clear, 1, &block_range);
-      texture_cache.MarkGpuWritten(raw_blocks.image_id);
-      auto compressed_blocks = resolve_block_alias(true);
-      (void)texture_cache.FindTexture(compressed_blocks.image_id,
-                                      compressed_blocks.desc);
-      auto raw_blocks_again = resolve_block_alias(false);
-      Require(name, "compressed atlas storage reuse",
-              compressed_blocks.image_id != raw_blocks.image_id &&
-                  raw_blocks_again.image_id == compressed_blocks.image_id &&
-                  texture_cache.FindTexture(raw_blocks_again.image_id,
-                                            raw_blocks_again.desc) != nullptr,
-              "BC3 sampling replaced the GPU atlas on its next raw-block write");
-      Require(name, "compressed atlas download",
-              TextureCacheTestAccess::TryDownload(texture_cache,
-                                                  raw_blocks_again.image_id),
-              "the retained BC3 atlas could not publish its native contents");
-      scheduler.Finish();
-      scheduler.DrainPriorityOperations();
-      const auto *block_words = reinterpret_cast<const uint32_t *>(block_alias_address);
-      Require(name, "compressed atlas GPU contents",
-              std::equal(block_alias_data.begin(), block_alias_data.end(), block_words) &&
-                  std::equal(block_alias_data.begin(), block_alias_data.end(),
-                             block_words + 0x10000 / sizeof(uint32_t) - 4),
-              "compressed atlas aliases reloaded stale CPU bytes over GPU-written blocks");
+      // The virtual-texture atlas is written as raw BC3 blocks, then sampled as BC3. The raw
+      // writes then go to the BC3 image through a storage view: as the renderer decides it (see
+      // ImageUsageFlags in image.cpp), only where the host can store to BC3.
+      auto &atlas_graphics = context.GetGraphics();
+      const bool bc3_storage =
+          atlas_graphics.supports_block_texel_view &&
+          atlas_graphics.GetImageFormatProperties(
+              vk::Format::eBc3UnormBlock, vk::ImageType::e2D, vk::ImageTiling::eOptimal,
+              vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+                  vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage,
+              vk::ImageCreateFlagBits::eMutableFormat | vk::ImageCreateFlagBits::eExtendedUsage |
+                  vk::ImageCreateFlagBits::eBlockTexelViewCompatible,
+              nullptr) == vk::Result::eSuccess;
+      if (!CannotRun("gpu", "CompressedAtlasStorage", bc3_storage,
+                     "storage access to a BC3 image", "BC3 storage image")) {
+        constexpr uint64_t block_alias_address = base + 0xf0000;
+        constexpr std::array<uint32_t, 4> block_alias_data{
+            0x01234567u, 0x89abcdefu, 0xfedcba98u, 0x76543210u};
+        const auto resolve_block_alias = [&](bool compressed) {
+          const uint32_t side = compressed ? 256 : 64;
+          const auto format = compressed ? Prospero::BufferFormat::kBc3UNorm
+                                         : Prospero::BufferFormat::k32_32_32_32UInt;
+          ShaderRecompiler::IR::DescriptorValue value{};
+          value.dword_count = 8;
+          value.dwords = {static_cast<uint32_t>(block_alias_address >> 8u),
+                          (static_cast<uint32_t>(format) << 20u) | (3u << 30u),
+                          ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+                          0x90900facu, 0, 0x00700000u, 0, 0};
+          ShaderRecompiler::IR::ImageResource resource{};
+          resource.resource_class = compressed
+              ? ShaderRecompiler::IR::ImageResourceClass::Sampled
+              : ShaderRecompiler::IR::ImageResourceClass::Storage;
+          resource.numeric_class = compressed ? Prospero::TextureNumericClass::Float
+                                              : Prospero::TextureNumericClass::Uint;
+          resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+          resource.read = compressed;
+          resource.written = !compressed;
+          return RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+        };
+        auto raw_blocks = resolve_block_alias(false);
+        (void)texture_cache.FindTexture(raw_blocks.image_id, raw_blocks.desc);
+        auto &raw_blocks_native = texture_cache.GetImage(raw_blocks.image_id);
+        raw_blocks_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                  vk::AccessFlagBits2::eTransferWrite, {},
+                                  scheduler.Current().Handle());
+        vk::ClearColorValue block_clear{};
+        std::copy(block_alias_data.begin(), block_alias_data.end(),
+                  block_clear.uint32.begin());
+        const vk::ImageSubresourceRange block_range{
+            vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        scheduler.Current().Handle().clearColorImage(
+            raw_blocks_native.backing.image, vk::ImageLayout::eTransferDstOptimal,
+            &block_clear, 1, &block_range);
+        texture_cache.MarkGpuWritten(raw_blocks.image_id);
+        auto compressed_blocks = resolve_block_alias(true);
+        (void)texture_cache.FindTexture(compressed_blocks.image_id,
+                                        compressed_blocks.desc);
+        auto raw_blocks_again = resolve_block_alias(false);
+        Require(name, "compressed atlas storage reuse",
+                compressed_blocks.image_id != raw_blocks.image_id &&
+                    raw_blocks_again.image_id == compressed_blocks.image_id &&
+                    texture_cache.FindTexture(raw_blocks_again.image_id,
+                                              raw_blocks_again.desc) != nullptr,
+                "BC3 sampling replaced the GPU atlas on its next raw-block write");
+        Require(name, "compressed atlas download",
+                TextureCacheTestAccess::TryDownload(texture_cache,
+                                                    raw_blocks_again.image_id),
+                "the retained BC3 atlas could not publish its native contents");
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+        const auto *block_words = reinterpret_cast<const uint32_t *>(block_alias_address);
+        Require(name, "compressed atlas GPU contents",
+                std::equal(block_alias_data.begin(), block_alias_data.end(), block_words) &&
+                    std::equal(block_alias_data.begin(), block_alias_data.end(),
+                               block_words + 0x10000 / sizeof(uint32_t) - 4),
+                "compressed atlas aliases reloaded stale CPU bytes over GPU-written blocks");
+      }
 
       const auto set_image_bindings = [](ShaderRecompiler::IR::Program &program) {
         for (auto &image : program.info.images) {
@@ -12232,7 +12267,10 @@ public:
       {
         const auto buffer_program = make_buffer_program(ShaderType::Compute, {.read = true});
 
-        constexpr uint64_t buffer_address = base + allocation_size - 0x5000;
+        // Over the stream upload limit (4 pages): a smaller read-only range the CPU wrote is
+        // copied into the stream buffer instead of being bound from its owner.
+        constexpr uint64_t clamped_size = 0x11000;
+        constexpr uint64_t buffer_address = base + allocation_size - clamped_size;
         ShaderBufferResource buffer_descriptor{};
         buffer_descriptor.UpdateAddress48(buffer_address);
         buffer_descriptor.fields[2] = 0x40000000; // Only oversized descriptors are clamped.
@@ -12250,7 +12288,7 @@ public:
 
         auto &buffer_cache = resources.GetBufferCache();
         const auto merged_id =
-            buffer_cache.FindBuffer(base + allocation_size - 0x10000, 0x10000);
+            buffer_cache.FindBuffer(base + allocation_size - 0x20000, 0x20000);
         Require(name, "buffer discovery invalidation", merged_id != original_id,
                 "overlapping buffer discovery did not replace its smaller owner");
         executor.RebindBuffers(buffer_bindings);
@@ -12259,7 +12297,7 @@ public:
         Require(name, "clamped buffer rebind",
                 binding.buffer == owner.Handle() &&
                     binding.offset == owner.Offset(buffer_address) &&
-                    binding.range == 0x5000,
+                    binding.range == clamped_size,
                 "descriptor rebind lost its clamped guest range or retained a stale host owner");
       }
 
@@ -12948,8 +12986,16 @@ public:
           sampled.view = views[index];
           sampled.layout = image.backing.state.layout;
           scheduler.Finish();
+          // As the renderer binds it: a host without imageViewMinLod applies the view's
+          // minimum LOD in the sampler of that texture (see IR::SamplerSlot).
+          const auto case_sampler =
+              m_host.capabilities.image_view_min_lod
+                  ? sampler
+                  : context.GetSamplerCache().GetSampler(
+                        lod_sampler, lod_program.program.info.samplers[0].integer_border,
+                        binding.desc.view_info.min_lod);
           Dispatch(lod_test, lod_program, output, nullptr, &sampled, nullptr,
-                   nullptr, sampler);
+                   nullptr, case_sampler);
           const auto result = ReadBuffer(lod_test.name, output, 1)[0];
           // Vulkan permits flooring imageViewMinLod instead of retaining its
           // fraction.
@@ -13399,10 +13445,15 @@ public:
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), disjoint_binding));
       const auto &disjoint_image = texture_cache.GetImage(disjoint_depth_id);
+      // A depth target that is also sampled: the renderer's layout for it (renderDraw.cpp).
+      const auto sampled_attachment_layout =
+          context.GetGraphics().attachment_feedback_loop_enabled
+              ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+              : vk::ImageLayout::eGeneral;
       Require(name, "disjoint depth sampling during depth writes",
               !disjoint_feedback &&
                   disjoint_rendering.depth_stencil_attachment.image_layout ==
-                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
+                      sampled_attachment_layout &&
                   disjoint_binding.images[0].layout ==
                       disjoint_rendering.depth_stencil_attachment.image_layout &&
                   disjoint_image.backing.state.layout ==
@@ -13411,45 +13462,51 @@ public:
               "disjoint sampling used inconsistent image layouts or enabled feedback");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      auto overlapping_sampled_desc = disjoint_sampled_desc;
-      overlapping_sampled_desc.view_info.base_level = 0;
-      const auto overlapping_view = texture_cache.FindTexture(
-          disjoint_depth_id, overlapping_sampled_desc);
-      ShaderRecompiler::IR::Program depth_views_ir{};
-      depth_views_ir.stage = ShaderType::Pixel;
-      depth_views_ir.resource_tracking_complete = true;
-      depth_views_ir.info.images = {sampled_resource, sampled_resource};
-      set_image_bindings(depth_views_ir);
-      ShaderRecompiler::IR::CompiledShaderInfo depth_views_program{};
-      depth_views_program.stage = depth_views_ir.stage;
-      depth_views_program.info = std::move(depth_views_ir.info);
-      depth_views_program.bindings = std::move(depth_views_ir.bindings);
-      ShaderRecompiler::IR::ResourceSnapshot depth_views_snapshot;
-      ShaderStageRuntime depth_views_runtime{&depth_views_program, &depth_views_snapshot};
-      PreparedBindings depth_views_binding{};
-      depth_views_binding.runtime = &depth_views_runtime;
-      depth_views_binding.images.push_back(
-          {disjoint_depth_id, overlapping_view, overlapping_sampled_desc});
-      depth_views_binding.images.push_back(
-          {disjoint_depth_id, disjoint_sampled_view, disjoint_sampled_desc});
-      RenderExecutorTestAccess::BindRenderTarget(executor, disjoint_depth_id);
-      std::array<PreparedBindings *, 1> depth_views_stages{&depth_views_binding};
-      vk::ImageAspectFlags depth_views_feedback;
-      const auto depth_views_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
-          executor, scheduler.Current(), &no_disjoint_color, 0, disjoint_depth,
-          depth_views_stages, &depth_views_feedback);
-      descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
-          executor, scheduler.Current(), depth_views_binding));
-      Require(name, "overlapping and disjoint depth views",
-              overlapping_view != nullptr &&
-                  depth_views_feedback == vk::ImageAspectFlagBits::eDepth &&
-                  depth_views_rendering.depth_stencil_attachment.image_layout ==
-                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
-                  MakeImageInfo(depth_views_binding.images[0]).imageLayout ==
-                      depth_views_rendering.depth_stencil_attachment.image_layout &&
-                  MakeImageInfo(depth_views_binding.images[1]).imageLayout ==
-                      depth_views_rendering.depth_stencil_attachment.image_layout,
-              "two depth views chose different descriptor layouts or feedback aspects");
+      // A sampled view that overlaps the written level is a feedback loop.
+      if (!CannotRun("gpu", "DepthFeedbackViews",
+                     context.GetGraphics().attachment_feedback_loop_enabled,
+                     "a depth target sampled while it is written",
+                     "attachmentFeedbackLoopDynamicState")) {
+        auto overlapping_sampled_desc = disjoint_sampled_desc;
+        overlapping_sampled_desc.view_info.base_level = 0;
+        const auto overlapping_view = texture_cache.FindTexture(
+            disjoint_depth_id, overlapping_sampled_desc);
+        ShaderRecompiler::IR::Program depth_views_ir{};
+        depth_views_ir.stage = ShaderType::Pixel;
+        depth_views_ir.resource_tracking_complete = true;
+        depth_views_ir.info.images = {sampled_resource, sampled_resource};
+        set_image_bindings(depth_views_ir);
+        ShaderRecompiler::IR::CompiledShaderInfo depth_views_program{};
+        depth_views_program.stage = depth_views_ir.stage;
+        depth_views_program.info = std::move(depth_views_ir.info);
+        depth_views_program.bindings = std::move(depth_views_ir.bindings);
+        ShaderRecompiler::IR::ResourceSnapshot depth_views_snapshot;
+        ShaderStageRuntime depth_views_runtime{&depth_views_program, &depth_views_snapshot};
+        PreparedBindings depth_views_binding{};
+        depth_views_binding.runtime = &depth_views_runtime;
+        depth_views_binding.images.push_back(
+            {disjoint_depth_id, overlapping_view, overlapping_sampled_desc});
+        depth_views_binding.images.push_back(
+            {disjoint_depth_id, disjoint_sampled_view, disjoint_sampled_desc});
+        RenderExecutorTestAccess::BindRenderTarget(executor, disjoint_depth_id);
+        std::array<PreparedBindings *, 1> depth_views_stages{&depth_views_binding};
+        vk::ImageAspectFlags depth_views_feedback;
+        const auto depth_views_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_disjoint_color, 0, disjoint_depth,
+            depth_views_stages, &depth_views_feedback);
+        descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+            executor, scheduler.Current(), depth_views_binding));
+        Require(name, "overlapping and disjoint depth views",
+                overlapping_view != nullptr &&
+                    depth_views_feedback == vk::ImageAspectFlagBits::eDepth &&
+                    depth_views_rendering.depth_stencil_attachment.image_layout ==
+                        vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
+                    MakeImageInfo(depth_views_binding.images[0]).imageLayout ==
+                        depth_views_rendering.depth_stencil_attachment.image_layout &&
+                    MakeImageInfo(depth_views_binding.images[1]).imageLayout ==
+                        depth_views_rendering.depth_stencil_attachment.image_layout,
+                "two depth views chose different descriptor layouts or feedback aspects");
+      }
 
       Libs::LibKernel::Memory::WriteBacking(
           storage_address, &storage_stale_value, sizeof(storage_stale_value));
@@ -13747,85 +13804,7 @@ public:
           "view followed the D32 backing");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      // Attachment acquisition consumes pending HTile clears using DB_DEPTH_CLEAR.
-      (void)texture_cache.FindDepthTarget(depth_only.image_id, depth_only.desc);
-      auto bounds_target = depth_only_target;
-      bounds_target.z_write_base_addr = 0;
-      bounds_target.depth_view.depth_write_disable = true;
-      registers.SetDepthRenderTarget(bounds_target);
-      HW::DepthControl bounds_control{};
-      bounds_control.depth_bounds_enable = true;
-      registers.SetDepthControl(bounds_control);
-      registers.SetRenderControl({});
-      registers.SetDepthClearValue(0.375f);
-      ShaderRecompiler::IR::ResourceSnapshot bounds_snapshot;
-      bounds_snapshot.images.push_back(sampled_depth_value);
-      ShaderStageRuntime bounds_vertex{&vertex_sampled_info, &bounds_snapshot};
-      ShaderStageRuntime bounds_pixel{&sampled_info, &bounds_snapshot};
-      const auto depth_texels = depth_only.desc.info.extent.width *
-                                depth_only.desc.info.extent.height;
-      const auto depth_bytes = depth_texels * sizeof(uint32_t);
-      auto bounds_readback = CreateHostBuffer(name, depth_bytes * 2,
-          vk::BufferUsageFlagBits::eTransferDst, {});
-      for (uint32_t pass = 0; pass < 2; ++pass) {
-        Require(name, "bounds prior depth contents",
-                texture_cache.ClearImageFromBuffer(scheduler.Current(),
-                    depth_only.desc.info.data.address, depth_only.desc.info.data.size,
-                    std::bit_cast<uint32_t>(0.625f)),
-                "failed to seed depth before the deferred HTile clear");
-        if (pass == 0) {
-          Require(name, "bounds deferred HTile clear",
-                  texture_cache.ClearMeta(depth_only_htile_address),
-                  "depth-only HTile was not registered");
-        } else {
-          bounds_target.z_write_base_addr = depth_only_address;
-          bounds_target.depth_view.depth_write_disable = false;
-          bounds_control.z_write_enable = true;
-          registers.SetDepthRenderTarget(bounds_target);
-          registers.SetDepthControl(bounds_control);
-        }
-        RenderDepthInfo bounds_depth{};
-        RenderExecutorTestAccess::ResolveRenderDepthTarget(
-            executor, scheduler.Current(), bounds_depth);
-        auto bounds_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
-            executor, bounds_vertex, bounds_pixel, true);
-        std::array<PreparedBindings *, 2> bounds_stages{
-            &bounds_bindings.vertex[0], &*bounds_bindings.pixel};
-        vk::ImageAspectFlags bounds_feedback;
-        const auto bounds_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
-            executor, scheduler.Current(), &no_color, 0, bounds_depth,
-            bounds_stages, &bounds_feedback);
-        descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
-            executor, scheduler.Current(), bounds_bindings.vertex[0], *bounds_bindings.pixel));
-        const auto &vertex_depth = bounds_bindings.vertex[0].images[0];
-        const auto &pixel_depth = bounds_bindings.pixel->images[0];
-        const auto expected_layout = pass == 0
-            ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-            : vk::ImageLayout::eDepthReadOnlyOptimal;
-        Require(name, "deferred clear with sampled depth bounds",
-                bounds_depth.image_id == depth_only.image_id &&
-                    bounds_depth.depth_bounds_test_enable &&
-                    !bounds_depth.depth_write_enable &&
-                    bounds_depth.depth_load_clear_enable == (pass == 0) &&
-                    !texture_cache.IsMetaCleared(depth_only_htile_address, 0) &&
-                    bounds_feedback == (pass == 0
-                                            ? vk::ImageAspectFlagBits::eDepth
-                                            : vk::ImageAspectFlags{}) &&
-                    bounds_rendering.depth_stencil_attachment.image_layout == expected_layout &&
-                    bounds_rendering.depth_stencil_attachment.depth_clear == (pass == 0) &&
-                    vertex_depth.image_id == depth_only.image_id &&
-                    pixel_depth.image_id == depth_only.image_id &&
-                    MakeImageInfo(vertex_depth).imageLayout == expected_layout &&
-                    MakeImageInfo(pixel_depth).imageLayout == expected_layout,
-                "a deferred clear sampled by vertex and pixel stages missed depth feedback");
-        scheduler.BeginRendering(bounds_rendering);
-        scheduler.EndRendering();
-        RenderExecutorTestAccess::ResetBindings(executor);
-        const vk::BufferImageCopy copy{pass * depth_bytes, 0, 0,
-            {vk::ImageAspectFlagBits::eDepth, 0, 0, 1}, {}, depth_only.desc.info.extent};
-        texture_cache.GetImage(depth_only.image_id).Download(
-            std::span{&copy, 1}, bounds_readback.buffer, 0, bounds_readback.size);
-      }
+      // Transfers that the host reads after Finish.
       vk::MemoryBarrier2 bounds_host_barrier{};
       bounds_host_barrier.sType = vk::StructureType::eMemoryBarrier2;
       bounds_host_barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
@@ -13836,16 +13815,101 @@ public:
       bounds_dependency.sType = vk::StructureType::eDependencyInfo;
       bounds_dependency.memoryBarrierCount = 1;
       bounds_dependency.pMemoryBarriers = &bounds_host_barrier;
-      scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
-      scheduler.Finish();
-      const auto bounds_result = ReadBuffer(name, bounds_readback, depth_texels * 2);
-      Require(name, "deferred HTile clear occurs once",
-              std::ranges::all_of(std::span{bounds_result}.first(depth_texels),
-                  [](uint32_t value) { return value == std::bit_cast<uint32_t>(0.375f); }) &&
-              std::ranges::all_of(std::span{bounds_result}.subspan(depth_texels),
-                  [](uint32_t value) { return value == std::bit_cast<uint32_t>(0.625f); }),
-              "pending clear did not use DB_DEPTH_CLEAR or cleared the next acquisition again");
-      DestroyBuffer(&bounds_readback);
+      // The first pass samples the depth target it clears: a feedback loop.
+      if (!CannotRun("gpu", "DeferredClearSampledDepthBounds",
+                     context.GetGraphics().attachment_feedback_loop_enabled,
+                     "a depth target sampled while it is written",
+                     "attachmentFeedbackLoopDynamicState")) {
+        // Attachment acquisition consumes pending HTile clears using DB_DEPTH_CLEAR.
+        (void)texture_cache.FindDepthTarget(depth_only.image_id, depth_only.desc);
+        auto bounds_target = depth_only_target;
+        bounds_target.z_write_base_addr = 0;
+        bounds_target.depth_view.depth_write_disable = true;
+        registers.SetDepthRenderTarget(bounds_target);
+        HW::DepthControl bounds_control{};
+        bounds_control.depth_bounds_enable = true;
+        registers.SetDepthControl(bounds_control);
+        registers.SetRenderControl({});
+        registers.SetDepthClearValue(0.375f);
+        ShaderRecompiler::IR::ResourceSnapshot bounds_snapshot;
+        bounds_snapshot.images.push_back(sampled_depth_value);
+        ShaderStageRuntime bounds_vertex{&vertex_sampled_info, &bounds_snapshot};
+        ShaderStageRuntime bounds_pixel{&sampled_info, &bounds_snapshot};
+        const auto depth_texels = depth_only.desc.info.extent.width *
+                                  depth_only.desc.info.extent.height;
+        const auto depth_bytes = depth_texels * sizeof(uint32_t);
+        auto bounds_readback = CreateHostBuffer(name, depth_bytes * 2,
+            vk::BufferUsageFlagBits::eTransferDst, {});
+        for (uint32_t pass = 0; pass < 2; ++pass) {
+          Require(name, "bounds prior depth contents",
+                  texture_cache.ClearImageFromBuffer(scheduler.Current(),
+                      depth_only.desc.info.data.address, depth_only.desc.info.data.size,
+                      std::bit_cast<uint32_t>(0.625f)),
+                  "failed to seed depth before the deferred HTile clear");
+          if (pass == 0) {
+            Require(name, "bounds deferred HTile clear",
+                    texture_cache.ClearMeta(depth_only_htile_address),
+                    "depth-only HTile was not registered");
+          } else {
+            bounds_target.z_write_base_addr = depth_only_address;
+            bounds_target.depth_view.depth_write_disable = false;
+            bounds_control.z_write_enable = true;
+            registers.SetDepthRenderTarget(bounds_target);
+            registers.SetDepthControl(bounds_control);
+          }
+          RenderDepthInfo bounds_depth{};
+          RenderExecutorTestAccess::ResolveRenderDepthTarget(
+              executor, scheduler.Current(), bounds_depth);
+          auto bounds_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
+              executor, bounds_vertex, bounds_pixel, true);
+          std::array<PreparedBindings *, 2> bounds_stages{
+              &bounds_bindings.vertex[0], &*bounds_bindings.pixel};
+          vk::ImageAspectFlags bounds_feedback;
+          const auto bounds_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+              executor, scheduler.Current(), &no_color, 0, bounds_depth,
+              bounds_stages, &bounds_feedback);
+          descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+              executor, scheduler.Current(), bounds_bindings.vertex[0], *bounds_bindings.pixel));
+          const auto &vertex_depth = bounds_bindings.vertex[0].images[0];
+          const auto &pixel_depth = bounds_bindings.pixel->images[0];
+          const auto expected_layout = pass == 0
+              ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+              : vk::ImageLayout::eDepthReadOnlyOptimal;
+          Require(name, "deferred clear with sampled depth bounds",
+                  bounds_depth.image_id == depth_only.image_id &&
+                      bounds_depth.depth_bounds_test_enable &&
+                      !bounds_depth.depth_write_enable &&
+                      bounds_depth.depth_load_clear_enable == (pass == 0) &&
+                      !texture_cache.IsMetaCleared(depth_only_htile_address, 0) &&
+                      bounds_feedback == (pass == 0
+                                              ? vk::ImageAspectFlagBits::eDepth
+                                              : vk::ImageAspectFlags{}) &&
+                      bounds_rendering.depth_stencil_attachment.image_layout == expected_layout &&
+                      bounds_rendering.depth_stencil_attachment.depth_clear == (pass == 0) &&
+                      vertex_depth.image_id == depth_only.image_id &&
+                      pixel_depth.image_id == depth_only.image_id &&
+                      MakeImageInfo(vertex_depth).imageLayout == expected_layout &&
+                      MakeImageInfo(pixel_depth).imageLayout == expected_layout,
+                  "a deferred clear sampled by vertex and pixel stages missed depth feedback");
+          scheduler.BeginRendering(bounds_rendering);
+          scheduler.EndRendering();
+          RenderExecutorTestAccess::ResetBindings(executor);
+          const vk::BufferImageCopy copy{pass * depth_bytes, 0, 0,
+              {vk::ImageAspectFlagBits::eDepth, 0, 0, 1}, {}, depth_only.desc.info.extent};
+          texture_cache.GetImage(depth_only.image_id).Download(
+              std::span{&copy, 1}, bounds_readback.buffer, 0, bounds_readback.size);
+        }
+        scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
+        scheduler.Finish();
+        const auto bounds_result = ReadBuffer(name, bounds_readback, depth_texels * 2);
+        Require(name, "deferred HTile clear occurs once",
+                std::ranges::all_of(std::span{bounds_result}.first(depth_texels),
+                    [](uint32_t value) { return value == std::bit_cast<uint32_t>(0.375f); }) &&
+                std::ranges::all_of(std::span{bounds_result}.subspan(depth_texels),
+                    [](uint32_t value) { return value == std::bit_cast<uint32_t>(0.625f); }),
+                "pending clear did not use DB_DEPTH_CLEAR or cleared the next acquisition again");
+        DestroyBuffer(&bounds_readback);
+      }
       registers.SetDepthClearValue(0.0f);
 
       // DB override copies run with depth and stencil tests disabled.
@@ -14122,6 +14186,14 @@ public:
       ShaderStageRuntime shared_depth_pixel{&sampled_info,
                                              &shared_depth_snapshot};
       for (const bool stencil_write : {true, false}) {
+        // Stencil written while it is sampled: a feedback loop.
+        if (stencil_write &&
+            CannotRun("gpu", "SampledStencilWrites",
+                      context.GetGraphics().attachment_feedback_loop_enabled,
+                      "a stencil target sampled while it is written",
+                      "attachmentFeedbackLoopDynamicState")) {
+          continue;
+        }
         registers.SetDepthRenderTarget(phased_depth_target);
         registers.SetRenderControl({});
         registers.SetDepthControl(read_only_depth_control);
@@ -14439,13 +14511,12 @@ public:
                     texture_cache.GetImage(target.image_id).backing.state.layout ==
                         vk::ImageLayout::eColorAttachmentOptimal,
                 "the buffer copy left the render attachment in its transfer layout");
-        vk::ClearAttachment clear_attachment{};
-        clear_attachment.aspectMask = vk::ImageAspectFlagBits::eColor;
-        clear_attachment.colorAttachment = 0;
-        clear_attachment.clearValue.color.uint32[0] = after;
-        const vk::ClearRect clear_rect{{{0, 0}, {128, 128}}, 0, 1};
-        scheduler.BeginRendering(rendering);
-        scheduler.Current().Handle().clearAttachments(1, &clear_attachment, 1, &clear_rect);
+        // The new color comes from the attachment's clear load, not from vkCmdClearAttachments:
+        // MoltenVK draws that with a float color, which loses the low bits of a 32-bit integer.
+        auto clearing = rendering;
+        clearing.color_attachments[0].is_clear = true;
+        clearing.color_attachments[0].clear_value = {after, 0, 0, 0};
+        scheduler.BeginRendering(clearing);
         scheduler.EndRendering();
         scheduler.Finish();
         Require(name, "buffer alias observes prior GPU contents",
@@ -16015,6 +16086,13 @@ public:
         name = "PackedUscaledVertexColor";
         packed_color = 513u | (257u << 10u) | (1023u << 20u) | (3u << 30u);
         packed_expected = {513.0f, 257.0f, 1023.0f, 3.0f};
+        // The case's own vertex shader reads the attribute as the host fetched it. Without
+        // native fetch the emulator's vertex shader unpacks the word (shader_cfg tests that).
+        if (CannotRun("graphics", name, m_host.capabilities.packed_scaled_vertex_input,
+                      "a host-fetched packed 10-10-10-2 scaled vertex attribute",
+                      "VK_FORMAT_A2B10G10R10_USCALED_PACK32 vertex buffer")) {
+          return;
+        }
         break;
       default: break;
     }
@@ -16263,9 +16341,14 @@ public:
         set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
         set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
       }
-      const vk::Bool32 write = true;
-      cmd.setColorWriteEnableEXT(1, &write);
-      cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      // As the renderer does: these dynamic states exist only where the host has them.
+      if (m_host.capabilities.color_write_enable) {
+        const vk::Bool32 write = true;
+        cmd.setColorWriteEnableEXT(1, &write);
+      }
+      if (m_runtime_context.attachment_feedback_loop_enabled) {
+        cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      }
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
@@ -16338,18 +16421,21 @@ public:
                   line_pixels[interior] == 0 &&
                   std::ranges::any_of(line_pixels, [](u32 value) { return value == 0x3f800000u; }),
               "wireframe did not preserve triangle edges while leaving its interior empty");
-      auto &last_vertex = pipeline(true, 2, 2, true);
-      Require(name, "provoking vertex pipeline cache",
-              last_vertex.pipeline != filled.pipeline &&
-                  pipeline(true, 2, 2, true).pipeline == last_vertex.pipeline &&
-                  pipeline(true, 2, 2).pipeline == filled.pipeline,
-              "first and last provoking vertices did not keep distinct cached pipelines");
-      draw(last_vertex);
-      const auto last_pixels = read_color();
-      for (size_t i = 0; i < solid_pixels.size(); i++) {
-        Require(name, "flat provoking vertex output",
-                last_pixels[i] == (solid_pixels[i] == 0 ? 0 : 0x3e800000u),
-                "last-vertex flat shading changed coverage or did not use vertex two");
+      if (!CannotRun("graphics", "LastProvokingVertex", m_provoking_last_supported,
+                     "the last vertex as the provoking vertex", "provokingVertexLast")) {
+        auto &last_vertex = pipeline(true, 2, 2, true);
+        Require(name, "provoking vertex pipeline cache",
+                last_vertex.pipeline != filled.pipeline &&
+                    pipeline(true, 2, 2, true).pipeline == last_vertex.pipeline &&
+                    pipeline(true, 2, 2).pipeline == filled.pipeline,
+                "first and last provoking vertices did not keep distinct cached pipelines");
+        draw(last_vertex);
+        const auto last_pixels = read_color();
+        for (size_t i = 0; i < solid_pixels.size(); i++) {
+          Require(name, "flat provoking vertex output",
+                  last_pixels[i] == (solid_pixels[i] == 0 ? 0 : 0x3e800000u),
+                  "last-vertex flat shading changed coverage or did not use vertex two");
+        }
       }
 
       const auto blend_pipeline = [&](bool enabled, bool bypass,
@@ -18402,6 +18488,10 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  // Each optional rasterization feature is enabled where the device has it, as the emulator's
+  // window does (vulkanWindow.cpp): the renderer reads these flags, not the gate above.
+  bool m_feedback_loop_supported = false;
+  bool m_provoking_last_supported = false;
   u32   m_skipped_cases          = 0;
   u32   m_not_run_cases          = 0;
   HostGpu m_host;
@@ -18438,8 +18528,8 @@ private:
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
     m_runtime_context.host = m_host;
-    m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
-    m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
+    m_runtime_context.attachment_feedback_loop_enabled = m_feedback_loop_supported;
+    m_runtime_context.provoking_vertex_last_enabled = m_provoking_last_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -18570,11 +18660,18 @@ private:
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.pNext = &available_provoking_vertex;
     m_physical_device.getFeatures2(&available_features2);
+    m_feedback_loop_supported = available_feedback_layout.attachmentFeedbackLoopLayout &&
+                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState;
+    m_provoking_last_supported = available_provoking_vertex.provokingVertexLast;
+    if (!m_feedback_loop_supported) {
+      std::printf("[host]    attachment feedback loop dynamic state is unavailable\n");
+    }
+    if (!m_provoking_last_supported) {
+      std::printf("[host]    provokingVertexLast is unavailable\n");
+    }
     m_rasterization_supported = caps.depth_bounds && caps.depth_clip_enable &&
-                                caps.color_write_enable &&
-                                available_feedback_layout.attachmentFeedbackLoopLayout &&
-                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
-                                available_provoking_vertex.provokingVertexLast;
+                                caps.color_write_enable && m_feedback_loop_supported &&
+                                m_provoking_last_supported;
     if (!m_rasterization_supported) {
       std::printf(
           "[host]    ProductionRasterization   unavailable, rasterization cases "
@@ -18652,22 +18749,28 @@ private:
     vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT feedback_layout{};
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic{};
     vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
-    if (m_rasterization_supported) {
+    if (caps.depth_clip_enable) {
       depth_clip.depthClipEnable = true;
       link(depth_clip);
+      device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
+    }
+    if (caps.color_write_enable) {
       color_write.colorWriteEnable = true;
       link(color_write);
+      device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
+    }
+    if (m_feedback_loop_supported) {
       feedback_layout.attachmentFeedbackLoopLayout = true;
       link(feedback_layout);
       feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
       link(feedback_dynamic);
-      provoking_vertex.provokingVertexLast = true;
-      link(provoking_vertex);
-      device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
-      device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+    }
+    if (m_provoking_last_supported) {
+      provoking_vertex.provokingVertexLast = true;
+      link(provoking_vertex);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
     device_info.pNext = chain;
