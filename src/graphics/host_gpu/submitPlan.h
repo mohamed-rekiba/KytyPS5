@@ -48,10 +48,12 @@ enum class SubmitReason : uint8_t {
 	Age,
 };
 
-// Starting values, measured on an M4 Max with MoltenVK 1.4.2 (about 25 us of recording per draw):
-// 4 ms of recording is about 160 draws, two to three guest command buffers of a typical frame.
-inline constexpr uint32_t SUBMIT_WORK_LIMIT  = 512;
-inline constexpr uint64_t SUBMIT_AGE_LIMIT_US = 4000;
+// Measured on an M4 Max with MoltenVK 1.4.2, in a scene of about 1,500 draws per frame: a guest
+// thread that reads a page the GPU writes waits for the submission that holds the write, so a
+// smaller submission ends that wait sooner. 512 draws or 4 ms gave 14 fps, 128 draws or 2 ms
+// gave 16 to 17 fps; 32 draws or 0.5 ms was no faster.
+inline constexpr uint32_t SUBMIT_WORK_LIMIT  = 128;
+inline constexpr uint64_t SUBMIT_AGE_LIMIT_US = 2000;
 // Past this many, the operations of the open submission no longer wait for the other limits.
 inline constexpr uint32_t SUBMIT_OPERATION_LIMIT = 4096;
 
