@@ -120,6 +120,10 @@ struct GraphicContext {
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
+	// The GPU uses the system memory, not memory of its own (see cacheCollection.h).
+	[[nodiscard]] bool UsesSystemMemory() const noexcept {
+		return physical_device_properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+	}
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);

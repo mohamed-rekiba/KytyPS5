@@ -94,6 +94,11 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+GuestSpan RenderContext::MappingAt(uint64_t vaddr) const {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges.Find(vaddr);
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
@@ -163,6 +168,22 @@ void RenderContext::PrepareBda(bool shader_writes_addresses) {
 		return;
 	}
 	KYTY_PROFILER_BLOCK("PrepareBda: written ranges");
+	// The log names a range once for each write. Overlapping and adjacent ranges are merged, so
+	// a buffer is visited once for each run of written bytes, not once for each write.
+	std::ranges::sort(m_bda_cpu_writes, {}, &GuestRange::address);
+	size_t merged = 0;
+	for (const auto& write: m_bda_cpu_writes) {
+		if (merged != 0) {
+			auto& last = m_bda_cpu_writes[merged - 1];
+			if (write.address <= last.address + last.size) {
+				last.size =
+				    std::max(last.address + last.size, write.address + write.size) - last.address;
+				continue;
+			}
+		}
+		m_bda_cpu_writes[merged++] = write;
+	}
+	m_bda_cpu_writes.resize(merged);
 	for (const auto& write: m_bda_cpu_writes) {
 		m_mapped_ranges.ForEachInRange(
 		    write.address, write.size, [this](uint64_t start, uint64_t end) {

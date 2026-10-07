@@ -5,6 +5,8 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/bufferChunk.h"
+#include "graphics/host_gpu/cacheCollection.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/readbackPlan.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -521,8 +523,11 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 
-	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
-	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	// The whole chunk around the first use (see bufferChunk.h).
+	const auto chunk =
+	    ChunkRange({vaddr, vaddr + size}, m_scheduler.Context().MappingAt(vaddr), s_chunk_size);
+	const auto end     = Common::AlignUp(chunk.end, CACHING_PAGESIZE);
+	vaddr              = Common::AlignDown(chunk.begin, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
@@ -877,12 +882,18 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// Buffers are collected only for memory, never because they are idle (see cacheCollection.h):
+	// the plan is asked as for a GPU with memory of its own.
+	const auto kind = PlanCollection({.used_memory    = m_total_used_memory,
+	                                  .trigger_memory = m_trigger_gc_memory,
+	                                  .system_memory  = false,
+	                                  .passes         = tick});
+	if (kind == CollectionKind::None) {
 		return;
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const uint64_t age        = CollectionAge(kind, aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
@@ -930,6 +941,11 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	// Most buffers of a range hold nothing the CPU wrote; for them a synchronization uploads
+	// nothing and only costs its setup.
+	if (!m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		return;
+	}
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {
@@ -939,7 +955,7 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 		auto&      buffer = m_slot_buffers[it->second];
 		const auto start  = std::max(buffer.CpuAddress(), vaddr);
 		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-		if (start < finish) {
+		if (start < finish && m_memory_tracker.IsRegionCpuModified(start, finish - start)) {
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
 		}
 	}

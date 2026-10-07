@@ -14,6 +14,8 @@ names=(
 	archive_file
 	audio_out2_port
 	avplayer_file
+	buffer_chunk
+	cache_collection
 	cache_folder
 	controller_settings
 	depth_snapshot_plan
