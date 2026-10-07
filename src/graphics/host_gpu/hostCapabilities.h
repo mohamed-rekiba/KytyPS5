@@ -84,6 +84,11 @@ struct DriverFaults {
 	// A plain load marked volatile may be done once and reused, so a loop that waits for a value
 	// another invocation stores never sees it.
 	bool volatile_loads_are_reused = false;
+	// Creating a pipeline cache from saved data takes about a second per megabyte and blocks
+	// the thread: a cache of a few hundred pipelines holds the start of a game for over a
+	// minute. What it saves, the translation of shaders to the device's language, is done by
+	// worker threads in the background anyway. So the cache is not kept on disk for the driver.
+	bool pipeline_cache_load_is_slow = false;
 
 	bool operator==(const DriverFaults&) const = default;
 };
@@ -97,6 +102,7 @@ struct DriverFaults {
 		faults.no_per_vertex_inputs        = true;
 		faults.no_centroid_barycentric     = true;
 		faults.volatile_loads_are_reused   = true;
+		faults.pipeline_cache_load_is_slow = true;
 	}
 	return faults;
 }
