@@ -113,6 +113,24 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	return has_writes;
 }
 
+bool HasShaderMemoryWrites(const ShaderStageRuntime& runtime) {
+	if (HasShaderBufferWrites(runtime)) {
+		return true;
+	}
+	const auto& program = *runtime.program;
+	for (const auto& buffer: program.info.buffers) {
+		if (buffer.atomic) {
+			return true;
+		}
+	}
+	for (const auto& image: program.info.images) {
+		if (image.written || image.atomic) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderAccessDependency();

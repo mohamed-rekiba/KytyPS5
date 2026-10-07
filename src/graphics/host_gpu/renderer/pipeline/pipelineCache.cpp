@@ -28,10 +28,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -231,18 +233,20 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		// The name the program has on the lists of the game: the same at every start.
+		uint64_t identity = 0;
 	};
 
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		    : resource_plan(std::move(plan)) {}
 
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
+		// A deque: a worker that builds a pipeline points to a permutation, and a new one must
+		// not move those that exist.
+		std::deque<Permutation> permutations;
 	};
 
 	struct ProgramKeyHash {
@@ -429,12 +433,15 @@ struct PipelineCache::ProgramCache {
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 		}
-		Remember(stage, params, input_info, entry->second.specialization, push_data_cursor);
+		// Zero without lists for this game.
+		const auto identity =
+		    Remember(stage, params, input_info, entry->second.specialization, push_data_cursor);
 		entry->second.permutations.push_back(
 		    MakePermutation(CompileChecked(stage_name, options, std::move(translated),
 		                                   entry->second.specialization, push_data_cursor),
 		                    entry->second.specialization));
-		const auto& permutation = entry->second.permutations.back();
+		auto& permutation = entry->second.permutations.back();
+		Name(entry->second, permutation, identity);
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
@@ -464,7 +471,41 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           plan;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::CompileResult              result;
+		uint64_t                                     identity = 0;
 	};
+
+	// What a program on the list is, once built: for the pipeline list, which names programs by
+	// their identity.
+	struct ListedProgram {
+		ShaderStageRuntime stage;
+		ShaderProgram      handle;
+	};
+	[[nodiscard]] std::optional<ListedProgram> Listed(uint64_t identity) const {
+		const auto it = m_by_identity.find(identity);
+		if (it == m_by_identity.end()) {
+			return std::nullopt;
+		}
+		const auto& [entry, permutation] = it->second;
+		return ListedProgram {.stage  = {.program   = &permutation->program,
+		                                 .resources = &entry->resources},
+		                      .handle = permutation->handle};
+	}
+	[[nodiscard]] uint64_t IdentityOf(const ShaderProgram& program) const {
+		const auto it = m_identity_of_id.find(program.id);
+		return it == m_identity_of_id.end() ? 0 : it->second;
+	}
+	// Also for a second identity of the same permutation: two records can name one program when
+	// their push data cursors differ but land on the same start.
+	void Name(SourceEntry& entry, Permutation& permutation, uint64_t identity) {
+		if (identity == 0) {
+			return;
+		}
+		if (permutation.identity == 0) {
+			permutation.identity = identity;
+			m_identity_of_id.emplace(permutation.handle.id, identity);
+		}
+		m_by_identity.try_emplace(identity, &entry, &permutation);
+	}
 
 	template <typename InputInfo>
 	static bool ReadInputInfo(const ProgramRecord& record, InputInfo& info) {
@@ -516,7 +557,7 @@ struct PipelineCache::ProgramCache {
 	uint64_t HostWords() const {
 		const auto& c = host.capabilities;
 		const auto& f = host.faults;
-		static_assert(sizeof(HostCapabilities) == 24 && sizeof(DriverFaults) == 6,
+		static_assert(sizeof(HostCapabilities) == 24 && sizeof(DriverFaults) == 7,
 		              "a host field was added: add it to the list signature");
 		const uint32_t words[] = {
 		    c.image_view_min_lod,
@@ -541,6 +582,7 @@ struct PipelineCache::ProgramCache {
 		    f.volatile_loads_are_reused,
 		    f.no_contraction_is_slow,
 		    f.pipeline_cache_load_is_slow,
+		    f.pipeline_cache_serializes_builds,
 		};
 		return XXH3_64bits(words, sizeof(words));
 	}
@@ -565,6 +607,7 @@ struct PipelineCache::ProgramCache {
 		out.key.user_data_count = record.user_data_count;
 		out.key.code_size       = static_cast<uint32_t>(record.code.size());
 		BuildStageStaticKey(info, out.key.static_state);
+		out.identity = Identity(record, out.key.static_state);
 		const std::vector<uint32_t> user_data(record.user_data_count, 0u);
 		const auto                  options =
 		    MakeOptions(record.stage, record.hash, user_data, record.back_code, info);
@@ -681,26 +724,34 @@ struct PipelineCache::ProgramCache {
 		for (auto& item: built) {
 			auto entry = programs.try_emplace(std::move(item.key), std::move(item.plan)).first;
 			const auto start = item.result.program.bindings.push_data_start_dword;
-			if (std::ranges::any_of(entry->second.permutations, [&](const Permutation& known) {
-				    return known.program.bindings.push_data_start_dword == start &&
-				           known.specialization == item.specialization;
-			    })) {
-				continue; // a draw needed it before the worker was done
+			if (const auto known = std::ranges::find_if(
+			        entry->second.permutations,
+			        [&](const Permutation& candidate) {
+				        return candidate.program.bindings.push_data_start_dword == start &&
+				               candidate.specialization == item.specialization;
+			        });
+			    known != entry->second.permutations.end()) {
+				// A draw needed it before the worker was done; the record's name still has to
+				// find it.
+				Name(entry->second, *known, item.identity);
+				continue;
 			}
 			entry->second.permutations.push_back(
 			    MakePermutation(std::move(item.result), std::move(item.specialization)));
+			Name(entry->second, entry->second.permutations.back(), item.identity);
 			m_adopted++;
 		}
 	}
 
-	// Renderer thread: a program was translated for a draw. Puts it on the list, once.
+	// Renderer thread: a program was translated for a draw. Puts it on the list, once, and
+	// returns its identity.
 	template <typename InputInfo>
-	void Remember(ShaderType stage, const ShaderParams& params, const InputInfo& input_info,
-	              const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	              uint32_t                                            push_data_cursor) {
+	uint64_t Remember(ShaderType stage, const ShaderParams& params, const InputInfo& input_info,
+	                  const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                  uint32_t                                            push_data_cursor) {
 		static_assert(std::is_trivially_copyable_v<InputInfo>);
 		if (m_list_file == nullptr) {
-			return;
+			return 0; // no lists for this game: nothing to name
 		}
 		ProgramRecord record;
 		record.stage           = stage;
@@ -714,13 +765,15 @@ struct PipelineCache::ProgramCache {
 		plain.stage           = {};
 		record.input_info.resize(sizeof(InputInfo));
 		std::memcpy(record.input_info.data(), static_cast<const void*>(&plain), sizeof(InputInfo));
-		if (!m_listed.insert(Identity(record, lookup_key.static_state)).second) {
-			return; // on the list, and built here before its worker was done
+		const auto identity = Identity(record, lookup_key.static_state);
+		if (!m_listed.insert(identity).second) {
+			return identity; // on the list, and built here before its worker was done
 		}
 		std::vector<uint8_t> bytes;
 		AppendProgramRecord(bytes, record);
 		std::fwrite(bytes.data(), 1, bytes.size(), m_list_file);
 		std::fflush(m_list_file);
+		return identity;
 	}
 
 	ProgramCache(vk::Device device, const HostGpu& host): device(device), host(host) {
@@ -755,6 +808,8 @@ struct PipelineCache::ProgramCache {
 	std::atomic<bool>                                           m_built_waiting {false};
 	std::atomic<uint32_t>                                       m_workers_running {0};
 	std::unordered_set<uint64_t>                                m_listed;
+	std::unordered_map<uint64_t, std::pair<SourceEntry*, Permutation*>> m_by_identity;
+	std::unordered_map<uint64_t, uint64_t>                      m_identity_of_id;
 	std::FILE*                                                  m_list_file = nullptr;
 	uint64_t                                                    m_adopted   = 0;
 	vk::Device                                                  device;
@@ -767,6 +822,19 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
       m_program_cache(std::make_unique<ProgramCache>(graphics.device, graphics.host)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	m_always_wait       = Config::PipelineWaitEnabled();
+	const auto builders = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
+	if (m_graphics.host.faults.pipeline_cache_serializes_builds) {
+		m_builder_caches.resize(builders);
+		for (auto& cache: m_builder_caches) {
+			vk::PipelineCacheCreateInfo create {};
+			EXIT_NOT_IMPLEMENTED(m_graphics.device.createPipelineCache(&create, nullptr, &cache) !=
+			                     vk::Result::eSuccess);
+		}
+	}
+	for (uint32_t i = 0; i < builders; i++) {
+		m_builders.emplace_back([this, i](std::stop_token stop) { BuildPipelines(stop, i); });
+	}
 	// The list is signed with the build. A build that cannot name its source has no signature
 	// to trust, like the driver cache.
 	const std::string_view git_hash = KYTY_GIT_HASH;
@@ -775,27 +843,311 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	} else if (const auto title_id = PipelineCacheTitleId(); !title_id.empty()) {
 		m_program_cache->OpenProgramList(std::filesystem::path("_PipelineCache") /
 		                                 (title_id + ".programs"));
+		OpenPipelineList(std::filesystem::path("_PipelineCache") / (title_id + ".pipelines"));
+	}
+}
+
+// Signed like the program list: with the build, and with the layout of what a record holds.
+static std::string PipelineListSignature() {
+	return fmt::format("KytyPP2:{}:{}:{}:{}:{}:{}:{}\n", KYTY_GIT_HASH,
+	                   sizeof(PipelineRenderingState), sizeof(PipelineVertexInputState),
+	                   sizeof(PipelineStaticParameters), sizeof(ShaderVertexInputInfo),
+	                   sizeof(ShaderPixelInputInfo), sizeof(ShaderComputeInputInfo));
+}
+
+void PipelineCache::OpenPipelineList(const std::filesystem::path& path) {
+	const auto           signature = PipelineListSignature();
+	std::vector<uint8_t> bytes;
+	if (std::FILE* file = std::fopen(Common::PathToString(path).c_str(), "rb")) {
+		std::fseek(file, 0, SEEK_END);
+		const auto size = std::ftell(file);
+		if (size > 0) {
+			bytes.resize(static_cast<size_t>(size));
+			std::fseek(file, 0, SEEK_SET);
+			bytes.resize(std::fread(bytes.data(), 1, bytes.size(), file));
+		}
+		std::fclose(file);
+	}
+	const bool signed_by_this_build =
+	    bytes.size() >= signature.size() &&
+	    std::equal(signature.begin(), signature.end(), bytes.begin());
+	if (signed_by_this_build) {
+		m_listed_pipelines = ReadPipelineRecords(
+		    std::span<const uint8_t>(bytes).subspan(signature.size()));
+	}
+	PipelineCacheLog("Pipeline list: {} pipeline(s) to build ahead from {}",
+	                 m_listed_pipelines.size(), Common::PathToString(path));
+	m_graphics.pipelines_ahead_total.store(static_cast<uint32_t>(m_listed_pipelines.size()),
+	                                       std::memory_order_relaxed);
+	// The list is written again without what was dropped (another build, a damaged tail), into
+	// a temporary file that then takes the list's place: a stop in between leaves the old list.
+	// New records are appended to it.
+	std::vector<uint8_t> kept(signature.begin(), signature.end());
+	for (const auto& record: m_listed_pipelines) {
+		std::vector<uint8_t> bytes;
+		AppendPipelineRecord(bytes, record);
+		// Known, so a draw that needs it before its programs are built ahead does not add it again.
+		m_pipelines_on_list.insert(XXH3_64bits(bytes.data(), bytes.size()));
+		kept.insert(kept.end(), bytes.begin(), bytes.end());
+	}
+	std::error_code error;
+	std::filesystem::create_directories(path.parent_path(), error);
+	auto temp_path = path;
+	temp_path += ".tmp";
+	bool written = false;
+	if (std::FILE* file = std::fopen(Common::PathToString(temp_path).c_str(), "wb")) {
+		written = std::fwrite(kept.data(), 1, kept.size(), file) == kept.size();
+		written = std::fclose(file) == 0 && written;
+	}
+	if (written) {
+		std::filesystem::rename(temp_path, path, error);
+		written = !error;
+	}
+	if (written) {
+		m_pipeline_list = std::fopen(Common::PathToString(path).c_str(), "ab");
+	}
+	if (m_pipeline_list == nullptr) {
+		// The pipelines that were read are still built ahead; new ones are not remembered.
+		PipelineCacheLog("Pipeline list: cannot write {}", Common::PathToString(path));
+	}
+}
+
+template <typename T>
+static void AppendBytes(std::vector<uint8_t>& out, const T& value) {
+	static_assert(std::is_trivially_copyable_v<T>);
+	const auto* raw = reinterpret_cast<const uint8_t*>(&value);
+	out.insert(out.end(), raw, raw + sizeof(T));
+}
+
+template <typename T>
+static bool ReadBytes(std::span<const uint8_t>& in, T& value) {
+	static_assert(std::is_trivially_copyable_v<T>);
+	if (in.size() < sizeof(T)) {
+		return false;
+	}
+	std::memcpy(&value, in.data(), sizeof(T));
+	in = in.subspan(sizeof(T));
+	return true;
+}
+
+// Renderer thread: a pipeline was queued for a draw. Puts it on the list, once.
+void PipelineCache::RememberPipeline(const GraphicsPipelineKey& key, const PipelineJob& job) {
+	if (m_pipeline_list == nullptr) {
+		return;
+	}
+	PipelineRecord record;
+	for (uint32_t i = 0; i < job.vertex_count; i++) {
+		record.programs[i] = m_program_cache->IdentityOf(job.programs.vertex[i]);
+		if (record.programs[i] == 0) {
+			return; // a program the list does not know cannot be named
+		}
+	}
+	if (job.pixel) {
+		record.programs[3] = m_program_cache->IdentityOf(job.programs.pixel);
+		if (record.programs[3] == 0) {
+			return;
+		}
+	}
+	AppendBytes(record.fixed_state, key.rendering);
+	AppendBytes(record.fixed_state, key.vertex_input);
+	AppendBytes(record.fixed_state, key.static_params);
+	record.stage_count = job.vertex_count;
+	for (uint32_t i = 0; i < job.vertex_count; i++) {
+		auto plain  = job.vertex_info[i];
+		plain.stage = {};
+		AppendBytes(record.stages[i], plain);
+	}
+	record.pixel_present = job.pixel.has_value();
+	if (job.pixel) {
+		auto plain  = *job.pixel;
+		plain.stage = {};
+		AppendBytes(record.pixel, plain);
+	}
+	WriteRecord(record);
+}
+
+void PipelineCache::RememberComputePipeline(const PipelineJob& job) {
+	if (m_pipeline_list == nullptr) {
+		return;
+	}
+	PipelineRecord record;
+	record.programs[0] = m_program_cache->IdentityOf(job.programs.pixel);
+	if (record.programs[0] == 0) {
+		return;
+	}
+	auto plain  = *job.compute;
+	plain.stage = {};
+	AppendBytes(record.fixed_state, plain);
+	WriteRecord(record);
+}
+
+void PipelineCache::WriteRecord(const PipelineRecord& record) {
+	std::vector<uint8_t> bytes;
+	AppendPipelineRecord(bytes, record);
+	if (!m_pipelines_on_list.insert(XXH3_64bits(bytes.data(), bytes.size())).second) {
+		return;
+	}
+	std::fwrite(bytes.data(), 1, bytes.size(), m_pipeline_list);
+	std::fflush(m_pipeline_list);
+}
+
+// Renderer thread, before the programs of a draw are looked up (right after the program list
+// workers' results were adopted). Queues every listed pipeline whose programs are all there.
+void PipelineCache::QueueListedPipelines() {
+	if (m_listed_pipelines.empty()) {
+		return;
+	}
+	std::erase_if(m_listed_pipelines, [this](const PipelineRecord& record) {
+		PipelineJob         job;
+		GraphicsPipelineKey key;
+		// Dropped or already built: done as far as the title's count goes.
+		const auto done = [this] {
+			m_graphics.pipelines_ahead_built.fetch_add(1, std::memory_order_relaxed);
+			return true;
+		};
+		if (record.stage_count == 0 && !record.pixel_present) {
+			const auto program = m_program_cache->Listed(record.programs[0]);
+			if (!program) {
+				return false;
+			}
+			auto bytes = std::span<const uint8_t>(record.fixed_state);
+			job.compute.emplace();
+			if (!ReadBytes(bytes, *job.compute) || !bytes.empty()) {
+				return done();
+			}
+			if (m_compute_pipelines.contains(program->handle.id)) {
+				return done();
+			}
+			job.compute->stage = program->stage;
+			job.programs.pixel = program->handle;
+			job.listed         = true;
+			QueueComputeBuild(program->handle.id, std::move(job));
+			return true;
+		}
+		for (uint32_t i = 0; i < record.stage_count; i++) {
+			const auto program = m_program_cache->Listed(record.programs[i]);
+			if (!program) {
+				return false; // not built yet; asked again at the next draw
+			}
+			auto bytes = std::span<const uint8_t>(record.stages[i]);
+			if (!ReadBytes(bytes, job.vertex_info[i]) || !bytes.empty()) {
+				return done(); // not from this layout: dropped
+			}
+			job.vertex_info[i].stage   = program->stage;
+			job.programs.vertex[i]     = program->handle;
+			key.vertex_shader_ids[i]   = program->handle.id;
+		}
+		job.vertex_count = record.stage_count;
+		if (record.pixel_present) {
+			const auto program = m_program_cache->Listed(record.programs[3]);
+			if (!program) {
+				return false;
+			}
+			auto bytes = std::span<const uint8_t>(record.pixel);
+			job.pixel.emplace();
+			if (!ReadBytes(bytes, *job.pixel) || !bytes.empty()) {
+				return done();
+			}
+			job.pixel->stage    = program->stage;
+			job.programs.pixel  = program->handle;
+			key.ps_shader_id    = program->handle.id;
+		}
+		auto fixed = std::span<const uint8_t>(record.fixed_state);
+		if (!ReadBytes(fixed, key.rendering) || !ReadBytes(fixed, key.vertex_input) ||
+		    !ReadBytes(fixed, key.static_params) || !fixed.empty()) {
+			return done();
+		}
+		if (m_graphics_pipelines.contains(key)) {
+			return done(); // a draw needed it before its programs were built ahead
+		}
+		job.listed        = true;
+		job.rendering     = key.rendering;
+		job.vertex_input  = key.vertex_input;
+		job.static_params = key.static_params;
+		QueueBuild(std::move(key), std::move(job));
+		return true;
+	});
+}
+
+void PipelineCache::Enqueue(PipelineJob job) {
+	{
+		std::lock_guard lock(m_jobs_mutex);
+		m_jobs.push_back(std::move(job));
+	}
+	m_job_added.notify_one();
+}
+
+void PipelineCache::QueueBuild(GraphicsPipelineKey key, PipelineJob job) {
+	auto cached = std::make_unique<GraphicsEntry>();
+	job.target  = cached.get();
+	Enqueue(std::move(job));
+	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+	EXIT_IF(!inserted);
+}
+
+void PipelineCache::QueueComputeBuild(uint64_t program_id, PipelineJob job) {
+	auto cached = std::make_unique<GraphicsEntry>();
+	job.target  = cached.get();
+	Enqueue(std::move(job));
+	auto [iter, inserted] = m_compute_pipelines.emplace(program_id, std::move(cached));
+	EXIT_IF(!inserted);
+}
+
+void PipelineCache::Promote(const GraphicsEntry& entry) {
+	std::lock_guard lock(m_jobs_mutex);
+	const auto      it = std::ranges::find_if(
+        m_jobs, [&entry](const PipelineJob& job) { return job.target == &entry; });
+	if (it != m_jobs.end() && it != m_jobs.begin()) {
+		auto job = std::move(*it);
+		m_jobs.erase(it);
+		m_jobs.push_front(std::move(job));
 	}
 }
 
 PipelineCache::~PipelineCache() {
+	// The workers first: a pipeline that is still queued is not built any more, and one that is
+	// being built is finished before anything is destroyed.
+	for (auto& builder: m_builders) {
+		builder.request_stop();
+	}
+	m_builders.clear();
+	if (m_builds != 0) {
+		PipelineCacheLog("Pipelines: {} built on worker threads, {} ms each on average, the "
+		                 "longest {} ms; {} draw(s) left out while their pipeline was built",
+		                 m_builds, m_build_us / m_builds / 1000, m_longest_us / 1000,
+		                 m_left_out_draws);
+	}
 	Save();
-	auto destroy = [this](const auto& pipelines) {
-		for (const auto& [key, pipeline]: pipelines) {
-			(void)key;
-			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
-			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
-			if (pipeline->mesh_compute != nullptr) {
-				m_graphics.device.destroyPipeline(pipeline->mesh_compute, nullptr);
-				m_graphics.device.destroyPipelineLayout(pipeline->mesh_compute_layout, nullptr);
-			}
-			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
+	if (m_pipeline_list != nullptr) {
+		std::fclose(m_pipeline_list);
+	}
+	auto destroy = [this](const Pipeline& pipeline) {
+		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+		m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+		if (pipeline.mesh_compute != nullptr) {
+			m_graphics.device.destroyPipeline(pipeline.mesh_compute, nullptr);
+			m_graphics.device.destroyPipelineLayout(pipeline.mesh_compute_layout, nullptr);
 		}
+		m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
 	};
-	destroy(m_graphics_pipelines);
-	destroy(m_compute_pipelines);
+	for (const auto& [key, entry]: m_graphics_pipelines) {
+		(void)key;
+		// Queued and never built: nothing to destroy.
+		if (entry->ready.load(std::memory_order_acquire)) {
+			destroy(entry->pipeline);
+		}
+	}
+	for (const auto& [id, entry]: m_compute_pipelines) {
+		(void)id;
+		if (entry->ready.load(std::memory_order_acquire)) {
+			destroy(entry->pipeline);
+		}
+	}
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	}
+	for (const auto cache: m_builder_caches) {
+		m_graphics.device.destroyPipelineCache(cache, nullptr);
 	}
 }
 
@@ -816,6 +1168,12 @@ void PipelineCache::InitializeDriverCache() {
 	}
 	if (git_hash.ends_with("-dirty")) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
+		return;
+	}
+	if (m_graphics.host.faults.pipeline_cache_serializes_builds) {
+		PipelineCacheLog("Vulkan pipeline cache: one in memory for each worker thread (the driver "
+		                 "builds the pipelines of a cache one at a time; the game's pipeline list "
+		                 "is built ahead instead)");
 		return;
 	}
 	if (m_graphics.host.faults.pipeline_cache_load_is_slow) {
@@ -959,6 +1317,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
 	m_program_cache->Adopt();
+	QueueListedPipelines();
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -1108,11 +1467,11 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
+PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs, const DrawEffects& effects) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -1278,7 +1637,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+		return WhenReady(*iter->second, effects);
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1291,19 +1650,91 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		     static_cast<void*>(pixel_program.module));
 	}
 
-	auto cached = std::make_unique<Pipeline>();
-	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
-	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+	LogPipelineTrace("CreatePipelineInternal queued", vs_id, ps_id);
+	PipelineJob job;
+	job.rendering    = rendering;
+	job.vertex_input = key.vertex_input;
+	EXIT_IF(vertex_info.size() > job.vertex_info.size());
+	std::copy(vertex_info.begin(), vertex_info.end(), job.vertex_info.begin());
+	job.vertex_count = static_cast<uint32_t>(vertex_info.size());
+	if (ps_input_info != nullptr) {
+		job.pixel = *ps_input_info;
+	}
+	job.programs      = programs;
+	job.static_params = static_params;
+	RememberPipeline(key, job);
+	QueueBuild(key, std::move(job));
+	return WhenReady(*m_graphics_pipelines.find(key)->second, effects);
+}
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+void PipelineCache::BuildPipelines(std::stop_token stop, uint32_t builder) {
+	const auto driver_cache = m_builder_caches.empty() ? m_driver_cache : m_builder_caches[builder];
+	for (;;) {
+		PipelineJob job;
+		{
+			std::unique_lock lock(m_jobs_mutex);
+			if (!m_job_added.wait(lock, stop, [this] { return !m_jobs.empty(); }) ||
+			    stop.stop_requested()) {
+				return;
+			}
+			job = std::move(m_jobs.front());
+			m_jobs.pop_front();
+		}
+		const auto begin = std::chrono::steady_clock::now();
+		if (job.compute) {
+			CreatePipelineInternal(m_graphics, job.target->pipeline, *job.compute,
+			                       job.programs.pixel.module, driver_cache);
+		} else {
+			CreatePipelineInternal(m_graphics, job.target->pipeline, job.rendering, job.vertex_input,
+			                       std::span {job.vertex_info.data(), job.vertex_count},
+			                       job.pixel ? &*job.pixel : nullptr, job.programs,
+			                       job.static_params, driver_cache);
+		}
+		EXIT_NOT_IMPLEMENTED(job.target->pipeline.pipeline == nullptr);
+		EXIT_NOT_IMPLEMENTED(job.target->pipeline.pipeline_layout == nullptr);
+		const auto took = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                            std::chrono::steady_clock::now() - begin)
+		                                            .count());
+		{
+			std::lock_guard lock(m_jobs_mutex);
+			m_builds++;
+			m_build_us += took;
+			m_longest_us = std::max(m_longest_us, took);
+			job.target->ready.store(true, std::memory_order_release);
+		}
+		if (job.listed) {
+			m_graphics.pipelines_ahead_built.fetch_add(1, std::memory_order_relaxed);
+		}
+		m_job_done.notify_all();
+	}
+}
 
-	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
-	EXIT_IF(!inserted);
-
-	return *iter->second;
+PipelineCache::Pipeline* PipelineCache::WhenReady(GraphicsEntry& entry, const DrawEffects& effects) {
+	const auto ready = [&entry] { return entry.ready.load(std::memory_order_acquire); };
+	switch (PlanPipelineUse(effects, ready(), m_always_wait)) {
+		case PipelineUse::Draw: return &entry.pipeline;
+		case PipelineUse::Wait: {
+			Promote(entry);
+			std::unique_lock lock(m_jobs_mutex);
+			m_job_done.wait(lock, ready);
+			return &entry.pipeline;
+		}
+		case PipelineUse::LeaveOut: {
+			// A build the driver has cached takes about a millisecond: a wait that short is no
+			// visible stop, and the picture stays exact on a host that builds fast.
+			constexpr auto GraceWait = std::chrono::milliseconds(2);
+			std::unique_lock lock(m_jobs_mutex);
+			if (m_job_done.wait_for(lock, GraceWait, ready)) {
+				return &entry.pipeline;
+			}
+			if (m_left_out_draws++ == 0) {
+				PipelineCacheLog("Pipelines: a draw is left out until its pipeline is built "
+				                 "(--pipeline-wait true waits instead)");
+			}
+			return nullptr;
+		}
+	}
+	return nullptr;
 }
 
 PipelineCache::Pipeline&
@@ -1313,24 +1744,25 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
+	// A dispatch that is left out would change the game's data: it always waits. The build runs
+	// on a worker all the same, so it is in parallel with others, and the game's list builds it
+	// ahead at the next start.
+	const auto wait = [this](GraphicsEntry& entry) -> Pipeline& {
+		return *WhenReady(entry, DrawEffects {.writes_memory = true});
+	};
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
-		return *iter->second;
+		return wait(*iter->second);
 	}
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(input_info);
 	}
-
-	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
-
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
-
-	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
-	EXIT_IF(!inserted);
-
-	return *iter->second;
+	PipelineJob job;
+	job.compute         = input_info;
+	job.programs.pixel  = compute_program;
+	RememberComputePipeline(job);
+	QueueComputeBuild(compute_program.id, std::move(job));
+	return wait(*m_compute_pipelines.find(compute_program.id)->second);
 }
 } // namespace Libs::Graphics

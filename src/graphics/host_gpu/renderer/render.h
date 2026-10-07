@@ -12,6 +12,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -164,6 +165,9 @@ public:
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	// A frame of the game ends: what the next frame draws into is told apart from what it does
+	// not (see PlanPipelineUse).
+	void NoteFlip() { m_frame++; }
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
 
@@ -222,6 +226,20 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	// The frame in which each render target was last drawn into. A target is an image slot with
+	// its generation (so a slot given to a new image does not inherit the frame of the old one)
+	// and, for colour, the mip level and array layer (a face of a cube map or a layer of an atlas
+	// drawn once is not covered by draws into the others).
+	std::unordered_map<uint64_t, uint64_t> m_target_frames;
+	static uint64_t TargetKey(ImageId image, uint32_t mip = 0, uint32_t layer = 0) {
+		uint64_t key = image.index;
+		for (const uint32_t part: {image.generation, mip, layer}) {
+			key = (key ^ part) * 0x9E3779B97F4A7C15ull;
+		}
+		return key;
+	}
+	static uint64_t TargetKey(const RenderColorInfo& color);
+	uint64_t                               m_frame = 0;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;

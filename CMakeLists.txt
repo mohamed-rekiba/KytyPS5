@@ -416,6 +416,11 @@ add_executable(readback_plan_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(readback_plan_tests PRIVATE ${inc_headers})
 
+add_executable(pipeline_use_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PipelineUseTests.cpp"
+)
+target_include_directories(pipeline_use_tests PRIVATE ${inc_headers})
+
 add_executable(host_lowering_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/HostLoweringTests.cpp"
 )
@@ -656,6 +661,7 @@ if(BUILD_TESTING)
 	add_test(NAME host_lowering COMMAND $<TARGET_FILE:host_lowering_tests>)
 	add_test(NAME write_heat COMMAND $<TARGET_FILE:write_heat_tests>)
 	add_test(NAME readback_plan COMMAND $<TARGET_FILE:readback_plan_tests>)
+	add_test(NAME pipeline_use COMMAND $<TARGET_FILE:pipeline_use_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME metadata_fill COMMAND $<TARGET_FILE:metadata_fill_tests>)
 	add_test(NAME fence_retirement COMMAND $<TARGET_FILE:fence_retirement_tests>)
@@ -741,6 +747,7 @@ if(BUILD_TESTING)
 		host_lowering_tests
 		write_heat_tests
 		readback_plan_tests
+		pipeline_use_tests
 		image_page_table_tests
 		metadata_fill_tests
 		fence_retirement_tests

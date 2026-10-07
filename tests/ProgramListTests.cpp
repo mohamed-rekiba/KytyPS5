@@ -9,7 +9,10 @@
 
 namespace {
 
+using Libs::Graphics::AppendPipelineRecord;
 using Libs::Graphics::AppendProgramRecord;
+using Libs::Graphics::PipelineRecord;
+using Libs::Graphics::ReadPipelineRecords;
 using Libs::Graphics::ProgramRecord;
 using Libs::Graphics::ReadProgramRecords;
 
@@ -42,6 +45,31 @@ ProgramRecord Geometry() {
 	record.code      = {1, 2};
 	record.back_code = {3, 4, 5};
 	return record;
+}
+
+PipelineRecord Pipeline() {
+	PipelineRecord record;
+	record.programs      = {0x11, 0, 0, 0x22};
+	record.fixed_state   = {1, 2, 3, 4, 5};
+	record.stage_count   = 1;
+	record.stages[0]     = {9, 8, 7};
+	record.pixel_present = true;
+	record.pixel         = {6, 5};
+	return record;
+}
+
+void TestPipelineRoundTrip() {
+	std::vector<uint8_t> bytes;
+	AppendPipelineRecord(bytes, Pipeline());
+	auto second          = Pipeline();
+	second.pixel_present = false;
+	second.pixel.clear();
+	AppendPipelineRecord(bytes, second);
+	const auto records = ReadPipelineRecords(bytes);
+	Check(records.size() == 2 && records[0] == Pipeline() && records[1] == second,
+	      "pipeline records were not read back as written");
+	bytes.pop_back();
+	Check(ReadPipelineRecords(bytes).size() == 1, "a cut-off pipeline record was read");
 }
 
 void TestRoundTrip() {
@@ -93,6 +121,7 @@ int main() {
 	TestEqualRecordsGiveEqualBytes();
 	TestCutOffTail();
 	TestDamagedRecord();
+	TestPipelineRoundTrip();
 	std::puts("ProgramListTests: all cases passed");
 	return 0;
 }

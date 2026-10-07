@@ -92,6 +92,12 @@ struct DriverFaults {
 	// minute. What it saves, the translation of shaders to the device's language, is done by
 	// worker threads in the background anyway. So the cache is not kept on disk for the driver.
 	bool pipeline_cache_load_is_slow = false;
+	// A pipeline built with a pipeline cache translates its shaders under the cache's one lock:
+	// worker threads that share a cache build their pipelines one at a time. Measured on a cold
+	// start: ten builders, nine of them waiting on the lock nearly all the time. So each worker
+	// has a cache of its own. (Without any cache, a run lost the device: Metal reported an
+	// invalid resource.)
+	bool pipeline_cache_serializes_builds = false;
 
 	bool operator==(const DriverFaults&) const = default;
 };
@@ -107,6 +113,7 @@ struct DriverFaults {
 		faults.volatile_loads_are_reused   = true;
 		faults.no_contraction_is_slow      = true;
 		faults.pipeline_cache_load_is_slow = true;
+		faults.pipeline_cache_serializes_builds = true;
 	}
 	return faults;
 }

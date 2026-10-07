@@ -186,6 +186,84 @@ inline std::vector<ProgramRecord> ReadProgramRecords(std::span<const uint8_t> by
 	return records;
 }
 
+// A graphics pipeline a game used: the programs it was built from, by the identity each has on
+// the program list, and the bytes of what else the build needs. Kept on disk for a game, so the
+// next start builds the pipeline before a draw asks for it.
+struct PipelineRecord {
+	// Vertex stages 0..2, then the pixel program; 0 when the stage is absent.
+	std::array<uint64_t, 4> programs {};
+	// Rendering formats, vertex input layout and static parameters, as their bytes.
+	std::vector<uint8_t> fixed_state;
+	uint32_t             stage_count = 0;
+	// The vertex stage input infos, as their bytes, `stage_count` of them.
+	std::array<std::vector<uint8_t>, 3> stages;
+	bool                                pixel_present = false;
+	std::vector<uint8_t>                pixel;
+
+	bool operator==(const PipelineRecord&) const = default;
+};
+
+inline void AppendPipelineRecord(std::vector<uint8_t>& out, const PipelineRecord& record) {
+	std::vector<uint8_t>   body;
+	ProgramListDetail::Out write(body);
+	for (const auto program: record.programs) {
+		write.Value(program);
+	}
+	write.Array(std::span<const uint8_t>(record.fixed_state));
+	write.Value(record.stage_count);
+	for (uint32_t i = 0; i < record.stage_count && i < record.stages.size(); i++) {
+		write.Array(std::span<const uint8_t>(record.stages[i]));
+	}
+	write.Value(static_cast<uint8_t>(record.pixel_present));
+	if (record.pixel_present) {
+		write.Array(std::span<const uint8_t>(record.pixel));
+	}
+	ProgramListDetail::Out file(out);
+	file.Value(static_cast<uint32_t>(body.size()));
+	out.insert(out.end(), body.begin(), body.end());
+	file.Value(ProgramListDetail::Checksum(body));
+}
+
+inline std::vector<PipelineRecord> ReadPipelineRecords(std::span<const uint8_t> bytes) {
+	std::vector<PipelineRecord> records;
+	for (;;) {
+		ProgramListDetail::In file(bytes);
+		uint32_t              size = 0;
+		if (!file.Value(size) || bytes.size() - sizeof(size) < size + sizeof(uint64_t)) {
+			break;
+		}
+		const auto body     = bytes.subspan(sizeof(size), size);
+		uint64_t   checksum = 0;
+		std::memcpy(&checksum, bytes.data() + sizeof(size) + size, sizeof(checksum));
+		if (checksum != ProgramListDetail::Checksum(body)) {
+			break;
+		}
+		PipelineRecord        record;
+		ProgramListDetail::In read(body);
+		bool                  ok = true;
+		for (auto& program: record.programs) {
+			ok = ok && read.Value(program);
+		}
+		ok = ok && read.Array(record.fixed_state) && read.Value(record.stage_count) &&
+		     record.stage_count <= record.stages.size();
+		for (uint32_t i = 0; ok && i < record.stage_count; i++) {
+			ok = read.Array(record.stages[i]);
+		}
+		uint8_t pixel_present = 0;
+		ok                    = ok && read.Value(pixel_present);
+		record.pixel_present  = pixel_present != 0;
+		if (ok && record.pixel_present) {
+			ok = read.Array(record.pixel);
+		}
+		if (!ok || !read.Done()) {
+			break;
+		}
+		records.push_back(std::move(record));
+		bytes = bytes.subspan(sizeof(size) + size + sizeof(checksum));
+	}
+	return records;
+}
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_PROGRAMLIST_H_

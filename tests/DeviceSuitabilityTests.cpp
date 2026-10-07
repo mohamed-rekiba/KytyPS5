@@ -149,7 +149,8 @@ void TestMoltenVkLikeDeviceIsAccepted() {
 void TestDriverDefectsAreNotCapabilities() {
 	const auto moltenvk = EvaluateDeviceSuitability(MoltenVkFacts(), kRequiredExtensions);
 	Check(moltenvk.faults.pushed_buffers_have_no_size && moltenvk.faults.no_per_vertex_inputs &&
-	          moltenvk.faults.no_centroid_barycentric,
+	          moltenvk.faults.no_centroid_barycentric &&
+	          moltenvk.faults.pipeline_cache_serializes_builds,
 	      "MoltenVK's defects must be reported");
 	Check(Contains(moltenvk.unavailable, "driver defect"), "a driver defect must reach the log");
 

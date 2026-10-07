@@ -1120,6 +1120,10 @@ void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderS
 	                        parameters);
 }
 
+uint64_t RenderExecutor::TargetKey(const RenderColorInfo& color) {
+	return TargetKey(color.image_id, color.guest_mip_level, color.guest_array_layer);
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1167,6 +1171,64 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	if (state.ps_active && m_context.GetGraphics().host.faults.no_per_vertex_inputs &&
+	    ShaderPixelReadsVertexValues(state.ps_input_info)) {
+		if (topology != vk::PrimitiveTopology::eTriangleList || vertex_stages.size() != 1 ||
+		    mesh_active) {
+			EXIT("a pixel shader reads raw vertex values in a draw that is not a plain triangle "
+			     "list, which the host GPU cannot do yet: primitive=%u stages=%u mesh=%u\n",
+			     static_cast<uint32_t>(ucfg.GetPrimType()),
+			     static_cast<uint32_t>(vertex_stages.size()), static_cast<uint32_t>(mesh_active));
+		}
+		topology = vk::PrimitiveTopology::ePatchList;
+		// A list has no strips to restart, and a patch list may not have the restart index.
+		primitive_restart_enable = false;
+	}
+	// The pipeline before anything is prepared for the draw: when it is still being built the
+	// draw is left out, and by then it must not have touched buffers or render targets.
+	if (draw.IsIndexed()) {
+		LogDrawPhase(draw.Name(), "CreatePipeline");
+	}
+	DrawEffects effects {.clears_depth = state.depth_info.depth_clear_enable ||
+	                                     state.depth_info.stencil_clear_enable};
+	// A target drawn in the previous frame, or earlier in this one, is drawn again anyway.
+	const auto drawn_recently = [&](uint64_t target) {
+		const auto it = m_target_frames.find(target);
+		return it != m_target_frames.end() && it->second + 1 >= m_frame;
+	};
+	const bool writes_depth =
+	    state.depth_info.image_id &&
+	    (state.depth_info.depth_write_enable || state.depth_info.stencil_test_enable);
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		effects.writes_fresh_target =
+		    effects.writes_fresh_target || !drawn_recently(TargetKey(state.color_info[i]));
+	}
+	if (writes_depth) {
+		effects.writes_fresh_target =
+		    effects.writes_fresh_target || !drawn_recently(TargetKey(state.depth_info.image_id));
+	}
+	for (const auto& stage: vertex_stages) {
+		effects.writes_memory = effects.writes_memory || HasShaderMemoryWrites(stage.stage);
+	}
+	if (state.ps_active) {
+		effects.writes_memory =
+		    effects.writes_memory || HasShaderMemoryWrites(state.ps_input_info.stage);
+	}
+	auto* const pipeline_or_none = m_context.GetPipelineCache().GetGraphicsPipeline(
+	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
+	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
+	    state.programs, effects);
+	if (pipeline_or_none == nullptr) {
+		return;
+	}
+	auto& pipeline = *pipeline_or_none;
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		m_target_frames[TargetKey(state.color_info[i])] = m_frame;
+	}
+	if (writes_depth) {
+		m_target_frames[TargetKey(state.depth_info.image_id)] = m_frame;
+	}
+
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.
@@ -1196,29 +1258,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "CreatePipeline");
-	}
 	// The pixel shader reads the raw values of its triangle's three vertices, and the host has
 	// no pixel shader input for them: the triangles are drawn as patches, through tessellation
 	// shaders that hand the values over (see triangleVertexValueShader.h).
-	if (state.ps_active && m_context.GetGraphics().host.faults.no_per_vertex_inputs &&
-	    ShaderPixelReadsVertexValues(state.ps_input_info)) {
-		if (topology != vk::PrimitiveTopology::eTriangleList || vertex_stages.size() != 1 ||
-		    mesh_active) {
-			EXIT("a pixel shader reads raw vertex values in a draw that is not a plain triangle "
-			     "list, which the host GPU cannot do yet: primitive=%u stages=%u mesh=%u\n",
-			     static_cast<uint32_t>(ucfg.GetPrimType()),
-			     static_cast<uint32_t>(vertex_stages.size()), static_cast<uint32_t>(mesh_active));
-		}
-		topology = vk::PrimitiveTopology::ePatchList;
-		// A list has no strips to restart, and a patch list may not have the restart index.
-		primitive_restart_enable = false;
-	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
