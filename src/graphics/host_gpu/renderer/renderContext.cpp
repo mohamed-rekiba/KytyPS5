@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -141,6 +142,7 @@ void RenderContext::PrepareBda(bool shader_writes_addresses) {
 		m_bda_logged = true;
 	}
 	m_fault_process_pending = true;
+	RegionManager::NoteUploadPass();
 	// Shaders that read through device addresses can read any cached buffer, so every buffer must
 	// hold the CPU's latest bytes. Walking all of them before each dispatch is expensive with
 	// thousands of buffers; the buffer cache logs where the CPU wrote, and only those ranges are
@@ -154,11 +156,13 @@ void RenderContext::PrepareBda(bool shader_writes_addresses) {
 		~UploadBatch() { cache.EndUploadBatch(); }
 	} upload_batch {m_buffer_cache};
 	if (!m_buffer_cache.TakeCpuWrites(m_bda_cpu_writes)) {
+		KYTY_PROFILER_BLOCK("PrepareBda: every buffer");
 		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 		});
 		return;
 	}
+	KYTY_PROFILER_BLOCK("PrepareBda: written ranges");
 	for (const auto& write: m_bda_cpu_writes) {
 		m_mapped_ranges.ForEachInRange(
 		    write.address, write.size, [this](uint64_t start, uint64_t end) {

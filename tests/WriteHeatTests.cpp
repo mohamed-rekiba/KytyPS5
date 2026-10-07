@@ -19,39 +19,72 @@ void Check(bool condition, const char* message) {
 
 void TestAPageIsHotAfterItsSecondWrite() {
 	Heat heat;
-	heat.NoteWrite(3, 5);
+	heat.NoteWrite(3, 5, 0);
 	Check(!heat.IsHot(3) && !heat.IsHot(4), "one write must not make a page hot");
-	heat.NoteWrite(4, 6);
+	heat.NoteWrite(4, 6, 0);
 	Check(!heat.IsHot(3) && heat.IsHot(4) && !heat.IsHot(5), "only the page written twice is hot");
-	heat.NoteWrite(4, 5);
+	heat.NoteWrite(4, 5, 0);
 	Check(heat.IsHot(4), "a hot page stays hot");
 }
 
 void TestHotPagesStayDirtyWhenTheRangeIsCleared() {
 	Heat heat;
-	heat.NoteWrite(8, 10);
-	heat.NoteWrite(8, 9);
+	heat.NoteWrite(8, 10, 0);
+	heat.NoteWrite(8, 9, 0);
 	Heat::Bits dirty;
 	dirty.SetRange(8, 12);
 	dirty.UnsetRange(8, 12); // the renderer uploaded the range
-	heat.KeepHotDirty(dirty, 8, 12);
+	heat.KeepHotDirty(dirty, 8, 12, 0);
 	Check(dirty.Get(8), "a hot page must stay dirty, so that it is uploaded again");
 	Check(!dirty.Get(9) && !dirty.Get(10) && !dirty.Get(11), "a page that is not hot is clean");
 }
 
 void TestCoolingEndsHeat() {
 	Heat heat;
-	heat.NoteWrite(1, 3);
-	heat.NoteWrite(1, 3);
+	heat.NoteWrite(1, 3, 0);
+	heat.NoteWrite(1, 3, 0);
 	Check(heat.Cool(2, 4), "cooling a range with a hot page must say so");
 	Check(heat.IsHot(1) && !heat.IsHot(2), "only the cooled page lost its heat");
 	Check(!heat.Cool(2, 4), "a range with no hot page reports none");
-	heat.NoteWrite(2, 3);
+	heat.NoteWrite(2, 3, 0);
 	Check(!heat.IsHot(2), "a cooled page needs two writes again");
 	heat.CoolAll();
 	Check(!heat.IsHot(1), "cooling everything ends all heat");
-	heat.NoteWrite(1, 2);
+	heat.NoteWrite(1, 2, 0);
 	Check(!heat.IsHot(1), "after cooling everything a page needs two writes again");
+}
+
+void TestTheLeaseEndsAfterItsUploadPasses() {
+	Heat       heat;
+	Heat::Bits dirty;
+	heat.NoteWrite(5, 6, 10);
+	heat.NoteWrite(5, 6, 10);
+	Check(heat.IsHot(5), "the second write makes the page hot");
+	for (const uint32_t pass: {10u, 10u, 11u}) {
+		dirty.UnsetRange(0, 64);
+		heat.KeepHotDirty(dirty, 0, 64, pass);
+		Check(dirty.Get(5) && heat.IsHot(5), "the page stays open within its lease, at every use");
+	}
+	dirty.UnsetRange(0, 64);
+	heat.KeepHotDirty(dirty, 0, 64, 10 + Heat::LeasePasses);
+	Check(!dirty.Get(5) && !heat.IsHot(5),
+	      "at its last upload the page is clean again, so it is protected before the copy");
+	heat.NoteWrite(5, 6, 13);
+	Check(!heat.IsHot(5), "after its lease a page needs two writes again");
+	heat.NoteWrite(5, 6, 13);
+	Check(heat.IsHot(5), "two new writes give a new lease");
+}
+
+void TestTheLeaseSurvivesPassCounterWrap() {
+	Heat       heat;
+	Heat::Bits dirty;
+	heat.NoteWrite(1, 2, 0xffffffffu);
+	heat.NoteWrite(1, 2, 0xffffffffu);
+	heat.KeepHotDirty(dirty, 0, 64, 0);
+	Check(dirty.Get(1), "a lease that crosses the counter wrap is still open");
+	dirty.UnsetRange(0, 64);
+	heat.KeepHotDirty(dirty, 0, 64, 0xffffffffu + Heat::LeasePasses);
+	Check(!dirty.Get(1), "and it ends after its passes");
 }
 
 } // namespace
@@ -60,6 +93,8 @@ int main() {
 	TestAPageIsHotAfterItsSecondWrite();
 	TestHotPagesStayDirtyWhenTheRangeIsCleared();
 	TestCoolingEndsHeat();
+	TestTheLeaseEndsAfterItsUploadPasses();
+	TestTheLeaseSurvivesPassCounterWrap();
 	if (g_failures != 0) {
 		std::cerr << "WriteHeatTests: " << g_failures << " check(s) failed\n";
 		return 1;
