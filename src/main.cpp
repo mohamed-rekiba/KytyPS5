@@ -80,6 +80,8 @@ static void PrintUsage() {
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
+	::printf("  --pipeline-cache-folder <path>       Pipeline and program lists of each game.\n"
+	         "                                       Default: the user's cache folder.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump <true|false>   Enable command buffer dumps.\n");
 	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
@@ -413,6 +415,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid shader log direction: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--pipeline-cache-folder") {
+			options.config.pipeline_cache_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--shader-log-folder") {
 			options.config.shader_log_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--command-buffer-dump") {

@@ -436,6 +436,17 @@ add_executable(video_out_resolution_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(video_out_resolution_tests PRIVATE ${inc_headers})
 
+add_executable(cache_folder_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CacheFolderTests.cpp"
+)
+target_include_directories(cache_folder_tests PRIVATE ${inc_headers})
+
+add_executable(file_lock_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FileLockTests.cpp"
+)
+target_include_directories(file_lock_tests PRIVATE ${inc_headers})
+target_link_libraries(file_lock_tests common)
+
 add_executable(host_lowering_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/HostLoweringTests.cpp"
 )
@@ -680,6 +691,8 @@ if(BUILD_TESTING)
 	add_test(NAME submit_plan COMMAND $<TARGET_FILE:submit_plan_tests>)
 	add_test(NAME depth_snapshot_plan COMMAND $<TARGET_FILE:depth_snapshot_plan_tests>)
 	add_test(NAME video_out_resolution COMMAND $<TARGET_FILE:video_out_resolution_tests>)
+	add_test(NAME cache_folder COMMAND $<TARGET_FILE:cache_folder_tests>)
+	add_test(NAME file_lock COMMAND $<TARGET_FILE:file_lock_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME metadata_fill COMMAND $<TARGET_FILE:metadata_fill_tests>)
 	add_test(NAME fence_retirement COMMAND $<TARGET_FILE:fence_retirement_tests>)
@@ -769,6 +782,8 @@ if(BUILD_TESTING)
 		submit_plan_tests
 		depth_snapshot_plan_tests
 		video_out_resolution_tests
+		cache_folder_tests
+		file_lock_tests
 		image_page_table_tests
 		metadata_fill_tests
 		fence_retirement_tests

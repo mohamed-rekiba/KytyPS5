@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_PIPELINEUSE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_PIPELINEUSE_H_
 
+#include <algorithm>
 #include <cstdint>
 
 // What a draw does when its graphics pipeline is not built yet.
@@ -20,6 +21,16 @@
 // two apart: a target drawn in the previous frame as well is drawn again anyway, so a draw into
 // it may be left out; a draw into any other target waits.
 //
+// Leaving a draw out keeps what the target held before it: last frame's picture, when the game
+// draws over it. A target the game clears or overwrites (a copy, an upload, a compute write) in
+// this frame holds the clear colour instead, and every object left out of it shows as a black
+// hole until its pipeline is built. So in a frame in which a target was reset, a draw into it
+// waits (TargetHistory), but only within a budget per frame: games clear most targets every
+// frame, and at a level start on a machine that sees the game for the first time about 200 new
+// pipelines of 30 to 450 ms each are needed one after another. Waiting for all of them stopped
+// the game for 10 to 40 s (measured). Past the budget such a draw is left out, and the black hole
+// shows until its pipeline is built.
+//
 // What this cannot see: a draw into one region of a target the game otherwise redraws (that
 // region stays missing), and a target the game later copies into memory it reads (the bytes
 // miss the draw). Both need knowledge of what the game does next, which the draw does not have.
@@ -33,6 +44,8 @@ struct DrawEffects {
 	bool clears_depth = false;
 	// A target of the draw was not drawn in the previous frame.
 	bool writes_fresh_target = false;
+	// A target of the draw was cleared or overwritten, other than by a draw, in this frame.
+	bool writes_reset_target = false;
 };
 
 enum class PipelineUse : uint8_t {
@@ -40,6 +53,9 @@ enum class PipelineUse : uint8_t {
 	Draw,
 	// Wait for the build, then draw.
 	Wait,
+	// Wait for the build while the frame's budget lasts (FrameWaitBudget), then draw; past the
+	// budget, leave the draw out.
+	WaitWithinBudget,
 	// Leave the draw out; it is drawn again by the game once the pipeline is built.
 	LeaveOut,
 };
@@ -54,8 +70,96 @@ enum class PipelineUse : uint8_t {
 	    effects.writes_fresh_target) {
 		return PipelineUse::Wait;
 	}
+	if (effects.writes_reset_target) {
+		return PipelineUse::WaitWithinBudget;
+	}
 	return PipelineUse::LeaveOut;
 }
+
+// The threads that build pipelines on a host with `host_threads` hardware threads. A build is
+// mostly the host's shader compiler, which runs builds in parallel; at a level start a game asks
+// for hundreds at once. Four threads stay free for the game's threads and the GPU thread. Measured
+// on an M4 Max (14 threads), building a list of 544 pipelines: 3 threads 8.4 s, 6 threads 6.7 s,
+// 10 threads 6.2 s with the compiler's cache warm; past 10 threads nothing was measured.
+[[nodiscard]] constexpr uint32_t PipelineBuilderCount(uint32_t host_threads) noexcept {
+	constexpr uint32_t Reserved = 4;
+	constexpr uint32_t Most     = 10;
+	return std::clamp(host_threads > Reserved ? host_threads - Reserved : 1u, 1u, Most);
+}
+
+// The time draws into reset targets may wait for their pipelines in one frame: one refresh at
+// 60 Hz, so such a frame takes at most that much longer.
+inline constexpr uint64_t RESET_TARGET_WAIT_BUDGET_US = 16'000;
+
+class FrameWaitBudget {
+public:
+	// Microseconds left to wait in `frame`.
+	[[nodiscard]] uint64_t Left(uint64_t frame) noexcept {
+		if (frame != m_frame) {
+			m_frame = frame;
+			m_left  = RESET_TARGET_WAIT_BUDGET_US;
+		}
+		return m_left;
+	}
+
+	// A draw in `frame` waited `us` microseconds.
+	void Spend(uint64_t frame, uint64_t us) noexcept {
+		const auto left = Left(frame);
+		m_left          = left > us ? left - us : 0;
+	}
+
+private:
+	uint64_t m_frame = UINT64_MAX;
+	uint64_t m_left  = RESET_TARGET_WAIT_BUDGET_US;
+};
+
+// What the renderer remembers of one draw target (an image, mip and layer): the frame of its last
+// draw, the image's content generation after that draw, and the frame in which a write other
+// than a draw was last seen. The content generation counts every write to the image's contents
+// (uploads, copies, clears, compute writes, draws that write depth); a draw into a colour target
+// does not change it.
+class TargetHistory {
+public:
+	enum class Seen : uint8_t {
+		// Not drawn in this or the previous frame.
+		Fresh,
+		// Drawn recently, and holds the picture of those draws.
+		Drawn,
+		// Cleared or overwritten in this frame.
+		Reset,
+	};
+
+	// The target is about to be drawn into in `frame`; its image's content generation is
+	// `generation`.
+	[[nodiscard]] Seen Observe(uint64_t generation, uint64_t frame) noexcept {
+		// First: a write since the last draw holds for the whole frame, also when this draw
+		// waits as a fresh target and its Drawn takes the new generation.
+		if (m_drawn && generation != m_generation) {
+			m_reset_frame = frame;
+		}
+		if (!m_drawn || m_drawn_frame + 1 < frame) {
+			return Seen::Fresh;
+		}
+		return m_reset_frame == frame ? Seen::Reset : Seen::Drawn;
+	}
+
+	// The target is reset in `frame` by something its content generation does not show yet: CPU
+	// writes to its memory, uploaded when the draw acquires the target.
+	void MarkReset(uint64_t frame) noexcept { m_reset_frame = frame; }
+
+	// A draw into the target was recorded in `frame`; the content generation after it.
+	void Drawn(uint64_t frame, uint64_t generation) noexcept {
+		m_drawn       = true;
+		m_drawn_frame = frame;
+		m_generation  = generation;
+	}
+
+private:
+	bool     m_drawn       = false;
+	uint64_t m_drawn_frame = 0;
+	uint64_t m_generation  = 0;
+	uint64_t m_reset_frame = UINT64_MAX;
+};
 
 } // namespace Libs::Graphics
 

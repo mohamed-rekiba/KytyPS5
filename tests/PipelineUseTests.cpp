@@ -7,8 +7,12 @@
 namespace {
 
 using Libs::Graphics::DrawEffects;
+using Libs::Graphics::FrameWaitBudget;
+using Libs::Graphics::RESET_TARGET_WAIT_BUDGET_US;
+using Libs::Graphics::PipelineBuilderCount;
 using Libs::Graphics::PipelineUse;
 using Libs::Graphics::PlanPipelineUse;
+using Libs::Graphics::TargetHistory;
 
 int g_failures = 0;
 
@@ -42,9 +46,88 @@ void TestADrawWithEffectsBeyondThePictureWaits() {
 	      "again");
 }
 
+void TestADrawIntoATargetResetThisFrameWaitsWithinTheBudget() {
+	Check(PlanPipelineUse({.writes_reset_target = true}, false, false) ==
+	          PipelineUse::WaitWithinBudget,
+	      "a draw into a target cleared or overwritten this frame waits while the frame's budget "
+	      "lasts: left out, the clear colour would show in its place");
+	Check(PlanPipelineUse({.writes_fresh_target = true, .writes_reset_target = true}, false,
+	                      false) == PipelineUse::Wait,
+	      "a reset target that is also fresh waits without a limit: it may never be drawn again");
+	Check(PlanPipelineUse({.writes_memory = true, .writes_reset_target = true}, false, false) ==
+	          PipelineUse::Wait,
+	      "a draw that writes memory waits without a limit, whatever its targets");
+}
+
+void TestTheWaitBudgetIsPerFrame() {
+	FrameWaitBudget budget;
+	Check(budget.Left(5) == RESET_TARGET_WAIT_BUDGET_US, "a frame starts with the whole budget");
+	budget.Spend(5, 10'000);
+	Check(budget.Left(5) == RESET_TARGET_WAIT_BUDGET_US - 10'000, "a wait spends from the budget");
+	budget.Spend(5, RESET_TARGET_WAIT_BUDGET_US);
+	Check(budget.Left(5) == 0, "a wait longer than what is left empties the budget");
+	Check(budget.Left(6) == RESET_TARGET_WAIT_BUDGET_US, "the next frame has the whole budget again");
+	budget.Spend(6, 1'000);
+	Check(budget.Left(6) == RESET_TARGET_WAIT_BUDGET_US - 1'000,
+	      "spending in the new frame does not bring back the old frame's spending");
+}
+
+void TestTargetHistoryTellsResetsApart() {
+	TargetHistory history;
+	Check(history.Observe(10, 5) == TargetHistory::Seen::Fresh, "a target never drawn is fresh");
+	history.Drawn(5, 10);
+	Check(history.Observe(10, 5) == TargetHistory::Seen::Drawn,
+	      "drawn this frame, nothing else wrote it: it may be left out");
+	Check(history.Observe(10, 6) == TargetHistory::Seen::Drawn,
+	      "drawn last frame, nothing else wrote it: last frame's picture stays in place");
+	Check(history.Observe(10, 7) == TargetHistory::Seen::Fresh,
+	      "not drawn for two frames: fresh again");
+
+	TargetHistory cleared;
+	cleared.Drawn(5, 10);
+	Check(cleared.Observe(11, 6) == TargetHistory::Seen::Reset,
+	      "a clear or copy since the last draw: the target was reset");
+	cleared.Drawn(6, 11);
+	Check(cleared.Observe(11, 6) == TargetHistory::Seen::Reset,
+	      "the rest of that frame's draws into it wait as well: the clear shows under each one");
+	Check(cleared.Observe(11, 7) == TargetHistory::Seen::Drawn,
+	      "the next frame without a clear keeps the last picture: draws may be left out again");
+}
+
+void TestAResetAcrossAFrameGapIsKept() {
+	TargetHistory history;
+	history.Drawn(5, 10);
+	Check(history.Observe(11, 7) == TargetHistory::Seen::Fresh,
+	      "not drawn for two frames and cleared since: the draw waits as a fresh target");
+	history.Drawn(7, 11);
+	Check(history.Observe(11, 7) == TargetHistory::Seen::Reset,
+	      "the clear seen at that first draw still holds for the rest of the frame");
+}
+
+void TestAPendingUploadCountsAsAReset() {
+	TargetHistory history;
+	history.Drawn(5, 10);
+	history.MarkReset(6);
+	Check(history.Observe(10, 6) == TargetHistory::Seen::Reset,
+	      "CPU writes not yet uploaded to the target: the upload resets it in this frame");
+	history.Drawn(6, 11);
+	Check(history.Observe(11, 6) == TargetHistory::Seen::Reset,
+	      "the upload done inside a drawn draw still holds for the rest of the frame");
+	Check(history.Observe(11, 7) == TargetHistory::Seen::Drawn, "the next frame is clean again");
+}
+
 void TestEveryDrawWaitsWhenAsked() {
 	Check(PlanPipelineUse({}, false, true) == PipelineUse::Wait,
 	      "with --pipeline-wait a visual draw waits too");
+}
+
+void TestBuildersLeaveCoresForTheGame() {
+	Check(PipelineBuilderCount(14) == 10, "a 14-core host builds on 10 threads, 4 cores stay free");
+	Check(PipelineBuilderCount(8) == 4, "an 8-core host builds on 4 threads");
+	Check(PipelineBuilderCount(32) == 10, "no more than 10 build threads: nothing past 10 was measured");
+	Check(PipelineBuilderCount(4) == 1 && PipelineBuilderCount(2) == 1,
+	      "a small host still builds on one thread");
+	Check(PipelineBuilderCount(0) == 1, "an unknown core count builds on one thread");
 }
 
 } // namespace
@@ -53,7 +136,13 @@ int main() {
 	TestAReadyPipelineDraws();
 	TestAVisualDrawIsLeftOutWhileItsPipelineBuilds();
 	TestADrawWithEffectsBeyondThePictureWaits();
+	TestADrawIntoATargetResetThisFrameWaitsWithinTheBudget();
+	TestTheWaitBudgetIsPerFrame();
+	TestTargetHistoryTellsResetsApart();
+	TestAResetAcrossAFrameGapIsKept();
+	TestAPendingUploadCountsAsAReset();
 	TestEveryDrawWaitsWhenAsked();
+	TestBuildersLeaveCoresForTheGame();
 	if (g_failures != 0) {
 		std::cerr << g_failures << " check(s) failed\n";
 		return 1;

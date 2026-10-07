@@ -15887,7 +15887,7 @@ public:
           std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
           topology, false,
           PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader},
-          DrawEffects{.writes_fresh_target = true});
+          DrawEffects{.writes_fresh_target = true}, 0);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,

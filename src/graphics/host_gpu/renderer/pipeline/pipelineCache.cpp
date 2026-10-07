@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/fileLock.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -114,6 +115,29 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
 	message += '\n';
 	Log::WriteToConsoleAndLog(message);
+}
+
+// Writes a list into a temporary file that then takes the list's place, so that a stop in
+// between leaves the old list. Returns the list opened for appending, or null.
+std::FILE* RewriteList(const std::filesystem::path& path, std::span<const uint8_t> bytes) {
+	std::error_code error;
+	std::filesystem::create_directories(path.parent_path(), error);
+	auto temp_path = path;
+	temp_path += ".tmp";
+	bool written = false;
+	if (std::FILE* file = std::fopen(Common::PathToString(temp_path).c_str(), "wb")) {
+		written = std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
+		written = std::fclose(file) == 0 && written;
+	}
+	if (written) {
+		std::filesystem::rename(temp_path, path, error);
+		written = !error;
+	}
+	if (!written) {
+		std::filesystem::remove(temp_path, error);
+		return nullptr;
+	}
+	return std::fopen(Common::PathToString(path).c_str(), "ab");
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
@@ -433,13 +457,14 @@ struct PipelineCache::ProgramCache {
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 		}
-		// Zero without lists for this game.
+		auto compiled = CompileChecked(stage_name, options, std::move(translated),
+		                               entry->second.specialization, push_data_cursor);
+		// After the compile: a program that fails to compile stops the emulator, and it must not
+		// stop every later start from the list. Zero without lists for this game.
 		const auto identity =
 		    Remember(stage, params, input_info, entry->second.specialization, push_data_cursor);
 		entry->second.permutations.push_back(
-		    MakePermutation(CompileChecked(stage_name, options, std::move(translated),
-		                                   entry->second.specialization, push_data_cursor),
-		                    entry->second.specialization));
+		    MakePermutation(std::move(compiled), entry->second.specialization));
 		auto& permutation = entry->second.permutations.back();
 		Name(entry->second, permutation, identity);
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
@@ -587,12 +612,16 @@ struct PipelineCache::ProgramCache {
 		return XXH3_64bits(words, sizeof(words));
 	}
 
-	// With the build: a record holds what the translator was given, and what those inputs mean
-	// can change with the translator. A list from another build is started again.
+	// With the layout of what a record holds and the host's capabilities, not with the build: a
+	// record is what the translator was given, and the program built from it is filed under the
+	// key the live path computes from the same inputs. That key holds every input that changes
+	// the translation (the live cache relies on it), so a record from another build either
+	// meets a draw with the same inputs, and the current translator builds what the draw would,
+	// or it meets no draw and the build is wasted. Lists survive new builds of the emulator.
 	std::string ListSignature() const {
-		return fmt::format("KytyPL2:{}:{}:{}:{}:{:016x}\n", KYTY_GIT_HASH,
-		                   sizeof(ShaderVertexInputInfo), sizeof(ShaderPixelInputInfo),
-		                   sizeof(ShaderComputeInputInfo), HostWords());
+		return fmt::format("KytyPL3:{}:{}:{}:{:016x}\n", sizeof(ShaderVertexInputInfo),
+		                   sizeof(ShaderPixelInputInfo), sizeof(ShaderComputeInputInfo),
+		                   HostWords());
 	}
 
 	// Worker thread. Builds what the live path builds for the same inputs.
@@ -608,6 +637,8 @@ struct PipelineCache::ProgramCache {
 		out.key.code_size       = static_cast<uint32_t>(record.code.size());
 		BuildStageStaticKey(info, out.key.static_state);
 		out.identity = Identity(record, out.key.static_state);
+		// The translator reads only how many user data words there are. Their values matter to
+		// the resources alone, and the record holds the specialization they gave on the live path.
 		const std::vector<uint32_t> user_data(record.user_data_count, 0u);
 		const auto                  options =
 		    MakeOptions(record.stage, record.hash, user_data, record.back_code, info);
@@ -634,8 +665,9 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
-	// Main thread, once. Reads the list of the game and starts the workers on it.
-	void OpenProgramList(const std::filesystem::path& path) {
+	// Main thread, once. Reads the list of the game and starts the workers on it. `writable`:
+	// this emulator keeps the list; otherwise it only builds ahead from it.
+	void OpenProgramList(const std::filesystem::path& path, bool writable) {
 		const auto           signature = ListSignature();
 		std::vector<uint8_t> bytes;
 		if (std::FILE* file = std::fopen(Common::PathToString(path).c_str(), "rb")) {
@@ -659,24 +691,20 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 		}
-		std::error_code error;
-		std::filesystem::create_directories(path.parent_path(), error);
-		// A list from another layout or device is started again; a damaged tail is cut off.
-		m_list_file = std::fopen(Common::PathToString(path).c_str(), "wb");
-		if (m_list_file == nullptr) {
-			PipelineCacheLog("Program list: cannot write {}", Common::PathToString(path));
-			m_records.clear();
-			return;
+		if (writable) {
+			// A list from another layout or device is started again; a damaged tail is cut off.
+			std::vector<uint8_t> kept(signature.begin(), signature.end());
+			for (const auto& record: m_records) {
+				AppendProgramRecord(kept, record);
+			}
+			m_list_file = RewriteList(path, kept);
+			if (m_list_file == nullptr) {
+				// The programs that were read are still built ahead; new ones are not remembered.
+				PipelineCacheLog("Program list: cannot write {}", Common::PathToString(path));
+			}
 		}
-		std::fwrite(signature.data(), 1, signature.size(), m_list_file);
-		std::vector<uint8_t> kept;
-		for (const auto& record: m_records) {
-			AppendProgramRecord(kept, record);
-		}
-		std::fwrite(kept.data(), 1, kept.size(), m_list_file);
-		std::fflush(m_list_file);
-		PipelineCacheLog("Program list: {} program(s) to build ahead from {}", m_records.size(),
-		                 Common::PathToString(path));
+		PipelineCacheLog("Program list: {} program(s) to build ahead from {}{}", m_records.size(),
+		                 Common::PathToString(path), writable ? "" : " (read only)");
 		if (m_records.empty()) {
 			return;
 		}
@@ -706,6 +734,15 @@ struct PipelineCache::ProgramCache {
 				}
 			});
 		}
+	}
+
+	// True when no program will come from the list any more: every worker is done and what they
+	// built was taken over. A pipeline record whose programs are still missing then never gets
+	// them.
+	[[nodiscard]] bool ListBuilt() const {
+		// The workers set m_built_waiting before they count themselves out.
+		return m_workers_running.load(std::memory_order_acquire) == 0 &&
+		       !m_built_waiting.load(std::memory_order_acquire);
 	}
 
 	// Renderer thread, before the programs of a draw or dispatch are looked up. Takes over what
@@ -823,7 +860,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	m_always_wait       = Config::PipelineWaitEnabled();
-	const auto builders = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
+	const auto builders = PipelineBuilderCount(std::thread::hardware_concurrency());
 	if (m_graphics.host.faults.pipeline_cache_serializes_builds) {
 		m_builder_caches.resize(builders);
 		for (auto& cache: m_builder_caches) {
@@ -835,28 +872,33 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	for (uint32_t i = 0; i < builders; i++) {
 		m_builders.emplace_back([this, i](std::stop_token stop) { BuildPipelines(stop, i); });
 	}
-	// The list is signed with the build. A build that cannot name its source has no signature
-	// to trust, like the driver cache.
-	const std::string_view git_hash = KYTY_GIT_HASH;
-	if (git_hash == "unknown" || git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Program list: off (the build cannot name its source)");
-	} else if (const auto title_id = PipelineCacheTitleId(); !title_id.empty()) {
-		m_program_cache->OpenProgramList(std::filesystem::path("_PipelineCache") /
-		                                 (title_id + ".programs"));
-		OpenPipelineList(std::filesystem::path("_PipelineCache") / (title_id + ".pipelines"));
+	if (const auto title_id = PipelineCacheTitleId(); !title_id.empty()) {
+		const auto folder = Config::GetPipelineCacheFolder();
+		// The folder is shared by every copy of the emulator: one at a time keeps a game's lists.
+		// Another one running the same game builds ahead from them and leaves the files alone.
+		m_lists_writable = m_list_lock.TryAcquire(folder / (title_id + ".lock"));
+		if (!m_lists_writable) {
+			PipelineCacheLog("Pipeline lists: another emulator keeps them for this game, or the "
+		                 "lock file cannot be opened; read only");
+		}
+		m_program_cache->OpenProgramList(folder / (title_id + ".programs"), m_lists_writable);
+		OpenPipelineList(folder / (title_id + ".pipelines"), m_lists_writable);
 	}
 }
 
-// Signed like the program list: with the build, and with the layout of what a record holds.
-static std::string PipelineListSignature() {
-	return fmt::format("KytyPP2:{}:{}:{}:{}:{}:{}:{}\n", KYTY_GIT_HASH,
+// Signed like the program list: with the layout of what a record holds and the host's
+// capabilities, not with the build. A record names its programs and fixed state; the pipeline
+// built from it is filed under the key a draw computes from the same state, so a record that no
+// draw matches is only a wasted build.
+static std::string PipelineListSignature(uint64_t host_words) {
+	return fmt::format("KytyPP3:{}:{}:{}:{}:{}:{}:{:016x}\n",
 	                   sizeof(PipelineRenderingState), sizeof(PipelineVertexInputState),
 	                   sizeof(PipelineStaticParameters), sizeof(ShaderVertexInputInfo),
-	                   sizeof(ShaderPixelInputInfo), sizeof(ShaderComputeInputInfo));
+	                   sizeof(ShaderPixelInputInfo), sizeof(ShaderComputeInputInfo), host_words);
 }
 
-void PipelineCache::OpenPipelineList(const std::filesystem::path& path) {
-	const auto           signature = PipelineListSignature();
+void PipelineCache::OpenPipelineList(const std::filesystem::path& path, bool writable) {
+	const auto           signature = PipelineListSignature(m_program_cache->HostWords());
 	std::vector<uint8_t> bytes;
 	if (std::FILE* file = std::fopen(Common::PathToString(path).c_str(), "rb")) {
 		std::fseek(file, 0, SEEK_END);
@@ -890,22 +932,11 @@ void PipelineCache::OpenPipelineList(const std::filesystem::path& path) {
 		m_pipelines_on_list.insert(XXH3_64bits(bytes.data(), bytes.size()));
 		kept.insert(kept.end(), bytes.begin(), bytes.end());
 	}
-	std::error_code error;
-	std::filesystem::create_directories(path.parent_path(), error);
-	auto temp_path = path;
-	temp_path += ".tmp";
-	bool written = false;
-	if (std::FILE* file = std::fopen(Common::PathToString(temp_path).c_str(), "wb")) {
-		written = std::fwrite(kept.data(), 1, kept.size(), file) == kept.size();
-		written = std::fclose(file) == 0 && written;
+	if (!writable) {
+		// Another emulator keeps the list: the pipelines read are built ahead, nothing is added.
+		return;
 	}
-	if (written) {
-		std::filesystem::rename(temp_path, path, error);
-		written = !error;
-	}
-	if (written) {
-		m_pipeline_list = std::fopen(Common::PathToString(path).c_str(), "ab");
-	}
+	m_pipeline_list = RewriteList(path, kept);
 	if (m_pipeline_list == nullptr) {
 		// The pipelines that were read are still built ahead; new ones are not remembered.
 		PipelineCacheLog("Pipeline list: cannot write {}", Common::PathToString(path));
@@ -997,7 +1028,8 @@ void PipelineCache::QueueListedPipelines() {
 	if (m_listed_pipelines.empty()) {
 		return;
 	}
-	std::erase_if(m_listed_pipelines, [this](const PipelineRecord& record) {
+	const bool list_built = m_program_cache->ListBuilt();
+	std::erase_if(m_listed_pipelines, [this, list_built](const PipelineRecord& record) {
 		PipelineJob         job;
 		GraphicsPipelineKey key;
 		// Dropped or already built: done as far as the title's count goes.
@@ -1005,10 +1037,14 @@ void PipelineCache::QueueListedPipelines() {
 			m_graphics.pipelines_ahead_built.fetch_add(1, std::memory_order_relaxed);
 			return true;
 		};
+		// A program that is not built yet is asked for again at the next draw. Once the program
+		// list is built, it never comes: the record is dropped, and a draw that needs the pipeline
+		// builds it.
+		const auto missing = [&] { return list_built ? done() : false; };
 		if (record.stage_count == 0 && !record.pixel_present) {
 			const auto program = m_program_cache->Listed(record.programs[0]);
 			if (!program) {
-				return false;
+				return missing();
 			}
 			auto bytes = std::span<const uint8_t>(record.fixed_state);
 			job.compute.emplace();
@@ -1027,7 +1063,7 @@ void PipelineCache::QueueListedPipelines() {
 		for (uint32_t i = 0; i < record.stage_count; i++) {
 			const auto program = m_program_cache->Listed(record.programs[i]);
 			if (!program) {
-				return false; // not built yet; asked again at the next draw
+				return missing();
 			}
 			auto bytes = std::span<const uint8_t>(record.stages[i]);
 			if (!ReadBytes(bytes, job.vertex_info[i]) || !bytes.empty()) {
@@ -1041,7 +1077,7 @@ void PipelineCache::QueueListedPipelines() {
 		if (record.pixel_present) {
 			const auto program = m_program_cache->Listed(record.programs[3]);
 			if (!program) {
-				return false;
+				return missing();
 			}
 			auto bytes = std::span<const uint8_t>(record.pixel);
 			job.pixel.emplace();
@@ -1113,9 +1149,11 @@ PipelineCache::~PipelineCache() {
 	m_builders.clear();
 	if (m_builds != 0) {
 		PipelineCacheLog("Pipelines: {} built on worker threads, {} ms each on average, the "
-		                 "longest {} ms; {} draw(s) left out while their pipeline was built",
+		                 "longest {} ms; {} draw(s) left out while their pipeline was built, {} "
+		                 "waited within the frame's budget because their target was cleared or "
+		                 "overwritten in that frame",
 		                 m_builds, m_build_us / m_builds / 1000, m_longest_us / 1000,
-		                 m_left_out_draws);
+		                 m_left_out_draws, m_reset_target_waits);
 	}
 	Save();
 	if (m_pipeline_list != nullptr) {
@@ -1187,7 +1225,7 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	m_driver_cache_path     = Config::GetPipelineCacheFolder() / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -1254,7 +1292,7 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::Save() {
-	if (m_driver_cache == nullptr || m_driver_cache_path.empty()) {
+	if (m_driver_cache == nullptr || m_driver_cache_path.empty() || !m_lists_writable) {
 		return;
 	}
 
@@ -1472,7 +1510,8 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs, const DrawEffects& effects) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs, const DrawEffects& effects,
+    uint64_t frame) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
@@ -1639,7 +1678,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return WhenReady(*iter->second, effects);
+		return WhenReady(*iter->second, effects, frame);
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1666,7 +1705,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	job.static_params = static_params;
 	RememberPipeline(key, job);
 	QueueBuild(key, std::move(job));
-	return WhenReady(*m_graphics_pipelines.find(key)->second, effects);
+	return WhenReady(*m_graphics_pipelines.find(key)->second, effects, frame);
 }
 
 void PipelineCache::BuildPipelines(std::stop_token stop, uint32_t builder) {
@@ -1711,8 +1750,29 @@ void PipelineCache::BuildPipelines(std::stop_token stop, uint32_t builder) {
 	}
 }
 
-PipelineCache::Pipeline* PipelineCache::WhenReady(GraphicsEntry& entry, const DrawEffects& effects) {
+PipelineCache::Pipeline* PipelineCache::WhenReady(GraphicsEntry& entry, const DrawEffects& effects,
+                                                  uint64_t frame) {
 	const auto ready = [&entry] { return entry.ready.load(std::memory_order_acquire); };
+	const auto leave_out = [this] {
+		if (m_left_out_draws++ == 0) {
+			PipelineCacheLog("Pipelines: a draw is left out until its pipeline is built "
+			                 "(--pipeline-wait true waits instead)");
+		}
+		return nullptr;
+	};
+	// A build the driver has cached takes about a millisecond: a wait that short is no visible
+	// stop, and the picture stays exact on a host that builds fast.
+	const auto grace_wait = [&]() -> Pipeline* {
+		constexpr auto GraceWait = std::chrono::milliseconds(2);
+		Promote(entry);
+		{
+			std::unique_lock lock(m_jobs_mutex);
+			if (m_job_done.wait_for(lock, GraceWait, ready)) {
+				return &entry.pipeline;
+			}
+		}
+		return leave_out();
+	};
 	switch (PlanPipelineUse(effects, ready(), m_always_wait)) {
 		case PipelineUse::Draw: return &entry.pipeline;
 		case PipelineUse::Wait: {
@@ -1721,20 +1781,30 @@ PipelineCache::Pipeline* PipelineCache::WhenReady(GraphicsEntry& entry, const Dr
 			m_job_done.wait(lock, ready);
 			return &entry.pipeline;
 		}
-		case PipelineUse::LeaveOut: {
-			// A build the driver has cached takes about a millisecond: a wait that short is no
-			// visible stop, and the picture stays exact on a host that builds fast.
-			constexpr auto GraceWait = std::chrono::milliseconds(2);
-			std::unique_lock lock(m_jobs_mutex);
-			if (m_job_done.wait_for(lock, GraceWait, ready)) {
-				return &entry.pipeline;
+		case PipelineUse::WaitWithinBudget: {
+			const auto left = m_reset_target_budget.Left(frame);
+			if (left == 0) {
+				// The frame's budget is spent: no worse off than a draw into a target not reset.
+				return grace_wait();
 			}
-			if (m_left_out_draws++ == 0) {
-				PipelineCacheLog("Pipelines: a draw is left out until its pipeline is built "
-				                 "(--pipeline-wait true waits instead)");
+			m_reset_target_waits++;
+			Promote(entry);
+			const auto begin = std::chrono::steady_clock::now();
+			bool       built = false;
+			{
+				std::unique_lock lock(m_jobs_mutex);
+				built = m_job_done.wait_for(lock, std::chrono::microseconds(left), ready);
 			}
-			return nullptr;
+			m_reset_target_budget.Spend(
+			    frame, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                     std::chrono::steady_clock::now() - begin)
+			                                     .count()));
+			if (!built) {
+				return grace_wait();
+			}
+			return &entry.pipeline;
 		}
+		case PipelineUse::LeaveOut: return grace_wait();
 	}
 	return nullptr;
 }
@@ -1750,7 +1820,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	// on a worker all the same, so it is in parallel with others, and the game's list builds it
 	// ahead at the next start.
 	const auto wait = [this](GraphicsEntry& entry) -> Pipeline& {
-		return *WhenReady(entry, DrawEffects {.writes_memory = true});
+		return *WhenReady(entry, DrawEffects {.writes_memory = true}, 0);
 	};
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {

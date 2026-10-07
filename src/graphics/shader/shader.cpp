@@ -764,6 +764,8 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));
 	}
 	key.push_back(static_cast<uint32_t>(info.tg_size_en));
+	// LDS in a storage buffer when the host's shared memory is too small: another binding layout.
+	key.push_back(static_cast<uint32_t>(info.lds_storage));
 }
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,

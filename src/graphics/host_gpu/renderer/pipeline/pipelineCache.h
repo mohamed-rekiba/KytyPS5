@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
 
+#include "common/fileLock.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -154,12 +155,14 @@ public:
 
 	// A pipeline that is not known yet is built on a worker thread. Null when it is still being
 	// built and the draw is left out for now; see PlanPipelineUse for which draws wait instead.
+	// `frame`: the game's frame the draw belongs to, for the budget of waits (FrameWaitBudget).
 	Pipeline* GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs, const DrawEffects& effects);
+	                              const GraphicsPrograms& programs, const DrawEffects& effects,
+	                              uint64_t frame);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -230,6 +233,12 @@ private:
 	bool                        m_always_wait = false;
 	// Counters for the log at exit.
 	uint64_t m_left_out_draws = 0;
+	// Held while this emulator keeps the game's lists (several copies share the folder).
+	Common::FileLock m_list_lock;
+	bool             m_lists_writable = false;
+	// Draws that waited only because a target of theirs was reset in this frame (pipelineUse.h).
+	uint64_t        m_reset_target_waits = 0;
+	FrameWaitBudget m_reset_target_budget;
 	uint64_t m_builds         = 0;
 	uint64_t m_build_us       = 0; // under m_jobs_mutex
 	uint64_t m_longest_us     = 0; // under m_jobs_mutex
@@ -241,7 +250,7 @@ private:
 	std::FILE*                   m_pipeline_list = nullptr;
 
 	void                    InitializeDriverCache();
-	void                    OpenPipelineList(const std::filesystem::path& path);
+	void OpenPipelineList(const std::filesystem::path& path, bool writable);
 	void                    QueueListedPipelines();
 	void                    RememberPipeline(const GraphicsPipelineKey& key, const PipelineJob& job);
 	// A compute record: no stages, no pixel program; the program is first, the input info is
@@ -254,7 +263,8 @@ private:
 	// A draw or dispatch waits for this build: it goes first.
 	void                    Promote(const GraphicsEntry& entry);
 	void                    BuildPipelines(std::stop_token stop, uint32_t builder);
-	[[nodiscard]] Pipeline* WhenReady(GraphicsEntry& entry, const DrawEffects& effects);
+	[[nodiscard]] Pipeline* WhenReady(GraphicsEntry& entry, const DrawEffects& effects,
+	                                   uint64_t frame);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

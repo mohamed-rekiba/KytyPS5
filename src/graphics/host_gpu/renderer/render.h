@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/pipelineUse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -255,7 +256,7 @@ private:
 	static TargetId TargetKey(ImageId image, uint32_t mip = 0, uint32_t layer = 0) {
 		return {ImageIdentity(image), mip, layer};
 	}
-	std::unordered_map<TargetId, uint64_t, TargetIdHash> m_target_frames;
+	std::unordered_map<TargetId, TargetHistory, TargetIdHash> m_target_frames;
 	// Buffers a draw uses on the GPU alone, within one submission (a depth snapshot, the records
 	// of an emulated mesh draw). Kept and used again once the GPU has passed the submission that
 	// used them: creating and destroying one per draw cost 0.45 ms each on MoltenVK.

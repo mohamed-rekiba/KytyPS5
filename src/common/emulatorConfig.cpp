@@ -1,7 +1,9 @@
+#include "common/cacheFolder.h"
 #include "common/emulatorConfig.h"
 
 #include "common/assert.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <memory>
 
@@ -114,6 +116,24 @@ ShaderOptimizationType GetShaderOptimizationType() {
 
 LogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
+}
+
+std::filesystem::path GetPipelineCacheFolder() {
+	const auto variable = [](const char* name) {
+		const char* value = std::getenv(name);
+		return value != nullptr ? std::string(value) : std::string();
+	};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr auto host = Common::CacheHost::Windows;
+#elif defined(__APPLE__)
+	constexpr auto host = Common::CacheHost::MacOs;
+#else
+	constexpr auto host = Common::CacheHost::Linux;
+#endif
+	return Common::PipelineCacheFolder(g_config->pipeline_cache_folder, host,
+	                                   {.home           = variable("HOME"),
+	                                    .xdg_cache_home = variable("XDG_CACHE_HOME"),
+	                                    .local_app_data = variable("LOCALAPPDATA")});
 }
 
 std::filesystem::path GetShaderLogFolder() {

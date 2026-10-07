@@ -1227,21 +1227,32 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	DrawEffects effects {.clears_depth = state.depth_info.depth_clear_enable ||
 	                                     state.depth_info.stencil_clear_enable};
-	// A target drawn in the previous frame, or earlier in this one, is drawn again anyway.
-	const auto drawn_recently = [&](const TargetId& target) {
-		const auto it = m_target_frames.find(target);
-		return it != m_target_frames.end() && it->second + 1 >= m_frame;
+	// A target drawn in the previous frame, or earlier in this one, is drawn again anyway; one
+	// cleared or overwritten in this frame shows the clear where a draw is missing.
+	auto&      texture_cache = m_context.GetTextureCache();
+	const auto observe       = [&](const TargetId& target, ImageId image) {
+        auto&       history = m_target_frames[target];
+        const auto& native  = texture_cache.GetImage(image);
+        // CPU writes to the target's memory, and GPU buffer writes to it (fills, copies), are
+        // uploaded when the draw acquires it, after this decision: the upload resets the
+        // target in this frame.
+        if (native.IsCpuDirty() || native.IsBufferModified()) {
+            history.MarkReset(m_frame);
+        }
+        switch (history.Observe(native.ContentGeneration(), m_frame)) {
+            case TargetHistory::Seen::Fresh: effects.writes_fresh_target = true; break;
+            case TargetHistory::Seen::Reset: effects.writes_reset_target = true; break;
+            case TargetHistory::Seen::Drawn: break;
+        }
 	};
 	const bool writes_depth =
 	    state.depth_info.image_id &&
 	    (state.depth_info.depth_write_enable || state.depth_info.stencil_test_enable);
 	for (uint32_t i = 0; i < state.color_count; i++) {
-		effects.writes_fresh_target =
-		    effects.writes_fresh_target || !drawn_recently(TargetKey(state.color_info[i]));
+		observe(TargetKey(state.color_info[i]), state.color_info[i].image_id);
 	}
 	if (writes_depth) {
-		effects.writes_fresh_target =
-		    effects.writes_fresh_target || !drawn_recently(TargetKey(state.depth_info.image_id));
+		observe(TargetKey(state.depth_info.image_id), state.depth_info.image_id);
 	}
 	for (const auto& stage: vertex_stages) {
 		effects.writes_memory = effects.writes_memory || HasShaderMemoryWrites(stage.stage);
@@ -1253,17 +1264,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto* const pipeline_or_none = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs, effects);
+	    state.programs, effects, m_frame);
 	if (pipeline_or_none == nullptr) {
 		return;
 	}
 	auto& pipeline = *pipeline_or_none;
-	for (uint32_t i = 0; i < state.color_count; i++) {
-		m_target_frames[TargetKey(state.color_info[i])] = m_frame;
-	}
-	if (writes_depth) {
-		m_target_frames[TargetKey(state.depth_info.image_id)] = m_frame;
-	}
 
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
@@ -1441,6 +1446,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    (state.depth_info.depth_write_enable || state.depth_info.stencil_test_enable ||
 	     state.depth_info.stencil_clear_enable || state.depth_info.depth_load_clear_enable)) {
 		m_context.GetTextureCache().GetImage(state.depth_info.image_id).NoteContentWrite();
+	}
+	// The targets hold this draw's picture now (see TargetHistory).
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		m_target_frames[TargetKey(state.color_info[i])].Drawn(
+		    m_frame, texture_cache.GetImage(state.color_info[i].image_id).ContentGeneration());
+	}
+	if (writes_depth) {
+		m_target_frames[TargetKey(state.depth_info.image_id)].Drawn(
+		    m_frame, texture_cache.GetImage(state.depth_info.image_id).ContentGeneration());
 	}
 	m_context.GetCommandScheduler().NoteWork();
 	LogDrawPhase(draw.Name(), "DrawComplete");
