@@ -428,6 +428,58 @@ void TestPcmCopiedBeforeScratchBufferReuse() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+// A game sends its 3D sound as an ambisonic field: mono object ports, one for each channel.
+void TestAmbisonicPortsAreDecodedToStereo() {
+	const auto context = CreateContext();
+	auto       param   = MakeParam(0x100);
+	param.port_type    = 0x0100;
+	const int devices_before = LiveDeviceCount();
+	std::vector<AudioOut2::AudioOut2PortHandle> ports(4);
+	for (auto& port: ports) {
+		Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+		      "object port create failed");
+	}
+	Check(LiveDeviceCount() == devices_before + 1,
+	      "the object ports of a context did not get one output for the decoded field");
+
+	// A sound on the left: W and Y carry it, in phase. Z and X carry other content.
+	const std::vector<float> w(512, 0.5f);
+	const std::vector<float> y(512, 0.5f);
+	const std::vector<float> other(512, 0.75f);
+	const float              gain = 0.5f;
+	for (uint32_t channel = 0; channel < ports.size(); channel++) {
+		const uint32_t  tag = 0x40u + channel;
+		const Pcm       pcm {channel == 0 ? w.data() : channel == 1 ? y.data() : other.data()};
+		const Attribute attributes[] {{0, 0, &pcm, sizeof(pcm)},
+		                              {1, 0, &gain, sizeof(gain)},
+		                              {8, 0, &tag, sizeof(tag)}};
+		Check(AudioOut2::AudioOut2PortSetAttributes(ports[channel], AsAttribute(attributes), 3) ==
+		          OK,
+		      "setting ambisonic attributes failed");
+	}
+
+	// The decoded field is the front pair of an 8-channel stream, like the game's own bed.
+	const auto bed_bytes = 512 * 8 * sizeof(float);
+	CaptureOutputPcm(bed_bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "ambisonic push failed");
+	const auto output = OutputPcm();
+	Check(output.size() == 1, "the ambisonic field did not reach the device as one stream");
+	std::vector<float> bed(512 * 8);
+	std::memcpy(bed.data(), output[0].data(), bed_bytes);
+	// left = gain * (W + Y) / 2, right = gain * (W - Y) / 2
+	Check(bed[0] == 0.25f && bed[1] == 0.0f && bed[511 * 8] == 0.25f && bed[511 * 8 + 1] == 0.0f,
+	      "a sound on the left was not decoded to the front left channel");
+	Check(std::all_of(bed.begin() + 2, bed.begin() + 8, [](float v) { return v == 0.0f; }),
+	      "the decoded field leaked into the other channels");
+
+	CaptureOutputPcm(0);
+	for (const auto port: ports) {
+		AudioOut2::AudioOut2PortDestroy(port);
+	}
+	AudioOut2::AudioOut2ContextDestroy(context);
+	Check(LiveDeviceCount() == devices_before, "the output of the decoded field leaked");
+}
+
 } // namespace
 
 namespace Libs::Audio::AudioInternal {
@@ -499,6 +551,7 @@ int main() {
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
 	TestPcmCopiedBeforeScratchBufferReuse();
+	TestAmbisonicPortsAreDecodedToStereo();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;

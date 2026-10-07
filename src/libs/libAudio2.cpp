@@ -4,6 +4,7 @@
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "libs/audio.h"
+#include "libs/audioAmbisonics.h"
 #include "libs/audio_internal.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -176,6 +177,8 @@ struct AudioOut2ContextState {
 	uint32_t               queued      = 0;
 	uint32_t               num_grains  = 512;
 	uint64_t               last_update = 0;
+	// The device that plays the decoded ambisonic field of this context's object ports.
+	int field_handle = 0;
 };
 
 struct AudioOut2PortStateEntry {
@@ -190,6 +193,9 @@ struct AudioOut2PortStateEntry {
 	AudioInternal::Format  audio_format  = AudioInternal::Format::Unknown;
 	int                    audio_handle  = 0;
 	std::vector<uint8_t>   pcm_data;
+	// For an object port that carries one channel of an ambisonic field: its ACN number.
+	int   field_channel = -1;
+	float gain          = 1.0f;
 };
 
 struct AudioOut2SpeakerArrayState {
@@ -224,6 +230,11 @@ static constexpr int AUDIO_OUT2_ERROR_BUSY                        = -2144960505;
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999; /* 0x80268201 */
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN            = 1;
+// Seen from a title that sends a third-order field through 16 mono object ports: a 32-bit value,
+// 0x40 + the ACN channel number. What bit 6 says is not known.
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS                  = 8;
+static constexpr uint32_t AUDIO_OUT2_AMBISONICS_CHANNEL_MASK                       = 0x3f;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_OUTPUT_RECORDING   = 2;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_DEFAULT  = 1;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_V2       = 2;
@@ -350,8 +361,29 @@ static size_t audioout2_pcm_size(const AudioOut2PortStateEntry& state) {
 	       audioout2_data_format_channels(state.data_format) * bytes_per_sample;
 }
 
+static int audioout2_field_handle(AudioOut2ContextHandle ctx) {
+	Common::LockGuard lock(g_audioout2_context_mutex);
+	const auto*       state = audioout2_find_context_locked(ctx);
+	return state != nullptr ? state->field_handle : 0;
+}
+
+static constexpr size_t FieldOutputChannels = 8;
+
+static bool audioout2_port_carries_field(const AudioOut2PortStateEntry& state) {
+	return state.field_channel >= 0 && state.audio_format == AudioInternal::Format::FloatMono &&
+	       !state.pcm_data.empty();
+}
+
 static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
+	const int  field_handle = audioout2_field_handle(ctx);
+	const bool field_device = field_handle > 0 && AudioInternal::AudioOutHasDevice(field_handle);
 	Common::LockGuard lock(g_audioout2_port_mutex);
+	for (const auto& state: g_audioout2_ports) {
+		if (field_device && state.used && state.context == ctx &&
+		    audioout2_port_carries_field(state)) {
+			return true;
+		}
+	}
 	for (const auto& state: g_audioout2_ports) {
 		if (state.used && state.context == ctx && state.audio_handle > 0 &&
 		    !state.pcm_data.empty() && AudioInternal::AudioOutHasDevice(state.audio_handle)) {
@@ -366,13 +398,41 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	// Keep both PCM storage and port handles alive until it returns.
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
+	const int                        field_handle = audioout2_field_handle(ctx);
+	std::vector<Ambisonics::Channel> field;
+	std::vector<float>               stereo;
+	std::vector<float>               bed;
+	size_t                           frames = 0;
 
 	Common::LockGuard lock(g_audioout2_port_mutex);
 	for (const auto& state: g_audioout2_ports) {
-		if (state.used && state.context == ctx && state.audio_handle > 0 &&
-		    !state.pcm_data.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
+		if (!state.used || state.context != ctx) {
+			continue;
+		}
+		if (state.audio_handle > 0 && !state.pcm_data.empty() &&
+		    params.size() < AudioInternal::OUT_PORTS_MAX) {
 			params.push_back(AudioInternal::OutputParam {state.audio_handle, state.pcm_data.data()});
 		}
+		if (field_handle > 0 && audioout2_port_carries_field(state)) {
+			const auto port_frames = state.pcm_data.size() / sizeof(float);
+			frames                 = field.empty() ? port_frames : std::min(frames, port_frames);
+			field.push_back({.acn     = static_cast<uint32_t>(state.field_channel),
+			                 .samples = reinterpret_cast<const float*>(state.pcm_data.data()),
+			                 .gain    = state.gain});
+		}
+	}
+	if (!field.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
+		stereo.resize(frames * 2);
+		Ambisonics::DecodeToStereo(field, frames, stereo.data());
+		// The field goes out as the front pair of an 8-channel stream, like the game's own
+		// 8-channel bed. The host scales 8 channels down for the speakers that are there; a
+		// plain stereo stream would skip that step and come out much louder than the bed.
+		bed.assign(frames * FieldOutputChannels, 0.0f);
+		for (size_t i = 0; i < frames; i++) {
+			bed[i * FieldOutputChannels]     = stereo[i * 2];
+			bed[i * FieldOutputChannels + 1] = stereo[i * 2 + 1];
+		}
+		params.push_back(AudioInternal::OutputParam {field_handle, bed.data()});
 	}
 
 	if (!params.empty()) {
@@ -467,11 +527,14 @@ int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	PRINT_NAME();
 	LOGF("\t ctx = 0x%016" PRIx64 "\n", ctx);
 
+	int field_handle = 0;
 	g_audioout2_context_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		*state = AudioOut2ContextState {};
+		field_handle = state->field_handle;
+		*state       = AudioOut2ContextState {};
 	}
 	g_audioout2_context_mutex.Unlock();
+	audioout2_close_audio_handle(field_handle);
 
 	std::array<int, 256> audio_handles {};
 	size_t               audio_handles_num = 0;
@@ -631,6 +694,23 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		audio_handle = AudioInternal::AudioOutOpen(audio_type, samples_num, params->sampling_freq,
 		                                           audio_format);
 	}
+	// Object ports have no device of their own. The ones that carry an ambisonic field are
+	// decoded together into one stereo stream for the context.
+	if (audio_format == AudioInternal::Format::FloatMono &&
+	    audioout2_port_type_is_object(params->port_type) && audioout2_field_handle(ctx) == 0) {
+		int field_handle =
+		    AudioInternal::AudioOutOpen(AUDIO_OUT_PORT_TYPE_MAIN, samples_num,
+		                                params->sampling_freq, AudioInternal::Format::Float8ChStd);
+		g_audioout2_context_mutex.Lock();
+		if (auto* state = audioout2_find_context_locked(ctx);
+		    state != nullptr && state->field_handle == 0) {
+			state->field_handle = field_handle;
+			field_handle        = 0;
+		}
+		g_audioout2_context_mutex.Unlock();
+		// The context is gone, or another port opened the device first.
+		audioout2_close_audio_handle(field_handle);
+	}
 
 	g_audioout2_port_mutex.Lock();
 	const bool reserved = port_state->used && port_state->handle == next_port;
@@ -679,16 +759,48 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
                                              const AudioOut2Attribute* attributes, uint32_t num) {
 	EXIT_NOT_IMPLEMENTED(num != 0 && attributes == nullptr);
 
-	const void* pcm_data = nullptr;
-	bool        has_pcm  = false;
+	const void* pcm_data      = nullptr;
+	bool        has_pcm       = false;
+	bool        has_gain      = false;
+	float       gain          = 1.0f;
+	int         field_channel = -1;
 	for (uint32_t i = 0; i < num; i++) {
+		if (attributes[i].value == nullptr) {
+			continue;
+		}
 		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM &&
-		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
+		    attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
 			AudioOut2Pcm pcm {};
 			std::memcpy(&pcm, attributes[i].value, sizeof(AudioOut2Pcm));
 			pcm_data = pcm.data;
 			has_pcm  = true;
 		}
+		// A port with several channels sends one gain for each: that form is not used here.
+		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN &&
+		    attributes[i].value_size == sizeof(float)) {
+			std::memcpy(&gain, attributes[i].value, sizeof(float));
+			has_gain = true;
+		}
+		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS &&
+		    attributes[i].value_size >= sizeof(uint32_t)) {
+			uint32_t tag = 0;
+			std::memcpy(&tag, attributes[i].value, sizeof(uint32_t));
+			field_channel = static_cast<int>(tag & AUDIO_OUT2_AMBISONICS_CHANNEL_MASK);
+		}
+	}
+
+	if (has_gain || field_channel >= 0) {
+		g_audioout2_port_mutex.Lock();
+		if (auto* state = audioout2_find_port_locked(port);
+		    state != nullptr && audioout2_port_type_is_object(state->port_type)) {
+			if (has_gain) {
+				state->gain = gain;
+			}
+			if (field_channel >= 0) {
+				state->field_channel = field_channel;
+			}
+		}
+		g_audioout2_port_mutex.Unlock();
 	}
 
 	if (has_pcm) {
