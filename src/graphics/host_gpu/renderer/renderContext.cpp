@@ -64,6 +64,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
+		m_texture_cache.SaveGpuWrites(fault_vaddr, fault_size);
 		constexpr uint64_t window = 64 * 1024;
 		m_buffer_cache.InvalidateWrittenMemory(
 		    fault_vaddr, IsMapped(Common::AlignDown(fault_vaddr, window), window));
@@ -78,6 +79,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	m_texture_cache.SaveGpuWrites(vaddr, size);
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;

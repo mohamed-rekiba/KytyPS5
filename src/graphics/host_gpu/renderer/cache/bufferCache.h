@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -152,6 +153,9 @@ private:
 	static constexpr size_t  MaxCpuWriteLog = 4096;
 	// Records a range for TakeCpuWrites.
 	void RecordCpuWrite(uint64_t vaddr, uint64_t size);
+	// The same for a range of hot pages, once until the log is taken: a hot range is synchronized
+	// at every use, and each would log it again.
+	void RecordHotRange(uint64_t vaddr, uint64_t size);
 	// GPU thread. One round of a read-back, by the rule of readbackPlan.h. Returns the submission
 	// the caller must wait for before it asks again, or nothing when guest memory is current.
 	[[nodiscard]] std::optional<uint64_t> ReadBack(uint64_t vaddr, uint64_t size, bool is_write,
@@ -189,6 +193,8 @@ private:
 	std::mutex                                        m_cpu_write_log_mutex;
 	std::vector<GuestRange>                           m_cpu_write_log;
 	bool                                              m_cpu_writes_need_full_pass = true;
+	// The hot ranges in m_cpu_write_log, by address (see RecordHotRange).
+	std::unordered_set<uint64_t>                      m_hot_ranges_logged;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

@@ -62,6 +62,10 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// A guest thread is about to write CPU memory in the range. An image the GPU wrote there is
+	// copied to guest memory first, and the caller waits for the copy: after the write the image
+	// is uploaded again from that memory, which must hold what the GPU wrote.
+	void               SaveGpuWrites(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);

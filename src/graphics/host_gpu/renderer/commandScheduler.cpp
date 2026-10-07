@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "common/logging/log.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/submitPlan.h"
 
@@ -95,6 +96,10 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
+bool CommandScheduler::InCompletionOffGpuThread() noexcept {
+	return InDeferredOperation() && !GuestGpu::IsGpuThread();
+}
+
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
@@ -185,9 +190,15 @@ bool CommandScheduler::SubmitIfDue(SubmitPoint point) {
 	if (used && m_open_since == std::chrono::steady_clock::time_point {}) {
 		m_open_since = std::chrono::steady_clock::now();
 	}
-	SubmitState state {.open_work      = m_open_work,
-	                   .open_callbacks = point == SubmitPoint::Packet ? 0u : m_open_callbacks,
-	                   .open_used      = used,
+	uint32_t open_operations = 0;
+	{
+		std::lock_guard lock(m_operation_mutex);
+		open_operations = m_open_operations;
+	}
+	SubmitState state {.open_work       = m_open_work,
+	                   .open_callbacks  = point == SubmitPoint::Packet ? 0u : m_open_callbacks,
+	                   .open_operations = open_operations,
+	                   .open_used       = used,
 	                   .about_to_wait  = point == SubmitPoint::Wait};
 	// The clock is read only when the age can decide: it is the costly part of this check.
 	if (point == SubmitPoint::GuestSubmission && used && state.open_callbacks == 0 &&
@@ -201,6 +212,7 @@ bool CommandScheduler::SubmitIfDue(SubmitPoint point) {
 		case SubmitReason::None: return false;
 		case SubmitReason::Callbacks: KYTY_PROFILER_MESSAGE("submit: callbacks"); break;
 		case SubmitReason::Idle: KYTY_PROFILER_MESSAGE("submit: idle"); break;
+		case SubmitReason::Operations: KYTY_PROFILER_MESSAGE("submit: operations"); break;
 		case SubmitReason::Work: KYTY_PROFILER_MESSAGE("submit: work"); break;
 		case SubmitReason::Age: KYTY_PROFILER_MESSAGE("submit: age"); break;
 	}
@@ -254,9 +266,14 @@ void CommandScheduler::PopPendingOperations() {
 				return;
 			}
 			front_tick = m_pending_operations.front().tick;
-			// Cheap early out, without holding off submissions: checked again below.
-			if (m_pending_operations.size() <= MaxPendingOperations &&
-			    !m_master.IsRetired(std::max(front_tick, m_master.CurrentTick() - 1))) {
+			// Cheap early out, without holding off submissions: checked again below. An operation
+			// of the open submission is never forced, also past the limit: the open command buffer
+			// can still use what it destroys, and waiting for that submission here can block the
+			// thread that has to submit it. Many of them make the GPU thread submit at the next
+			// packet instead (see submitPlan.h).
+			if (front_tick >= m_master.CurrentTick() ||
+			    (m_pending_operations.size() <= MaxPendingOperations &&
+			     !m_master.IsRetired(std::max(front_tick, m_master.CurrentTick() - 1)))) {
 				return;
 			}
 		}
@@ -280,6 +297,9 @@ void CommandScheduler::PopPendingOperations() {
 				continue;
 			}
 			const auto last_submitted = m_master.CurrentTick() - 1;
+			if (front_tick > last_submitted) {
+				return; // of the open submission: see above
+			}
 			if (!m_master.IsRetired(last_submitted)) {
 				if (m_pending_operations.size() <= MaxPendingOperations) {
 					return;
@@ -327,6 +347,8 @@ void CommandScheduler::QueueOperationInAnyState(Common::UniqueFunction<void>&& o
 		if (priority) {
 			// Runs when the open submission completes: the submission must go out for that.
 			m_open_callbacks++;
+		} else {
+			m_open_operations++;
 		}
 		lock.unlock();
 		if (priority) {
@@ -385,6 +407,7 @@ void CommandScheduler::RetireCallbackState(Common::UniqueFunction<void>&& callba
 	if (m_operation_state == OperationState::Open) {
 		m_pending_operations.push(
 		    {[state = std::move(callback)]() mutable { state = {}; }, CurrentTick()});
+		m_open_operations++;
 	}
 	// During shutdown every submission has retired, so the callback is destroyed in place.
 }
@@ -494,6 +517,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
+	{
+		// An operation queued between the tick's change and here is not counted: the limit is
+		// a soft one.
+		std::lock_guard lock(m_operation_mutex);
+		m_open_operations = 0;
+	}
 	m_open_work      = 0;
 	m_open_callbacks = 0;
 	m_open_since     = {};

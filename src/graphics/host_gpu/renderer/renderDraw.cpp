@@ -1159,6 +1159,11 @@ RenderExecutor::TargetId RenderExecutor::TargetKey(const RenderColorInfo& color)
 	return TargetKey(color.image_id, color.guest_mip_level, color.guest_array_layer);
 }
 
+RenderExecutor::TargetId RenderExecutor::TargetKey(const RenderDepthInfo& depth) {
+	return TargetKey(depth.image_id, depth.desc.view_info.base_level,
+	                 depth.desc.view_info.base_layer);
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1252,7 +1257,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		observe(TargetKey(state.color_info[i]), state.color_info[i].image_id);
 	}
 	if (writes_depth) {
-		observe(TargetKey(state.depth_info.image_id), state.depth_info.image_id);
+		observe(TargetKey(state.depth_info), state.depth_info.image_id);
 	}
 	for (const auto& stage: vertex_stages) {
 		effects.writes_memory = effects.writes_memory || HasShaderMemoryWrites(stage.stage);
@@ -1453,7 +1458,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    m_frame, texture_cache.GetImage(state.color_info[i].image_id).ContentGeneration());
 	}
 	if (writes_depth) {
-		m_target_frames[TargetKey(state.depth_info.image_id)].Drawn(
+		m_target_frames[TargetKey(state.depth_info)].Drawn(
 		    m_frame, texture_cache.GetImage(state.depth_info.image_id).ContentGeneration());
 	}
 	m_context.GetCommandScheduler().NoteWork();
@@ -1595,6 +1600,7 @@ Buffer& RenderExecutor::AcquireScratch(uint64_t bytes) {
 		m_scratch.push_back({std::make_unique<Buffer>(
 		                         m_context.GetGraphics(), scheduler, MemoryUsage::DeviceLocal, 0,
 		                         vk::BufferUsageFlagBits::eStorageBuffer |
+		                             vk::BufferUsageFlagBits::eTransferSrc |
 		                             vk::BufferUsageFlagBits::eTransferDst |
 		                             vk::BufferUsageFlagBits::eShaderDeviceAddress,
 		                         size),

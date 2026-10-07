@@ -236,8 +236,8 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	// The frame in which each render target was last drawn into. A target is an image slot with
 	// its generation (so a slot given to a new image does not inherit the frame of the old one)
-	// and, for colour, the mip level and array layer (a face of a cube map or a layer of an atlas
-	// drawn once is not covered by draws into the others).
+	// and the mip level and array layer (a face of a cube map, a layer of an atlas or a cascade of
+	// a shadow map drawn once is not covered by draws into the others).
 	// One target of a draw: an image (slot and generation), a mip and a layer. Exact, no hash.
 	struct TargetId {
 		uint64_t image = 0;
@@ -280,6 +280,7 @@ private:
 	DepthSnapshot              m_depth_snapshot;
 	Buffer&                    AcquireScratch(uint64_t bytes);
 	static TargetId TargetKey(const RenderColorInfo& color);
+	static TargetId TargetKey(const RenderDepthInfo& depth);
 	uint64_t                               m_frame = 0;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
