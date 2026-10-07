@@ -20,6 +20,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "graphics/presentation/videoOutResolution.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -1797,9 +1798,11 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	int32_t attribute3 = 0;
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
 	ctx->mutex.Lock();
-	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
-	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	    Graphics::ReportedVideoOutResolution({.setting    = Config::GetVideoOutResolution(),
+	                                          .attribute3 = attribute3,
+	                                          .width      = ctx->width,
+	                                          .height     = ctx->height});
 	status->dynamicRange = 1;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

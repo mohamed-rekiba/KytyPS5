@@ -60,6 +60,10 @@ uint32_t GetControllerVibrationIntensity() {
 	return g_config->controller_vibration_intensity;
 }
 
+VideoOutResolution GetVideoOutResolution() {
+	return g_config->video_out_resolution;
+}
+
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
