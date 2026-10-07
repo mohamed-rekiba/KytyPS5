@@ -73,7 +73,19 @@ void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ResetInputState();
-int  GetActiveControllerId();
+// The host gamepad of player 1, or HOST_INPUT_CONTROLLER_ID when player 1 has only the keyboard.
+int GetGamepadOfPlayerOne();
+
+// The players, numbered from 0. A player other than the first is logged in while they have a
+// gamepad.
+int  GetPlayerOfUser(int user_id); // -1 when no logged-in player has this user id
+// The user id of each of the four players, or -1 for a player who is not logged in.
+void GetLoggedInUsers(int* users);
+// The oldest login or logout the game has not seen yet.
+bool TakePlayerEvent(bool* login, int* user_id);
+
+// True for the handle of any of the players.
+bool IsPadHandle(int handle);
 
 enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
 

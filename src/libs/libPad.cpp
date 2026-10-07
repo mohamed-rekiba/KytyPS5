@@ -89,7 +89,7 @@ PadDeviceClassGetExtendedInformation(int handle, PadDeviceClassExtendedInformati
 	constexpr int pad_error_invalid_handle = -2137915389; /* 0x80920003 */
 	constexpr int pad_error_invalid_arg    = -2137915391; /* 0x80920001 */
 
-	if (handle != 1) {
+	if (!Controller::IsPadHandle(handle)) {
 		return pad_error_invalid_handle;
 	}
 	if (info == nullptr) {
@@ -113,7 +113,7 @@ static int KYTY_SYSV_ABI PadDeviceClassParseData(int handle, const Controller::P
 	     "\t class_data = 0x%016" PRIx64 "\n",
 	     handle, reinterpret_cast<uint64_t>(data), reinterpret_cast<uint64_t>(class_data));
 
-	if (handle != 1) {
+	if (!Controller::IsPadHandle(handle)) {
 		return pad_error_invalid_handle;
 	}
 	if (data == nullptr || class_data == nullptr) {

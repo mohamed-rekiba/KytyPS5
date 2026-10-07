@@ -287,8 +287,6 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
-
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
 		LOGF("Controller %s: %d, time = %.04f\n", (f.added ? "added" : "removed"), f.id,
@@ -304,22 +302,22 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	}
 #endif
 
-	if (f.added) {
-		auto* pad = SDL_OpenGamepad(f.id);
-		if (pad == nullptr) {
-			LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
-			     SDL_GetError());
-			return;
+	// A remapped pad needs nothing here: SDL has already loaded the new mapping, and the button
+	// and axis events that follow use it.
+
+	// SDL reports a pad again when a new mapping makes a known joystick a gamepad.
+	if (f.added && SDL_GetGamepadFromID(f.id) == nullptr) {
+		if (SDL_OpenGamepad(f.id) != nullptr) {
+			Controller::Connect(f.id);
+		} else {
+			LOGF("Controller %d cannot be opened: %s\n", f.id, SDL_GetError());
 		}
-		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
-		Controller::Connect(id);
 	}
 
-	if (f.removed) {
-		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
-			Controller::Disconnect(f.id);
-			SDL_CloseGamepad(pad);
-		}
+	// SDL reports the removal of every pad, also of one that could not be opened.
+	if (auto* pad = f.removed ? SDL_GetGamepadFromID(f.id) : nullptr; pad != nullptr) {
+		Controller::Disconnect(f.id);
+		SDL_CloseGamepad(pad);
 	}
 
 	if (f.down || f.up) {

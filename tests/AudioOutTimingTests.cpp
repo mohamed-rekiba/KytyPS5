@@ -132,7 +132,7 @@ public:
 #undef SDL_ClearAudioStream
 
 namespace Libs::Controller {
-int GetActiveControllerId() {
+int GetGamepadOfPlayerOne() {
 	return 0;
 }
 float GetSettingScale(Setting) {

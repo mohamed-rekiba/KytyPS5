@@ -105,12 +105,19 @@ double GetTimeMs() {
 namespace {
 using namespace Libs::Controller;
 
+// A gamepad plays from its first button press, not from its connection.
+void Join(int id) {
+	Connect(id);
+	SetButton(id, PAD_BUTTON_CROSS, true);
+	SetButton(id, PAD_BUTTON_CROSS, false);
+}
+
 struct Controller {
 	Controller() {
 		now                    = 1000;
 		haptics_handles_rumble = false;
 		Initialize();
-		Connect(1);
+		Join(1);
 		Check(GetSettingScale(Setting::SpeakerVolume) ==
 		              Config::GetControllerSpeakerVolume() / 50.0f &&
 		          GetSettingScale(Setting::VibrationIntensity) ==
@@ -316,9 +323,10 @@ void TestIndependentOutputsAndPadSwitch() {
 	CycleSetting(Setting::SpeakerVolume);
 	Check(haptics.size() == vibration_calls && effects.size() == trigger_calls,
 	      "speaker volume resent controller effects");
-	Connect(2);
+	// The gamepad of player one leaves, and the next one to join plays as player one.
 	Disconnect(1);
-	Check(GetActiveControllerId() == 2, "active controller did not change");
+	Join(2);
+	Check(GetGamepadOfPlayerOne() == 2, "the next gamepad did not become player one");
 	haptics.clear();
 	effects.clear();
 	CycleSetting(Setting::VibrationIntensity);
@@ -332,7 +340,8 @@ void TestIndependentOutputsAndPadSwitch() {
 	SetRumble(200, 100);
 	Check(PadSetTriggerEffect(1, &param) == 0, "replacement pad trigger request failed");
 	EmergencyShutdown();
-	Check(GetActiveControllerId() == -1, "released controller remained active");
+	Check(GetGamepadOfPlayerOne() == HOST_INPUT_CONTROLLER_ID,
+	      "released controller remained player one's gamepad");
 	haptics.clear();
 	effects.clear();
 	CycleSetting(Setting::VibrationIntensity);
@@ -345,8 +354,53 @@ void TestIndependentOutputsAndPadSwitch() {
 }
 } // namespace
 
+void TestAGamepadPlaysFromItsFirstPress() {
+	now = 1000;
+	Initialize();
+	Connect(1);
+	Connect(2);
+	Check(GetGamepadOfPlayerOne() == HOST_INPUT_CONTROLLER_ID,
+	      "a gamepad that is only plugged in took player one");
+	SetButton(2, PAD_BUTTON_CROSS, true);
+	Check(GetGamepadOfPlayerOne() == 2, "the first gamepad pressed did not become player one");
+	SetButton(1, PAD_BUTTON_CROSS, false);
+	Check(GetGamepadOfPlayerOne() == 2, "a released button made a gamepad join");
+	Shutdown();
+}
+
+// A game may open a player's standard port and special port (arcade sticks and the like) and read
+// both: each press would count twice if both handles read the same gamepad.
+void TestTheSpecialPortIsAPortOfItsOwn() {
+	now = 1000;
+	Initialize();
+	Join(1);
+	const int standard = PadOpen(1000, 0, 0, nullptr);
+	const int special  = PadOpen(1000, 2, 0, nullptr);
+	Check(standard > 0 && special > 0, "the standard and special ports of player one open");
+	Check(standard != special, "the special port has its own handle");
+	Check(PadGetHandle(1000, 2, 0) == special, "the special port's handle is found again");
+	SetButton(1, PAD_BUTTON_DOWN, true);
+	PadData data {};
+	Check(PadReadState(standard, &data) == 0 && data.connected &&
+	          (data.buttons & PAD_BUTTON_DOWN) != 0,
+	      "the standard port reads the gamepad");
+	data = {};
+	Check(PadReadState(special, &data) == 0 && !data.connected && data.buttons == 0,
+	      "the special port reads as no controller");
+	PadData states[4] {};
+	Check(PadRead(special, states, 4) == 1 && !states[0].connected && states[0].buttons == 0,
+	      "buffered reads of the special port hold no presses");
+	PadControllerInformation info {};
+	Check(PadGetControllerInformation(special, &info) == 0 && !info.connected,
+	      "the special port reports no controller");
+	SetButton(1, PAD_BUTTON_DOWN, false);
+	Shutdown();
+}
+
 int main() {
 	Config::Initialize();
+	TestAGamepadPlaysFromItsFirstPress();
+	TestTheSpecialPortIsAPortOfItsOwn();
 	TestSettingCycles();
 	TestGlobalControllerLevels();
 	// Each following test initializes another controller and requires strong defaults.
