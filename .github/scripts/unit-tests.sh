@@ -27,6 +27,7 @@ names=(
 	pad_haptics
 	pipeline_use
 	program_list
+	queue_commits
 	readback_plan
 	resource_materialization
 	resource_tracking

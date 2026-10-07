@@ -131,6 +131,11 @@ private:
 	void RetireCallbackState(Common::UniqueFunction<void>&& callback);
 
 	MasterSemaphore              m_master;
+	// Priority callbacks that finished while the scheduler shut down. They may own resources, so
+	// Shutdown destroys them once the queue is idle.
+	std::vector<Common::UniqueFunction<void>> m_retired_while_draining;
+	// This scheduler's timeline in GraphicContext::queue_commits.
+	uint32_t                     m_queue_timeline = 0;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;

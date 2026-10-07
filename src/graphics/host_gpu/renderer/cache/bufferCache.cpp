@@ -214,6 +214,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		publish();
+		// A temporary download buffer is held by every command buffer committed while it lived,
+		// also by the other submitters' (see queueCommits.h).
+		m_scheduler.DeferDestruction([held = std::move(publish)] {});
 	}
 	return true;
 }
@@ -350,12 +353,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				std::this_thread::sleep_for(std::chrono::hours(1));
 			}
 		};
-		if (!gpu.TrySendCommandSync(round)) {
+		bool sent = false;
+		{
+			KYTY_PROFILER_BLOCK("ReadMemory: on the GPU thread");
+			sent = gpu.TrySendCommandSync(round);
+		}
+		if (!sent) {
 			wait_for_exit();
 		}
 		if (!wait_tick) {
 			return;
 		}
+		KYTY_PROFILER_BLOCK("ReadMemory: wait for the GPU");
 		if (!m_scheduler.WaitSubmitted(*wait_tick)) {
 			wait_for_exit();
 		}
