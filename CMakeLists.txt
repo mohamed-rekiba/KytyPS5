@@ -431,6 +431,11 @@ add_executable(cache_collection_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(cache_collection_tests PRIVATE ${inc_headers})
 
+add_executable(buffer_chunk_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BufferChunkTests.cpp"
+)
+target_include_directories(buffer_chunk_tests PRIVATE ${inc_headers})
+
 add_executable(depth_snapshot_plan_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DepthSnapshotPlanTests.cpp"
 )
@@ -715,6 +720,7 @@ if(BUILD_TESTING)
 	add_test(NAME pipeline_use COMMAND $<TARGET_FILE:pipeline_use_tests>)
 	add_test(NAME submit_plan COMMAND $<TARGET_FILE:submit_plan_tests>)
 	add_test(NAME cache_collection COMMAND $<TARGET_FILE:cache_collection_tests>)
+	add_test(NAME buffer_chunk COMMAND $<TARGET_FILE:buffer_chunk_tests>)
 	add_test(NAME depth_snapshot_plan COMMAND $<TARGET_FILE:depth_snapshot_plan_tests>)
 	add_test(NAME video_out_resolution COMMAND $<TARGET_FILE:video_out_resolution_tests>)
 	add_test(NAME bench_script COMMAND $<TARGET_FILE:bench_script_tests>)
@@ -811,6 +817,7 @@ if(BUILD_TESTING)
 		pipeline_use_tests
 		submit_plan_tests
 		cache_collection_tests
+		buffer_chunk_tests
 		depth_snapshot_plan_tests
 		video_out_resolution_tests
 		bench_script_tests

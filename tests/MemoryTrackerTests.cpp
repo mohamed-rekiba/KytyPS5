@@ -297,6 +297,13 @@ void TestRangeSet() {
             intersections[0].second == 0x1040 &&
             intersections[1].first == 0x1220 && intersections[1].second == 0x1240,
         "range set subtraction did not preserve both exact tails");
+  // ranges is now [0x1000, 0x1040) and [0x1220, 0x1240).
+  Check(ranges.Find(0x1230) == std::pair<uint64_t, uint64_t>{0x1220, 0x1240} &&
+            ranges.Find(0x1000) == std::pair<uint64_t, uint64_t>{0x1000, 0x1040},
+        "range set did not find the range that holds an address");
+  Check(ranges.Find(0x1100).first == ranges.Find(0x1100).second &&
+            ranges.Find(0x1040).first == ranges.Find(0x1040).second,
+        "range set found a range for an address between ranges or at an end");
 }
 
 void TestGuestRange() {

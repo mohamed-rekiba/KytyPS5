@@ -94,6 +94,12 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+GuestSpan RenderContext::MappingAt(uint64_t vaddr) const {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	const auto [begin, end] = m_mapped_ranges.Find(vaddr);
+	return {begin, end};
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);

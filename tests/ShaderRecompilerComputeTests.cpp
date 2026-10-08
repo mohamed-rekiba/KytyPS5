@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/bufferChunk.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
@@ -154,6 +155,9 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
 struct BufferCacheTestAccess {
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
+
+  // The size of the chunk a new buffer covers (see bufferChunk.h).
+  static void SetChunkSize(uint64_t size) { BufferCache::s_chunk_size = size; }
 
   static void SetGarbageCollectionThresholds(BufferCache &cache,
                                              uint64_t trigger,
@@ -9989,10 +9993,16 @@ public:
 
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
-    constexpr uintptr_t base = 0x0000000204600000ull;
-    constexpr uint64_t allocation_size = 0x100000;
-    constexpr uint64_t case_size = 0x10000;
+    // A new cache buffer covers a whole chunk (bufferChunk.h), so two owners meet only at a
+    // chunk border: each case takes two chunks, and its arguments end the first one.
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t case_size = 2 * Libs::Graphics::BUFFER_CHUNK_SIZE;
+    constexpr uint64_t owner_border = Libs::Graphics::BUFFER_CHUNK_SIZE;
     constexpr uint32_t sentinel = 0xa5a5a5a5u;
+    struct WholeChunks {
+      WholeChunks() { BufferCacheTestAccess::SetChunkSize(Libs::Graphics::BUFFER_CHUNK_SIZE); }
+      ~WholeChunks() { BufferCacheTestAccess::SetChunkSize(BufferCache::CACHING_PAGESIZE); }
+    } whole_chunks;
     struct DispatchCase {
       std::array<uint32_t, 3> dimensions;
       uint32_t mode;
@@ -10007,6 +10017,8 @@ public:
         DispatchCase{{3, 1, 1}, 0x41u, 12, true},
         DispatchCase{{8, 1, 1}, 0x61u, 8},
     };
+    // One more chunk after the cases holds the image checks below.
+    constexpr uint64_t allocation_size = cases.size() * case_size + owner_border;
 
     // Separate DWORD descriptors preserve two owners until the indirect argument
     // range spans them. The consumer's output aliases the second owner.
@@ -10054,7 +10066,7 @@ public:
     std::memset(mapped, 0xa5, allocation_size);
     const auto argument_address = [&](size_t index) {
       return base + index * case_size +
-          (cases[index].transfer ? 0x200u : BufferCache::CACHING_PAGESIZE - 4u);
+          (cases[index].transfer ? 0x200u : owner_border - 4u);
     };
     for (size_t i = 0; i < cases.size(); i++) {
       std::memset(reinterpret_cast<void *>(argument_address(i)), 0, 12);
@@ -10085,7 +10097,7 @@ public:
       for (size_t index = 0; index < cases.size(); index++) {
         const auto &test = cases[index];
         const auto args = argument_address(index);
-        const auto output = base + index * case_size + BufferCache::CACHING_PAGESIZE + 0x100u;
+        const auto output = base + index * case_size + owner_border + 0x100u;
         if (test.transfer) {
           for (u32 i = 0; i < 3; i++) {
             auto [buffer, offset] = cache.ObtainBuffer(args + i * 4u, 4, true);
@@ -10128,7 +10140,7 @@ public:
         } else {
           processor.SetDispatchIndirectArgsBaseAddress(base + index * case_size);
           const std::array<u32, 2> packet{
-              static_cast<u32>(BufferCache::CACHING_PAGESIZE - 4u), test.mode};
+              static_cast<u32>(owner_border - 4u), test.mode};
           Require(name, "offset indirect packet",
                   CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
                   "the offset indirect packet was not consumed");
@@ -42406,6 +42418,10 @@ int RunSelectedCases(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+  // Most cases check how the buffer cache lays out its buffers page by page, so a new buffer
+  // covers only the pages of its first use. NativeIndirectDispatch uses whole chunks.
+  Libs::Graphics::BufferCacheTestAccess::SetChunkSize(
+      Libs::Graphics::BufferCache::CACHING_PAGESIZE);
   const int result = RunSelectedCases(argc, argv);
   if (result != 0 || Libs::Graphics::g_wrong_results.empty()) {
     return result;

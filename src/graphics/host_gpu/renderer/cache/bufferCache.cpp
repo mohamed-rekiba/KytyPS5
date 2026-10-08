@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/bufferChunk.h"
 #include "graphics/host_gpu/cacheCollection.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/readbackPlan.h"
@@ -495,8 +496,11 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 
-	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
-	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	// The whole chunk around the first use (see bufferChunk.h).
+	const auto chunk =
+	    ChunkRange({vaddr, vaddr + size}, m_scheduler.Context().MappingAt(vaddr), s_chunk_size);
+	const auto end     = Common::AlignUp(chunk.end, CACHING_PAGESIZE);
+	vaddr              = Common::AlignDown(chunk.begin, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 

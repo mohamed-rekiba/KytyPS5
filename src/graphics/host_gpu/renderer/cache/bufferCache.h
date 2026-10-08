@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "graphics/host_gpu/bufferChunk.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -204,6 +205,9 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// The size of the chunk a new buffer covers (see bufferChunk.h). The tests that check how the
+	// cache lays out its buffers set it to one page.
+	static inline uint64_t s_chunk_size = BUFFER_CHUNK_SIZE;
 };
 
 } // namespace Libs::Graphics

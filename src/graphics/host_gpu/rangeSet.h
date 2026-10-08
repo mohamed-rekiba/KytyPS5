@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -89,6 +90,17 @@ public:
 				func(begin, last);
 			}
 		}
+	}
+
+	// The range that holds `address`, as [begin, end); begin == end when no range holds it.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> Find(uint64_t address) const {
+		auto it = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin()) {
+			return {address, address};
+		}
+		--it;
+		return address < it->second ? std::pair {it->first, it->second}
+		                            : std::pair {address, address};
 	}
 
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
