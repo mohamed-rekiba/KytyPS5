@@ -586,6 +586,11 @@ add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static opus)
 target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
 
+add_executable(image_readback_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ImageReadbackTests.cpp"
+)
+target_include_directories(image_readback_tests PRIVATE ${inc_headers})
+
 add_executable(pad_input_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadInputTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/padInput.cpp"
@@ -743,6 +748,7 @@ if(BUILD_TESTING)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME pad_input COMMAND $<TARGET_FILE:pad_input_tests>)
+	add_test(NAME image_readback COMMAND $<TARGET_FILE:image_readback_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
@@ -837,6 +843,7 @@ if(BUILD_TESTING)
 		pad_haptics_tests
 		controller_settings_tests
 		pad_input_tests
+		image_readback_tests
 		save_data_memory_tests
 		png_enc_tests
 		ces_tests

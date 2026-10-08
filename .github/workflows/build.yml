@@ -115,7 +115,7 @@ jobs:
           rem The unit tests: keep them as in .github/scripts/unit-tests.sh (the Linux job checks it).
           cmake --build _Build/windows --target launcher ^
             host_lowering_tests write_heat_tests readback_plan_tests pipeline_use_tests submit_plan_tests depth_snapshot_plan_tests video_out_resolution_tests cache_folder_tests file_lock_tests program_list_tests soft_float64_tests metadata_fill_tests fence_retirement_tests queue_commits_tests cache_collection_tests buffer_chunk_tests ^
-            audio_out2_port_tests pad_haptics_tests controller_settings_tests pad_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
+            audio_out2_port_tests pad_haptics_tests controller_settings_tests pad_input_tests image_readback_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
             resource_materialization_tests shader_vertex_metadata_tests device_suitability_tests shader_cfg_tests archive_file_tests trophy_system_tests avplayer_file_tests --parallel
@@ -123,7 +123,7 @@ jobs:
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^(audio_out2_port|pad_haptics|controller_settings|device_suitability|host_lowering|write_heat|readback_plan|pipeline_use|submit_plan|depth_snapshot_plan|video_out_resolution|cache_folder|file_lock|program_list|soft_float64|shader_cfg|metadata_fill|fence_retirement|queue_commits|cache_collection|buffer_chunk|pad_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|trophy_system|avplayer_file|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^(audio_out2_port|pad_haptics|controller_settings|device_suitability|host_lowering|write_heat|readback_plan|pipeline_use|submit_plan|depth_snapshot_plan|video_out_resolution|cache_folder|file_lock|program_list|soft_float64|shader_cfg|metadata_fill|fence_retirement|queue_commits|cache_collection|buffer_chunk|pad_input|image_readback|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|trophy_system|avplayer_file|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd

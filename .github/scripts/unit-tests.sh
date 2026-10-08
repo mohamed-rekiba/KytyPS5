@@ -23,6 +23,7 @@ names=(
 	fence_retirement
 	file_lock
 	host_lowering
+	image_readback
 	ime_dialog
 	lru_cache
 	metadata_fill
