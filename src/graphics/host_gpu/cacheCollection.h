@@ -13,15 +13,20 @@ namespace Libs::Graphics {
 // is most of that memory (32 GB on an M4 Max with 36 GB), and a game never reaches the trigger: the
 // caches keep every buffer and image they ever made.
 //
-// That costs more than memory. MoltenVK attaches every live resource to every command buffer, and
-// the buffer cache watches the pages of every buffer it holds. In Crash Bandicoot 4 the buffer
-// cache grew to 7,000 buffers in five minutes, the GPU time of a frame grew from about 20 ms to
-// 75 ms, and the game fell from 27 to 7 fps. With the idle passes below, GPU memory stayed at about
-// 5 GB and the game at 20 to 25 fps for six minutes of play.
+// That costs more than memory: MoltenVK attaches every live resource to every command buffer. In
+// Crash Bandicoot 4 the GPU time of a frame grew from about 20 ms to 75 ms in five minutes, and the
+// game fell from 27 to 7 fps. With idle passes in the texture cache it stayed at 15 to 16 fps.
 //
-// So on system memory a pass also frees, below the trigger, items that were unused for the idle
-// age. An idle pass keeps GPU-written items: items the GPU wrote and the CPU has not read back. It
-// marks them as used now, so that they do not stop the pass from reaching the items behind them.
+// So on system memory a texture-cache pass also frees, below the trigger, images that were unused
+// for the idle age. An idle pass keeps GPU-written images: images the GPU wrote and the CPU has not
+// read back. It marks them as used now, so that they do not stop the pass from reaching the images
+// behind them.
+//
+// The buffer cache has no idle passes. Shaders reach buffers through device addresses, and that
+// access neither marks a buffer as used nor records what it writes. A buffer that looks idle can
+// hold GPU results the guest has not read yet, and freeing it clears its entries in the
+// device-address page table. Idle passes of the buffer cache froze Crash Bandicoot 4 after about
+// three minutes, in two of five runs.
 enum class CollectionKind : uint8_t {
 	// Nothing to free.
 	None,

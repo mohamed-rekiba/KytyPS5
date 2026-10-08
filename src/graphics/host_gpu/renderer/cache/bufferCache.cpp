@@ -851,22 +851,19 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	// Buffers are collected only for memory, never because they are idle (see cacheCollection.h).
 	const auto kind = PlanCollection({.used_memory    = m_total_used_memory,
 	                                  .trigger_memory = m_trigger_gc_memory,
-	                                  .system_memory  = m_graphics.UsesSystemMemory(),
 	                                  .passes         = tick});
 	if (kind == CollectionKind::None) {
 		return;
 	}
 
-	const bool idle = kind == CollectionKind::Idle;
-	const bool aggressive =
-	    kind == CollectionKind::Memory && m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age   = CollectionAge(kind, aggressive ? 80 : 160, tick);
-	const size_t   limit = aggressive ? 64 : 32;
+	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	const uint64_t age        = CollectionAge(kind, aggressive ? 80 : 160, tick);
+	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
-	std::vector<BufferId> kept_buffers;
 	size_t                retire_count = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
@@ -874,12 +871,6 @@ void BufferCache::RunGarbageCollector() {
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
-		if (dirty && idle) {
-			// A GPU-written buffer is kept (see cacheCollection.h), and counts toward the limit so
-			// that a pass looks at few buffers.
-			kept_buffers.push_back(id);
-			return ++retire_count == limit;
-		}
 		if (dirty && !aggressive) {
 			return false;
 		}
@@ -892,9 +883,6 @@ void BufferCache::RunGarbageCollector() {
 		}
 		return ++retire_count == limit;
 	});
-	for (const auto id: kept_buffers) {
-		m_lru_cache.Touch(m_slot_buffers[id].lru_id, tick);
-	}
 	if (dirty_buffers.empty()) {
 		return;
 	}
