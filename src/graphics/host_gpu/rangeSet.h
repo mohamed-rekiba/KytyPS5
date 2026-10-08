@@ -2,11 +2,11 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RANGESET_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/bufferChunk.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <map>
-#include <utility>
 
 namespace Libs::Graphics {
 
@@ -92,15 +92,15 @@ public:
 		}
 	}
 
-	// The range that holds `address`, as [begin, end); begin == end when no range holds it.
-	[[nodiscard]] std::pair<uint64_t, uint64_t> Find(uint64_t address) const {
+	// The range that holds `address`; empty when no range holds it. Ranges that touch are one
+	// range here.
+	[[nodiscard]] GuestSpan Find(uint64_t address) const {
 		auto it = m_ranges.upper_bound(address);
 		if (it == m_ranges.begin()) {
-			return {address, address};
+			return {};
 		}
 		--it;
-		return address < it->second ? std::pair {it->first, it->second}
-		                            : std::pair {address, address};
+		return address < it->second ? GuestSpan {it->first, it->second} : GuestSpan {};
 	}
 
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }

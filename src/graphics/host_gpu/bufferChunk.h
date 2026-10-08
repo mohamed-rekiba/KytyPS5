@@ -11,8 +11,8 @@ namespace Libs::Graphics {
 // Every buffer of the cache can be reached through device addresses, and MoltenVK attaches each
 // such buffer to every command encoder: the cost of a frame grows with the number of buffers. A
 // buffer that covers only the bytes of its first use makes many small buffers. In Crash Bandicoot
-// 4 the cache held about 6,500 buffers of about 100 KB after five minutes, and the game fell from
-// 43 to 7 fps.
+// 4 the cache held about 6,500 buffers of about 100 KB after five minutes, and on a player's route
+// the game fell from 43 to 7 fps.
 //
 // So a new buffer covers the whole chunk of guest memory around its first use, cut at the ends of
 // the mapping that holds it. A buffer is never freed because it is idle (see cacheCollection.h),

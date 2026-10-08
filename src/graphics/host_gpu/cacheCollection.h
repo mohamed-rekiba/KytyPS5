@@ -30,7 +30,8 @@ namespace Libs::Graphics {
 enum class CollectionKind : uint8_t {
 	// Nothing to free.
 	None,
-	// Free items that were unused for the idle age, except GPU-written items.
+	// Free images that were unused for the idle age, except GPU-written images. Only the texture
+	// cache asks for these passes.
 	Idle,
 	// Memory is short: free with the cache's own ages and limits.
 	Memory,

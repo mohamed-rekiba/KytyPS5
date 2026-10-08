@@ -855,9 +855,11 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	// Buffers are collected only for memory, never because they are idle (see cacheCollection.h).
+	// Buffers are collected only for memory, never because they are idle (see cacheCollection.h):
+	// the plan is asked as for a GPU with memory of its own.
 	const auto kind = PlanCollection({.used_memory    = m_total_used_memory,
 	                                  .trigger_memory = m_trigger_gc_memory,
+	                                  .system_memory  = false,
 	                                  .passes         = tick});
 	if (kind == CollectionKind::None) {
 		return;

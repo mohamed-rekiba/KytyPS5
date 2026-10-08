@@ -426,6 +426,7 @@ static std::string GamepadSource(int id) {
 	Uint16      vendor  = 0;
 	Uint16      product = 0;
 	SDL_GetJoystickGUIDInfo(guid, &vendor, &product, nullptr, nullptr);
+	// SDL keeps the signature of the driver that opened the device in byte 14 of its GUID.
 	const char driver =
 	    guid.data[14] >= ' ' && guid.data[14] < 127 ? static_cast<char>(guid.data[14]) : '-';
 	return fmt::format("vendor {:04x} product {:04x}, driver '{}', path {}", vendor, product,

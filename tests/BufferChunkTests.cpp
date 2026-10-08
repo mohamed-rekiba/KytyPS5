@@ -54,6 +54,13 @@ void TestARequestOutsideTheMappingIsKept() {
 	      "without a mapping the request is not grown");
 }
 
+void TestARequestPastTheMappingEndKeepsItsEnd() {
+	const GuestSpan mapped {Base, Base + 4 * Page};
+	const auto      span = ChunkRange({Base + 2 * Page, Base + 6 * Page}, mapped);
+	Check(span.begin == Base && span.end == Base + 6 * Page,
+	      "a request that leaves the mapping keeps its own end");
+}
+
 void TestAChunkOfOnePageKeepsTheRequest() {
 	const GuestSpan mapped {Base, Base + 8 * Chunk};
 	const auto      span = ChunkRange({Base + Page, Base + 3 * Page}, mapped, Page);
@@ -68,6 +75,7 @@ int main() {
 	TestARequestOverAChunkBorderCoversBothChunks();
 	TestTheChunkStaysInsideTheMapping();
 	TestARequestOutsideTheMappingIsKept();
+	TestARequestPastTheMappingEndKeepsItsEnd();
 	TestAChunkOfOnePageKeepsTheRequest();
 	if (g_failures != 0) {
 		std::cerr << g_failures << " check(s) failed\n";
