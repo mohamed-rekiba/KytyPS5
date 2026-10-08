@@ -121,7 +121,7 @@ struct GraphicContext {
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	// The GPU uses the system memory, not memory of its own (see cacheCollection.h).
-	[[nodiscard]] bool SharesSystemMemory() const noexcept {
+	[[nodiscard]] bool UsesSystemMemory() const noexcept {
 		return physical_device_properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
 	}
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;

@@ -9,6 +9,7 @@ namespace {
 
 using Libs::Graphics::CollectionAge;
 using Libs::Graphics::CollectionKind;
+using Libs::Graphics::CollectionState;
 using Libs::Graphics::IDLE_COLLECT_AGE;
 using Libs::Graphics::PlanCollection;
 
@@ -23,36 +24,57 @@ void Check(bool condition, const char* message) {
 
 constexpr uint64_t GiB = 1024ull * 1024 * 1024;
 
-void TestADiscreteGpuCollectsOnlyUnderMemoryPressure() {
-	Check(PlanCollection(1 * GiB, 4 * GiB, false) == CollectionKind::None,
-	      "below the trigger a discrete GPU keeps everything");
-	Check(PlanCollection(4 * GiB, 4 * GiB, false) == CollectionKind::Memory,
-	      "at the trigger a discrete GPU collects for memory");
+void TestOwnGpuMemoryCollectsOnlyAtTheTrigger() {
+	Check(PlanCollection({.used_memory = 1 * GiB, .trigger_memory = 4 * GiB, .passes = 10'000}) ==
+	          CollectionKind::None,
+	      "below the trigger a GPU with its own memory keeps everything");
+	Check(PlanCollection({.used_memory = 4 * GiB, .trigger_memory = 4 * GiB, .passes = 10'000}) ==
+	          CollectionKind::Memory,
+	      "at the trigger a GPU with its own memory collects for memory");
 }
 
-void TestUnifiedMemoryAlsoCollectsIdleItems() {
-	Check(PlanCollection(1 * GiB, 32 * GiB, true) == CollectionKind::Idle,
-	      "below a trigger it never reaches, unified memory still frees unused items");
-	Check(PlanCollection(32 * GiB, 32 * GiB, true) == CollectionKind::Memory,
-	      "at the trigger unified memory collects for memory as before");
+void TestSystemMemoryAlsoCollectsIdleItems() {
+	Check(PlanCollection({.used_memory    = 1 * GiB,
+	                      .trigger_memory = 32 * GiB,
+	                      .system_memory  = true,
+	                      .passes         = 10'000}) == CollectionKind::Idle,
+	      "below a trigger it never reaches, a GPU on system memory still frees idle items");
+	Check(PlanCollection({.used_memory    = 32 * GiB,
+	                      .trigger_memory = 32 * GiB,
+	                      .system_memory  = true,
+	                      .passes         = 10'000}) == CollectionKind::Memory,
+	      "at the trigger a GPU on system memory collects for memory as before");
 }
 
-void TestIdleItemsMustBeUnusedForLong() {
+void TestNoIdlePassBeforeAnItemCanBeIdle() {
+	Check(PlanCollection({.used_memory    = 1 * GiB,
+	                      .trigger_memory = 32 * GiB,
+	                      .system_memory  = true,
+	                      .passes         = IDLE_COLLECT_AGE - 1}) == CollectionKind::None,
+	      "before the idle age has passed once, no item can have been idle for it");
+	Check(PlanCollection({.used_memory    = 1 * GiB,
+	                      .trigger_memory = 32 * GiB,
+	                      .system_memory  = true,
+	                      .passes         = IDLE_COLLECT_AGE}) == CollectionKind::Idle,
+	      "from the idle age on, idle passes run");
+}
+
+void TestEachKindUsesItsOwnAge() {
 	Check(CollectionAge(CollectionKind::Idle, 160, 10'000) == IDLE_COLLECT_AGE,
-	      "an idle pass frees only what was unused for the idle age");
+	      "an idle pass frees only items unused for the idle age");
 	Check(CollectionAge(CollectionKind::Memory, 160, 10'000) == 160,
-	      "a memory pass keeps the cache's own age");
-	Check(CollectionAge(CollectionKind::Idle, 160, 100) == 100,
-	      "early in a run the age is capped by the passes done so far");
-	Check(IDLE_COLLECT_AGE >= 500, "the idle age spans many frames: about 28 passes run per frame");
+	      "a memory pass uses the cache's own age");
+	Check(CollectionAge(CollectionKind::Memory, 160, 100) == 100,
+	      "early in a run a memory pass caps its age at the passes done so far");
 }
 
 } // namespace
 
 int main() {
-	TestADiscreteGpuCollectsOnlyUnderMemoryPressure();
-	TestUnifiedMemoryAlsoCollectsIdleItems();
-	TestIdleItemsMustBeUnusedForLong();
+	TestOwnGpuMemoryCollectsOnlyAtTheTrigger();
+	TestSystemMemoryAlsoCollectsIdleItems();
+	TestNoIdlePassBeforeAnItemCanBeIdle();
+	TestEachKindUsesItsOwnAge();
 	if (g_failures != 0) {
 		std::cerr << g_failures << " check(s) failed\n";
 		return 1;

@@ -2205,15 +2205,17 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	const auto kind =
-	    PlanCollection(m_total_used_memory, m_trigger_gc_memory, m_graphics.SharesSystemMemory());
+	const auto kind = PlanCollection({.used_memory    = m_total_used_memory,
+	                                  .trigger_memory = m_trigger_gc_memory,
+	                                  .system_memory  = m_graphics.UsesSystemMemory(),
+	                                  .passes         = tick});
 	if (kind == CollectionKind::None) {
 		return;
 	}
 	const bool idle    = kind == CollectionKind::Idle;
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		bool pressured  = !idle && m_total_used_memory >= m_pressure_gc_memory;
+		bool aggressive = !idle && allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
 		const uint64_t age = CollectionAge(kind, aggressive ? 160 : pressured ? 80 : 16, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
@@ -2235,6 +2237,8 @@ void TextureCache::RunGarbageCollector() {
 			}
 			if (owner->IsGpuModified()) {
 				if (idle) {
+					// A GPU-written image is kept (see cacheCollection.h).
+					m_lru_cache.Touch(owner->lru_id, tick);
 					continue;
 				}
 				const bool safe = owner->SafeToDownload();
