@@ -147,15 +147,13 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	if (state.host.faults.no_contraction_is_slow) {
 		// The marks below are slow on this host. So the product goes to the sum through the
-		// denormal flush of legacy MAD/MAC, which works on its bits, and the operands come out of
-		// the same flush. No multiply then feeds an add directly, and there is nothing for a
-		// compiler to fuse.
-		a = EmitFlushF32DenormToSignedZero(state, a);
-		b = EmitFlushF32DenormToSignedZero(state, b);
-		c = EmitFlushF32DenormToSignedZero(state, c);
+		// denormal flush of legacy MAD/MAC, which works on its bits: no multiply then feeds an add
+		// directly, and there is nothing for a compiler to fuse. The operands and the sum are not
+		// flushed, as on the other hosts below. A flush takes six instructions, and with five of
+		// them a multiply-add took 33: a compute shader of Crash Bandicoot 4 grew to 1.65 million
+		// SPIR-V words, and the Metal compiler took from 1.5 to over 10 minutes to build it.
 		const auto product = EmitFPMul32(state, a, b);
-		const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
-		return EmitFlushF32DenormToSignedZero(state, sum);
+		return EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
 	}
 	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
 	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
