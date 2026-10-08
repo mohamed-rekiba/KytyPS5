@@ -27,6 +27,7 @@ names=(
 	lru_cache
 	metadata_fill
 	pad_haptics
+	pad_input
 	pipeline_use
 	program_list
 	queue_commits
