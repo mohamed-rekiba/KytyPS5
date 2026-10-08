@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/cacheCollection.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/readbackPlan.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -214,6 +215,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	if (m_graphics.SharesSystemMemory()) {
+		Log::WriteToConsoleAndLog("Caches: the GPU shares the system memory, so buffers and images "
+		                          "unused for about two seconds are freed.\n");
+	}
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -850,13 +855,16 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	const auto kind =
+	    PlanCollection(m_total_used_memory, m_trigger_gc_memory, m_graphics.SharesSystemMemory());
+	if (kind == CollectionKind::None) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
-	const size_t   limit      = aggressive ? 64 : 32;
+	const bool aggressive =
+	    kind == CollectionKind::Memory && m_total_used_memory >= m_critical_gc_memory;
+	const uint64_t age   = CollectionAge(kind, aggressive ? 80 : 160, tick);
+	const size_t   limit = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;

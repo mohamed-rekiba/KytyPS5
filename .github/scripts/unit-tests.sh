@@ -15,6 +15,7 @@ names=(
 	audio_out2_port
 	avplayer_file
 	bench_script
+	cache_collection
 	cache_folder
 	controller_settings
 	depth_snapshot_plan
