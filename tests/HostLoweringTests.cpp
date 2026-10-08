@@ -88,6 +88,8 @@ void TestCapturedDrawSizeAndLimit() {
 	Check(!PlanCapturedDraw(layout, most + 1).has_value(), "a draw over the byte limit is not");
 	Check(!PlanCapturedDraw(layout, 0).has_value(), "a draw with no record is not planned");
 	Check(!PlanCapturedDraw({}, 1).has_value(), "an invalid layout is not planned");
+	Check(kCapturedDrawByteLimit >= 500'797'440u,
+	      "the largest emulated mesh draw seen in Crash Bandicoot 4 (478 MiB) fits");
 }
 
 } // namespace

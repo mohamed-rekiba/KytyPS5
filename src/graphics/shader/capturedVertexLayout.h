@@ -66,8 +66,12 @@ struct CapturedVertexLayout {
 };
 
 // The most bytes one draw may capture. A draw that needs more stops with a message, before any
-// guest code runs: a part of the records would change what the draw does.
-inline constexpr uint64_t kCapturedDrawByteLimit = 256ull << 20u;
+// guest code runs: a part of the records would change what the draw does. Crash Bandicoot 4 has an
+// emulated mesh draw of 29,952 workgroups that captures 478 MiB; 256 MiB stopped the game there.
+inline constexpr uint64_t kCapturedDrawByteLimit = 1ull << 30u;
+// A primitive takes at least 8 bytes and is drawn with 3 vertices, so a draw under the limit has
+// fewer than 2^32 vertices.
+static_assert(kCapturedDrawByteLimit / 8u * 3u < (uint64_t {1} << 32u));
 
 struct CapturedDrawSize {
 	uint64_t bytes    = 0; // of all records
