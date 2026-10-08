@@ -415,6 +415,23 @@ static std::string GamepadLabel(int id) {
 	return fmt::format("\"{}\" (id {})", name != nullptr ? name : "gamepad", id);
 }
 
+// Where SDL found the gamepad, for the log: its vendor, product, device path, and the driver that
+// opened it ('m' for Apple's GameController framework). One device can show up as two gamepads:
+// that framework reports a Logitech Cordless RumblePad 2 twice. Only the copy that sends input
+// takes a player (Button).
+static std::string GamepadSource(int id) {
+	const auto  jid     = static_cast<SDL_JoystickID>(id);
+	const char* path    = SDL_GetGamepadPathForID(jid);
+	const auto  guid    = SDL_GetGamepadGUIDForID(jid);
+	Uint16      vendor  = 0;
+	Uint16      product = 0;
+	SDL_GetJoystickGUIDInfo(guid, &vendor, &product, nullptr, nullptr);
+	const char driver =
+	    guid.data[14] >= ' ' && guid.data[14] < 127 ? static_cast<char>(guid.data[14]) : '-';
+	return fmt::format("vendor {:04x} product {:04x}, driver '{}', path {}", vendor, product,
+	                   driver, path != nullptr ? path : "none");
+}
+
 void GameController::Seat(int id) {
 	const int slot = m_slots.Connect(id);
 	if (slot == PlayerSlots::NoSlot) {
@@ -454,6 +471,7 @@ void GameController::Connect(int id) {
 	// It plays from its first button press (Button), as a console's controller logs in with a
 	// press of its PS button: a gamepad that is only plugged in takes no player and logs in no user.
 	LOGF("Gamepad %s connected: press a button on it to play\n", GamepadLabel(id).c_str());
+	LOGF("\t %s\n", GamepadSource(id).c_str());
 }
 
 void GameController::Disconnect(int id) {
