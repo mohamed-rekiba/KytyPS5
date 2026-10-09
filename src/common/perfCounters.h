@@ -21,6 +21,8 @@ enum class Counter : uint8_t {
 	GuestFaults,     // write faults on pages the emulator watches
 	PageProtections, // protection changes of watched pages
 	UploadPasses,    // draws and dispatches that read memory through device addresses
+	UploadBytes,     // bytes the buffer cache copied from guest memory to GPU buffers
+	UploadCopies,    // copy regions of those uploads
 	Draws,
 	Dispatches,
 	RenderPasses,    // render passes begun on the host
@@ -38,6 +40,8 @@ using Snapshot = std::array<uint64_t, CounterCount>;
 		case Counter::GuestFaults: return "guest_faults";
 		case Counter::PageProtections: return "page_protections";
 		case Counter::UploadPasses: return "upload_passes";
+		case Counter::UploadBytes: return "upload_bytes";
+		case Counter::UploadCopies: return "upload_copies";
 		case Counter::Draws: return "draws";
 		case Counter::Dispatches: return "dispatches";
 		case Counter::RenderPasses: return "render_passes";
