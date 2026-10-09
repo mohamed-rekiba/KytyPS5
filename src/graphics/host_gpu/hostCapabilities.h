@@ -83,7 +83,8 @@ struct DriverFaults {
 	// A pixel shader input with the raw values of the three vertices of its triangle
 	// (PerVertexKHR) cannot be translated for the device.
 	bool no_per_vertex_inputs = false;
-	// Barycentrics interpolated at the centroid cannot be translated for the device.
+	// Barycentrics interpolated at the centroid cannot be translated for the device. A shader
+	// reads them at the pixel centre instead.
 	bool no_centroid_barycentric = false;
 	// A plain load marked volatile may be done once and reused, so a loop that waits for a value
 	// another invocation stores never sees it.

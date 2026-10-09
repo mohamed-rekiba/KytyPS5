@@ -423,7 +423,6 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			}
 			const auto kind      = static_cast<StageInputKind>(inst.Arg(0).U32());
 			const auto component = inst.Arg(1).U32();
-			info.centroid_barycentric |= kind == StageInputKind::BaryCoordSmoothCentroid;
 			info.barycentric |= kind == StageInputKind::BaryCoordSmooth ||
 			                    kind == StageInputKind::BaryCoordSmoothCentroid ||
 			                    kind == StageInputKind::BaryCoordNoPerspective;
@@ -579,7 +578,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
 	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 =
-	    info.append_consume = info.barycentric = info.centroid_barycentric = false;
+	    info.append_consume = info.barycentric = false;
 	InputUsage inputs;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {

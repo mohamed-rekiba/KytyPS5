@@ -143,16 +143,10 @@ std::optional<MissingCapability> FindMissingCapability(const IR::Program& progra
 		if (!caps.fragment_barycentric && requirements.barycentric) {
 			return MissingCapability {"barycentrics", "fragmentShaderBarycentric"};
 		}
-		if (host.faults.no_centroid_barycentric && requirements.centroid_barycentric) {
-			return MissingCapability {"barycentrics at the centroid", "centroid BaryCoordKHR"};
-		}
 		return std::nullopt;
 	}
 	if (!caps.fragment_barycentric && (per_vertex || barycentric)) {
 		return MissingCapability {"barycentrics or raw vertex values", "fragmentShaderBarycentric"};
-	}
-	if (host.faults.no_centroid_barycentric && centroid) {
-		return MissingCapability {"barycentrics at the centroid", "centroid BaryCoordKHR"};
 	}
 	return std::nullopt;
 }

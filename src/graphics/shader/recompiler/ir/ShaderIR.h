@@ -503,9 +503,8 @@ struct ShaderInfo {
 	bool                            float64                       = false;
 	// The shader moves an append or consume counter.
 	bool                            append_consume                = false;
-	// The shader reads the barycentrics as values, and at the centroid.
+	// The shader reads the barycentrics as values.
 	bool                            barycentric                   = false;
-	bool                            centroid_barycentric          = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
