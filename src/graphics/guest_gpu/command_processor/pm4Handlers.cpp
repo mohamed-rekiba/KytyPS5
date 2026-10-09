@@ -1360,6 +1360,7 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 			auto* label = static_cast<uint32_t*>(dst);
 			*label      = 1;
 		}
+		cp.NoteGuestWrite(dst, buffer_size);
 	}
 
 	return 4;

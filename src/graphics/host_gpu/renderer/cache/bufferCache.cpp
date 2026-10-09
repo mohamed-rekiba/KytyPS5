@@ -565,12 +565,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (!is_written) {
 		// Hot pages stay dirty and open after an upload (see writeHeat.h), so the CPU's next
 		// writes to them neither fault nor reach the log. The uploaded ranges that are still
-		// dirty hold them: logged again, they are uploaded again at the next use through device
-		// addresses too.
+		// dirty hold them: uploaded again through device addresses in the next guest submission.
 		for (const auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			if (m_memory_tracker.IsRegionCpuModified(address, copy.size)) {
-				RecordHotRange(address, copy.size);
+				m_cpu_write_log.RecordHot({address, copy.size});
 			}
 		}
 	}
@@ -830,45 +829,23 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RecordCpuWrite(uint64_t vaddr, uint64_t size) {
-	std::scoped_lock lock {m_cpu_write_log_mutex};
-	if (m_cpu_writes_need_full_pass) {
-		return;
-	}
-	if (m_cpu_write_log.size() >= MaxCpuWriteLog) {
-		m_cpu_write_log.clear();
-		m_cpu_writes_need_full_pass = true;
-		return;
-	}
-	m_cpu_write_log.push_back({vaddr, size});
+	m_cpu_write_log.Record({vaddr, size});
 }
 
-void BufferCache::RecordHotRange(uint64_t vaddr, uint64_t size) {
-	{
-		std::scoped_lock lock {m_cpu_write_log_mutex};
-		if (m_cpu_writes_need_full_pass || !m_hot_ranges_logged.insert(vaddr).second) {
-			return;
-		}
-	}
+void BufferCache::RecordGpuThreadWrite(uint64_t vaddr, uint64_t size) {
 	RecordCpuWrite(vaddr, size);
 }
 
+void BufferCache::NoteGuestSubmission() {
+	m_cpu_write_log.BeginSubmission();
+}
+
 bool BufferCache::TakeCpuWrites(std::vector<GuestRange>& ranges) {
-	ranges.clear();
-	std::scoped_lock lock {m_cpu_write_log_mutex};
-	m_hot_ranges_logged.clear();
-	if (m_cpu_writes_need_full_pass) {
-		m_cpu_writes_need_full_pass = false;
-		m_cpu_write_log.clear();
-		return false;
-	}
-	ranges.swap(m_cpu_write_log);
-	return true;
+	return m_cpu_write_log.Take(ranges);
 }
 
 void BufferCache::RequestFullSynchronization() {
-	std::scoped_lock lock {m_cpu_write_log_mutex};
-	m_cpu_write_log.clear();
-	m_cpu_writes_need_full_pass = true;
+	m_cpu_write_log.RequestFullPass();
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {

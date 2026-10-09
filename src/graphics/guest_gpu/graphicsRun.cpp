@@ -380,9 +380,15 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		for (uint32_t i = 0; i < dw_num; i++) {
 			dst[0] = src[i];
 		}
+		NoteGuestWrite(dst, sizeof(uint32_t));
 	} else {
 		memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
+		NoteGuestWrite(dst, static_cast<uint64_t>(dw_num) * sizeof(uint32_t));
 	}
+}
+
+void CommandProcessor::NoteGuestWrite(const void* dst, uint64_t size) {
+	m_renderer.GetBufferCache().RecordGpuThreadWrite(reinterpret_cast<uint64_t>(dst), size);
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -393,6 +399,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	NoteGuestWrite(reinterpret_cast<const void*>(dst_address), num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -587,6 +594,7 @@ bool GuestGpu::Process(Submission& submission) {
 	if (first_slice) {
 		submission.started = true;
 		cp.SetSubmitId(++m_submit_id);
+		m_renderer.GetBufferCache().NoteGuestSubmission();
 		cp.ResetDeCe();
 		cp.SetFlip({});
 	}
@@ -1134,6 +1142,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
 		std::memcpy(dst, &data, sizeof(data));
+		NoteGuestWrite(dst, sizeof(data));
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1159,6 +1168,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					SynchronizeGpu();
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
+					NoteGuestWrite(dst, uint64_t {value >> 16u} * sizeof(uint32_t));
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
 					                            value >> 16u);
 					if (with_interrupt) {
@@ -1188,6 +1198,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					std::memcpy(dst, &value, sizeof(value));
+					NoteGuestWrite(dst, sizeof(value));
 
 					if (with_interrupt) {
 						if (with_writeback) {
@@ -1413,6 +1424,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	}
 
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	NoteGuestWrite(dst_gpu_addr, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
@@ -1438,6 +1450,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		EXIT("unknown event type\n");
 	}
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	NoteGuestWrite(dst_gpu_addr, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(

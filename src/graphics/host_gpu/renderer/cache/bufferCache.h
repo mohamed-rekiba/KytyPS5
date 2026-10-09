@@ -6,6 +6,7 @@
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/bufferChunk.h"
+#include "graphics/host_gpu/cpuWriteLog.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -17,7 +18,6 @@
 #include <mutex>
 #include <optional>
 #include <span>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -92,10 +92,15 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Moves into `ranges` the guest ranges that gained bytes the GPU has not seen since the last
-	// call: CPU write faults and new buffers. False when the log overflowed or a full pass was
+	// call, sorted and merged (cpuWriteLog.h). False when the log overflowed or a full pass was
 	// requested; the caller must then synchronize every buffer.
 	[[nodiscard]] bool TakeCpuWrites(std::vector<GuestRange>& ranges);
 	void               RequestFullSynchronization();
+	// GPU thread. A guest submission starts (see CpuWriteLog::BeginSubmission).
+	void NoteGuestSubmission();
+	// GPU thread. The GPU thread itself wrote guest memory (WRITE_DATA, a label): a later
+	// draw of the same submission must see it, also on a page that stays open.
+	void RecordGpuThreadWrite(uint64_t vaddr, uint64_t size);
 	// A shader that writes through device addresses is being prepared. It can write any buffer,
 	// so it counts as a write of every buffer for a read-back (see readbackPlan.h).
 	void NoteAddressWrites() noexcept;
@@ -154,9 +159,6 @@ private:
 	static constexpr size_t  MaxCpuWriteLog = 4096;
 	// Records a range for TakeCpuWrites.
 	void RecordCpuWrite(uint64_t vaddr, uint64_t size);
-	// The same for a range of hot pages, once until the log is taken: a hot range is synchronized
-	// at every use, and each would log it again.
-	void RecordHotRange(uint64_t vaddr, uint64_t size);
 	// GPU thread. One round of a read-back, by the rule of readbackPlan.h. Returns the submission
 	// the caller must wait for before it asks again, or nothing when guest memory is current.
 	[[nodiscard]] std::optional<uint64_t> ReadBack(uint64_t vaddr, uint64_t size, bool is_write,
@@ -188,14 +190,10 @@ private:
 	bool                                              m_read_back_through_gpu = false;
 	MemoryTracker                                     m_memory_tracker;
 	WriteWatchSet                                      m_write_watches;
-	// See TakeCpuWrites. Written by the fault thread and the GPU thread.
 	bool                                              m_upload_batch_open    = false;
 	bool                                              m_upload_batch_started = false;
-	std::mutex                                        m_cpu_write_log_mutex;
-	std::vector<GuestRange>                           m_cpu_write_log;
-	bool                                              m_cpu_writes_need_full_pass = true;
-	// The hot ranges in m_cpu_write_log, by address (see RecordHotRange).
-	std::unordered_set<uint64_t>                      m_hot_ranges_logged;
+	// See TakeCpuWrites. Written by the fault thread and the GPU thread.
+	CpuWriteLog                                       m_cpu_write_log {MaxCpuWriteLog};
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

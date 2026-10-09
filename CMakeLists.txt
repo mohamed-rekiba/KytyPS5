@@ -413,6 +413,11 @@ add_executable(write_heat_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(write_heat_tests PRIVATE ${inc_headers})
 
+add_executable(cpu_write_log_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CpuWriteLogTests.cpp"
+)
+target_include_directories(cpu_write_log_tests PRIVATE ${inc_headers})
+
 add_executable(perf_counters_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PerfCountersTests.cpp"
 )
@@ -720,6 +725,7 @@ if(BUILD_TESTING)
 	add_test(NAME host_lowering COMMAND $<TARGET_FILE:host_lowering_tests>)
 	add_test(NAME write_heat COMMAND $<TARGET_FILE:write_heat_tests>)
 	add_test(NAME perf_counters COMMAND $<TARGET_FILE:perf_counters_tests>)
+	add_test(NAME cpu_write_log COMMAND $<TARGET_FILE:cpu_write_log_tests>)
 	add_test(NAME readback_plan COMMAND $<TARGET_FILE:readback_plan_tests>)
 	add_test(NAME pipeline_use COMMAND $<TARGET_FILE:pipeline_use_tests>)
 	add_test(NAME submit_plan COMMAND $<TARGET_FILE:submit_plan_tests>)
@@ -814,6 +820,7 @@ if(BUILD_TESTING)
 		host_lowering_tests
 		write_heat_tests
 		perf_counters_tests
+		cpu_write_log_tests
 		readback_plan_tests
 		pipeline_use_tests
 		submit_plan_tests

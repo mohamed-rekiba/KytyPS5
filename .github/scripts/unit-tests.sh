@@ -18,6 +18,7 @@ names=(
 	cache_collection
 	cache_folder
 	controller_settings
+	cpu_write_log
 	depth_snapshot_plan
 	device_suitability
 	fence_retirement
