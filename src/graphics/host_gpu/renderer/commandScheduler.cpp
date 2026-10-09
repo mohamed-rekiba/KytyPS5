@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -541,6 +542,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, m_master.AcquireFence(tick));
+		PerfCounters::Add(PerfCounters::Counter::Submissions);
 		if (result == vk::Result::eSuccess) {
 			graphics.queue_commits.NoteSubmit(m_queue_timeline, tick);
 		}

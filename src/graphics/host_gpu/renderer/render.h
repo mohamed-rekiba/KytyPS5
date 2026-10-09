@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/pipelineUse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -174,6 +175,7 @@ public:
 	// not (see PlanPipelineUse).
 	void NoteFlip() {
 		m_frame++;
+		PerfCounters::EndFrame();
 		KYTY_PROFILER_FRAME();
 	}
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,

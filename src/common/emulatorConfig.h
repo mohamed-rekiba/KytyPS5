@@ -79,6 +79,8 @@ struct ConfigOptions {
 	LogDirection           printf_direction            = LogDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
+	// Count the events that cost frame time and print them per frame (perfCounters.h).
+	bool                   perf_counters_enabled       = false;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
@@ -133,6 +135,7 @@ LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
 
 bool ProfilerEnabled();
+bool PerfCountersEnabled();
 
 bool SpirvDebugPrintfEnabled();
 

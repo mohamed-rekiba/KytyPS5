@@ -1,5 +1,6 @@
 #include "common/cacheFolder.h"
 #include "common/emulatorConfig.h"
+#include "common/perfCounters.h"
 
 #include "common/assert.h"
 
@@ -28,6 +29,7 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
 
 	*g_config = cfg;
+	PerfCounters::SetEnabled(cfg.perf_counters_enabled);
 }
 
 uint32_t GetScreenWidth() {
@@ -166,6 +168,10 @@ std::filesystem::path GetPrintfOutputFile() {
 
 bool ProfilerEnabled() {
 	return g_config->profiler_enabled;
+}
+
+bool PerfCountersEnabled() {
+	return g_config->perf_counters_enabled;
 }
 
 bool SpirvDebugPrintfEnabled() {

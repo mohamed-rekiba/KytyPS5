@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -58,6 +59,7 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	PerfCounters::Add(PerfCounters::Counter::GuestFaults);
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
@@ -148,6 +150,7 @@ void RenderContext::PrepareBda(bool shader_writes_addresses) {
 	}
 	m_fault_process_pending = true;
 	RegionManager::NoteUploadPass();
+	PerfCounters::Add(PerfCounters::Counter::UploadPasses);
 	// Shaders that read through device addresses can read any cached buffer, so every buffer must
 	// hold the CPU's latest bytes. Walking all of them before each dispatch is expensive with
 	// thousands of buffers; the buffer cache logs where the CPU wrote, and only those ranges are

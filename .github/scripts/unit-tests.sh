@@ -29,6 +29,7 @@ names=(
 	metadata_fill
 	pad_haptics
 	pad_input
+	perf_counters
 	pipeline_use
 	program_list
 	queue_commits
