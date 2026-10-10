@@ -18,6 +18,7 @@ names=(
 	cache_collection
 	cache_folder
 	controller_settings
+	copy_workers
 	cpu_write_log
 	depth_snapshot_plan
 	device_suitability

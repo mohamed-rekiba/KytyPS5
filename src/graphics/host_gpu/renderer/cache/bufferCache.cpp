@@ -634,6 +634,7 @@ void BufferCache::BeginUploadBatch() {
 void BufferCache::EndUploadBatch() {
 	EXIT_IF(!m_upload_batch_open);
 	m_upload_batch_open = false;
+	RunBatchCopies();
 	if (!m_upload_batch_started) {
 		return;
 	}
@@ -655,12 +656,21 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	PerfCounters::Add(PerfCounters::Counter::UploadBytes, total_size);
 	PerfCounters::Add(PerfCounters::Counter::UploadCopies, copies.size());
 
-	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+	auto [mapped, base_offset] = MapStaging(total_size);
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			if (m_upload_batch_open) {
+				m_batch_copies.push_back({mapped + copy.srcOffset,
+				                          reinterpret_cast<const void*>(address), copy.size});
+			} else {
+				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address),
+				            copy.size);
+			}
 			copy.srcOffset += base_offset;
+		}
+		if (m_upload_batch_open && !m_staging_buffer.IsCoherent()) {
+			m_batch_flushes.emplace_back(base_offset, total_size);
 		}
 		m_staging_buffer.Commit();
 		return m_staging_buffer.Handle();
@@ -677,6 +687,32 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	const auto handle = temporary->Handle();
 	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return handle;
+}
+
+std::pair<uint8_t*, uint64_t> BufferCache::MapStaging(uint64_t size) {
+	// A map can wait for the GPU, and a wait for the open command buffer submits it. The batch's
+	// GPU copies would then read staging bytes not copied yet, so a map that has to wait runs the
+	// batch's copies first.
+	if (!m_batch_copies.empty()) {
+		if (const auto mapped = m_staging_buffer.Map(size, 4, false); mapped.first != nullptr) {
+			return mapped;
+		}
+		RunBatchCopies();
+	}
+	return m_staging_buffer.Map(size, 4);
+}
+
+void BufferCache::RunBatchCopies() {
+	if (m_batch_copies.empty()) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("UploadCopies: batch copy");
+	m_copy_workers.Run(m_batch_copies);
+	m_batch_copies.clear();
+	for (const auto& [offset, size]: m_batch_flushes) {
+		m_staging_buffer.Flush(offset, size);
+	}
+	m_batch_flushes.clear();
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,

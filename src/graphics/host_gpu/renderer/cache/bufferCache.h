@@ -6,6 +6,7 @@
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/bufferChunk.h"
+#include "graphics/host_gpu/copyWorkers.h"
 #include "graphics/host_gpu/cpuWriteLog.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -155,6 +156,9 @@ private:
 	                                     bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
+	[[nodiscard]] std::pair<uint8_t*, uint64_t> MapStaging(uint64_t size);
+	// Copies the guest bytes of the open upload batch to the staging buffer.
+	void RunBatchCopies();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	static constexpr size_t  MaxCpuWriteLog = 4096;
 	// Records a range for TakeCpuWrites.
@@ -195,6 +199,13 @@ private:
 	// See TakeCpuWrites. Written by the fault thread and the GPU thread.
 	CpuWriteLog                                       m_cpu_write_log {MaxCpuWriteLog};
 	StreamBuffer                                      m_staging_buffer;
+	// In an upload batch, UploadCopies records the CPU copies to the staging buffer, and the
+	// copy workers run them all at once before the batch ends: the upload passes of a frame make
+	// about a thousand uploads of about 140 KB each, too small to share one by one. The guest
+	// memory stays mapped until then: PrepareBda ends the batch before it unlocks the mapping.
+	CopyWorkers                                       m_copy_workers {3};
+	std::vector<CopyWorkers::Copy>                    m_batch_copies;
+	std::vector<std::pair<uint64_t, uint64_t>>        m_batch_flushes; // staging offset, size
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
