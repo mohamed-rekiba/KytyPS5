@@ -196,6 +196,9 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// Remembered in m_decoded_textures.
+	[[nodiscard]] DecodedTexture DecodeTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                           const ShaderRecompiler::IR::DescriptorValue& value) const;
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -282,6 +285,9 @@ private:
 	uint64_t                               m_frame = 0;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// Dropped whole when full: a frame of Crash Bandicoot 4 decodes about 1,500 different ones.
+	static constexpr size_t                MaxDecodedTextures = 4096;
+	std::unordered_map<TextureDecodeKey, DecodedTexture, TextureDecodeKeyHash> m_decoded_textures;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

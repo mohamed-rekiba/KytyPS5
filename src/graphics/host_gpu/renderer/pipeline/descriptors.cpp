@@ -538,6 +538,50 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+	TextureDecodeKey key {value, resource};
+	auto             decoded = m_decoded_textures.find(key);
+	if (decoded == m_decoded_textures.end()) {
+		if (m_decoded_textures.size() >= MaxDecodedTextures) {
+			m_decoded_textures.clear();
+		}
+		auto texture = DecodeTexture(resource, value);
+		decoded      = m_decoded_textures.emplace(std::move(key), std::move(texture)).first;
+	}
+	// The texture cache can change the description, and a later decode can drop the table.
+	auto  desc          = decoded->second.desc;
+	auto& texture_cache = m_context.GetTextureCache();
+	if (decoded->second.null) {
+		const auto id = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+	const auto pixel_format = decoded->second.pixel_format;
+	const auto view_format  = decoded->second.view_format;
+	const auto size         = decoded->second.size;
+	const bool storage      = resource.written;
+	const auto descriptor   = DecodeNativeDescriptor<ShaderTextureResource>(value);
+
+	auto       id                  = texture_cache.FindImage(desc, decoded->second.shader_conversion);
+	auto*      image               = &texture_cache.GetImage(id);
+	const bool stencil_association = static_cast<bool>(image->depth_id);
+	if (stencil_association) {
+		id    = image->depth_id;
+		image = &texture_cache.GetImage(id);
+	} else if (image->info.IsDepth()) {
+		if (storage) {
+			EXIT("depth target cannot be bound as a storage image\n");
+		}
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size);
+	} else if (storage) {
+		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+	} else {
+		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
+		                             descriptor.DstSelXYZW());
+	}
+	return {id, nullptr, std::move(desc)};
+}
+
+DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                             const ShaderRecompiler::IR::DescriptorValue& value) const {
 	if (resource.atomic64 && !m_context.GetGraphics().host.capabilities.image_int64_atomics) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -547,12 +591,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageImageResource(resource);
 	}
 
-	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		DecodedTexture texture;
+		texture.desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                 : TextureCache::BindingType::Texture);
+		texture.null = true;
+		return texture;
 	}
 
 	const auto address         = descriptor.Base40();
@@ -694,24 +738,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
-	auto*      image               = &texture_cache.GetImage(id);
-	const bool stencil_association = static_cast<bool>(image->depth_id);
-	if (stencil_association) {
-		id    = image->depth_id;
-		image = &texture_cache.GetImage(id);
-	} else if (image->info.IsDepth()) {
-		if (storage) {
-			EXIT("depth target cannot be bound as a storage image\n");
-		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
-	} else if (storage) {
-		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
-	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
-		                             descriptor.DstSelXYZW());
-	}
-	return {id, nullptr, std::move(desc)};
+	return {std::move(desc), false, shader_conversion, pixel_format, view_format, size.size};
 }
 
 static vk::Sampler NativeSampler(RenderContext&                                  context,

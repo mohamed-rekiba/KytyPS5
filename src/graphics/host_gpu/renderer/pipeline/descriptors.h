@@ -26,6 +26,37 @@ struct TextureBinding {
 	std::vector<vk::ImageView> mip_views;
 };
 
+// What a texture descriptor decodes to before the texture cache looks up its image (see
+// RenderExecutor::DecodeTexture). It depends only on the descriptor and on how the shader uses the
+// texture, so a frame that binds the same texture thousands of times decodes it once.
+struct DecodedTexture {
+	TextureCache::ImageDesc desc;
+	bool                    null              = false;
+	bool                    shader_conversion = false;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	uint64_t                size              = 0;
+};
+
+struct TextureDecodeKey {
+	ShaderRecompiler::IR::DescriptorValue value;
+	ShaderRecompiler::IR::ImageResource   resource;
+
+	bool operator==(const TextureDecodeKey& other) const = default;
+};
+
+struct TextureDecodeKeyHash {
+	size_t operator()(const TextureDecodeKey& key) const noexcept {
+		uint64_t hash = key.value.dword_count;
+		for (const auto dword: key.value.dwords) {
+			hash = (hash ^ dword) * 0x100000001b3ull;
+		}
+		hash = (hash ^ key.resource.source) * 0x100000001b3ull;
+		hash = (hash ^ static_cast<uint32_t>(key.resource.written)) * 0x100000001b3ull;
+		return static_cast<size_t>(hash);
+	}
+};
+
 struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;
