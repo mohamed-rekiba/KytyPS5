@@ -54,28 +54,40 @@ void TestCoolingEndsHeat() {
 	Check(!heat.IsHot(1), "after cooling everything a page needs two writes again");
 }
 
-void TestTheLeaseEndsAfterItsUploadPasses() {
+void TestTheLeaseEndsAfterItsFrames() {
 	Heat       heat;
 	Heat::Bits dirty;
 	heat.NoteWrite(5, 6, 10);
 	heat.NoteWrite(5, 6, 10);
 	Check(heat.IsHot(5), "the second write makes the page hot");
-	for (const uint32_t pass: {10u, 10u, 11u}) {
+	for (const uint32_t frame: {10u, 10u, 11u, 10u + Heat::LeaseFrames - 1}) {
 		dirty.UnsetRange(0, 64);
-		heat.KeepHotDirty(dirty, 0, 64, pass);
+		heat.KeepHotDirty(dirty, 0, 64, frame);
 		Check(dirty.Get(5) && heat.IsHot(5), "the page stays open within its lease, at every use");
 	}
 	dirty.UnsetRange(0, 64);
-	heat.KeepHotDirty(dirty, 0, 64, 10 + Heat::LeasePasses);
+	heat.KeepHotDirty(dirty, 0, 64, 10 + Heat::LeaseFrames);
 	Check(!dirty.Get(5) && !heat.IsHot(5),
 	      "at its last upload the page is clean again, so it is protected before the copy");
-	heat.NoteWrite(5, 6, 13);
-	Check(!heat.IsHot(5), "after its lease a page needs two writes again");
-	heat.NoteWrite(5, 6, 13);
-	Check(heat.IsHot(5), "two new writes give a new lease");
 }
 
-void TestTheLeaseSurvivesPassCounterWrap() {
+// A page the game writes every frame comes back right after its lease: one write heats it again,
+// so it costs one fault per lease, not two.
+void TestAPageThatComesBackAfterItsLeaseIsHotAgainAtOnce() {
+	Heat       heat;
+	Heat::Bits dirty;
+	heat.NoteWrite(5, 6, 0);
+	heat.NoteWrite(5, 6, 0);
+	heat.KeepHotDirty(dirty, 0, 64, Heat::LeaseFrames);
+	Check(!heat.IsHot(5), "the lease ended");
+	heat.NoteWrite(5, 6, Heat::LeaseFrames + 1);
+	Check(heat.IsHot(5), "one write after the lease did not heat the page again");
+	dirty.UnsetRange(0, 64);
+	heat.KeepHotDirty(dirty, 0, 64, 2 * Heat::LeaseFrames);
+	Check(dirty.Get(5), "the new lease does not run from the write that started it");
+}
+
+void TestTheLeaseSurvivesFrameCounterWrap() {
 	Heat       heat;
 	Heat::Bits dirty;
 	heat.NoteWrite(1, 2, 0xffffffffu);
@@ -83,8 +95,8 @@ void TestTheLeaseSurvivesPassCounterWrap() {
 	heat.KeepHotDirty(dirty, 0, 64, 0);
 	Check(dirty.Get(1), "a lease that crosses the counter wrap is still open");
 	dirty.UnsetRange(0, 64);
-	heat.KeepHotDirty(dirty, 0, 64, 0xffffffffu + Heat::LeasePasses);
-	Check(!dirty.Get(1), "and it ends after its passes");
+	heat.KeepHotDirty(dirty, 0, 64, 0xffffffffu + Heat::LeaseFrames);
+	Check(!dirty.Get(1), "and it ends after its frames");
 }
 
 } // namespace
@@ -93,8 +105,9 @@ int main() {
 	TestAPageIsHotAfterItsSecondWrite();
 	TestHotPagesStayDirtyWhenTheRangeIsCleared();
 	TestCoolingEndsHeat();
-	TestTheLeaseEndsAfterItsUploadPasses();
-	TestTheLeaseSurvivesPassCounterWrap();
+	TestTheLeaseEndsAfterItsFrames();
+	TestAPageThatComesBackAfterItsLeaseIsHotAgainAtOnce();
+	TestTheLeaseSurvivesFrameCounterWrap();
 	if (g_failures != 0) {
 		std::cerr << "WriteHeatTests: " << g_failures << " check(s) failed\n";
 		return 1;

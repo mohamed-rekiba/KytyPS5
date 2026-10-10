@@ -110,7 +110,7 @@ public:
 			// A write to a clean page: the page came back after an upload.
 			for (size_t page = start; page < end; page++) {
 				if (!m_cpu_dirty.Get(page)) {
-					m_write_heat.NoteWrite(page, page + 1, UploadPass());
+					m_write_heat.NoteWrite(page, page + 1, Frame());
 				}
 			}
 		}
@@ -157,7 +157,7 @@ public:
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
 				ForgetOldHeat();
-				m_write_heat.KeepHotDirty(bits, start, end, UploadPass());
+				m_write_heat.KeepHotDirty(bits, start, end, Frame());
 				UpdateProtection<true, false>();
 			} else {
 				UpdateProtection<false, true>();
@@ -174,12 +174,11 @@ public:
 	// the guest has stopped writing is protected again.
 	static void CoolAllRegions() noexcept { s_heat_epoch.fetch_add(1, std::memory_order_relaxed); }
 
-	// One upload pass began: a draw or dispatch that reads memory through device addresses is
-	// about to upload what the CPU wrote. Hot pages count their lease in these (writeHeat.h).
-	static void NoteUploadPass() noexcept { s_upload_pass.fetch_add(1, std::memory_order_relaxed); }
+	// A guest frame ended (a flip). Hot pages count their lease in these (writeHeat.h).
+	static void NoteFrame() noexcept { s_frame.fetch_add(1, std::memory_order_relaxed); }
 
 private:
-	static uint32_t UploadPass() noexcept { return s_upload_pass.load(std::memory_order_relaxed); }
+	static uint32_t Frame() noexcept { return s_frame.load(std::memory_order_relaxed); }
 
 	void ForgetOldHeat() {
 		const auto epoch = s_heat_epoch.load(std::memory_order_relaxed);
@@ -239,7 +238,7 @@ private:
 	WriteHeat<TRACKER_REGION_PAGES>     m_write_heat;
 	uint32_t                            m_heat_epoch = 0;
 	static inline std::atomic<uint32_t> s_heat_epoch {0};
-	static inline std::atomic<uint32_t> s_upload_pass {0};
+	static inline std::atomic<uint32_t> s_frame {0};
 };
 
 } // namespace Libs::Graphics

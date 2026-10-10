@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/depthSnapshotPlan.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -1161,6 +1162,13 @@ void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderS
 	vk_buffer.pushConstants(layout, vk::ShaderStageFlagBits::eFragment,
 	                        ps.ps_depth_bounds_dword * sizeof(uint32_t), sizeof(parameters),
 	                        parameters);
+}
+
+void RenderExecutor::NoteFlip() {
+	m_frame++;
+	RegionManager::NoteFrame();
+	PerfCounters::EndFrame();
+	KYTY_PROFILER_FRAME();
 }
 
 RenderExecutor::TargetId RenderExecutor::TargetKey(const RenderColorInfo& color) {

@@ -173,11 +173,7 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 	// A frame of the game ends: what the next frame draws into is told apart from what it does
 	// not (see PlanPipelineUse).
-	void NoteFlip() {
-		m_frame++;
-		PerfCounters::EndFrame();
-		KYTY_PROFILER_FRAME();
-	}
+	void NoteFlip();
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
 

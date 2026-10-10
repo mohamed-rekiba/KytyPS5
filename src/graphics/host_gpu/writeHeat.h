@@ -17,11 +17,12 @@
 // that read through device addresses (cpuWriteLog.h). That is always correct, since an upload of
 // unchanged bytes changes nothing; it trades the faults for copies.
 //
-// The heat is a lease of LeasePasses upload passes (RegionManager::NoteUploadPass: one pass for
-// each draw or dispatch that reads memory through device addresses). At the first upload after
-// the lease, the page is clean again: it is protected before its bytes are copied, so a later
-// write faults and is seen. A game that writes a ring buffer touches each page once per lap; a
-// lease keeps such a page from being uploaded at every pass for seconds after its last write.
+// The heat is a lease of LeaseFrames guest frames (RegionManager::NoteFrame). At the first upload
+// after the lease, the page is clean again: it is protected before its bytes are copied, so a
+// later write faults and is seen. A page the game still writes faults once and is hot again at
+// once; one it stopped writing stays protected. A game that writes a buffer once per frame then
+// pays one fault per lease instead of one or two per frame, and a ring buffer touched once per lap
+// is not uploaded for long after its last write.
 //
 // Heat is also forgotten from time to time (CoolAll), for pages that no pass uploads.
 
@@ -34,25 +35,25 @@ public:
 
 	// Writes to a clean page, since the last cooling, that make it hot.
 	static constexpr uint8_t HotAfter = 2;
-	// Upload passes a page stays hot for.
-	static constexpr uint32_t LeasePasses = 2;
+	// Guest frames a page stays hot for: about one to two seconds.
+	static constexpr uint32_t LeaseFrames = 32;
 
-	// The CPU wrote to pages [start, end) that the tracker had as clean, during upload pass
-	// `pass`.
-	constexpr void NoteWrite(size_t start, size_t end, uint32_t pass) {
+	// The CPU wrote to pages [start, end) that the tracker had as clean, in guest frame `frame`.
+	constexpr void NoteWrite(size_t start, size_t end, uint32_t frame) {
 		for (size_t page = start; page < end; page++) {
 			if (m_writes[page] < HotAfter && ++m_writes[page] == HotAfter) {
 				m_hot.Set(page);
-				m_lease_end[page] = pass + LeasePasses;
+				m_lease_end[page] = frame + LeaseFrames;
 			}
 		}
 	}
 
 	[[nodiscard]] constexpr bool IsHot(size_t page) const { return m_hot.Get(page); }
 
-	// After the caller cleared [start, end) in `dirty` for an upload in pass `pass`: the hot
-	// pages stay dirty. A page whose lease has ended loses its heat and stays clean.
-	constexpr void KeepHotDirty(Bits& dirty, size_t start, size_t end, uint32_t pass) {
+	// After the caller cleared [start, end) in `dirty` for an upload in guest frame `frame`: the
+	// hot pages stay dirty. A page whose lease has ended loses its heat and stays clean; its next
+	// write makes it hot again.
+	constexpr void KeepHotDirty(Bits& dirty, size_t start, size_t end, uint32_t frame) {
 		if (m_hot.None()) {
 			return;
 		}
@@ -60,10 +61,10 @@ public:
 			if (!m_hot.Get(page)) {
 				continue;
 			}
-			// The counter wraps; the difference tells whether `pass` reached the end.
-			if (static_cast<int32_t>(pass - m_lease_end[page]) >= 0) {
+			// The counter wraps; the difference tells whether `frame` reached the end.
+			if (static_cast<int32_t>(frame - m_lease_end[page]) >= 0) {
 				m_hot.Unset(page);
-				m_writes[page] = 0;
+				m_writes[page] = HotAfter - 1;
 			} else {
 				dirty.Set(page);
 			}

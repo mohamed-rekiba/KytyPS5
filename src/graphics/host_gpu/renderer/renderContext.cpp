@@ -149,7 +149,6 @@ void RenderContext::PrepareBda(bool shader_writes_addresses) {
 		m_bda_logged = true;
 	}
 	m_fault_process_pending = true;
-	RegionManager::NoteUploadPass();
 	PerfCounters::Add(PerfCounters::Counter::UploadPasses);
 	// Shaders that read through device addresses can read any cached buffer, so every buffer must
 	// hold the CPU's latest bytes. Walking all of them before each dispatch is expensive with
