@@ -41121,6 +41121,42 @@ void CheckPm4AcquireMemNoOp(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4AcquireMemNoOp");
 }
 
+// Empties the buffer cache's log of guest writes; the first take can be a full pass.
+void DrainGuestWriteLog(RenderContext &renderer) {
+  std::vector<GuestRange> ranges;
+  while (!renderer.GetBufferCache().TakeCpuWrites(ranges)) {
+  }
+}
+
+// The log holds a write that covers [address, address + size): a later shader of the same
+// submission sees the GPU thread's write also on a page left open.
+bool LoggedGuestWrite(RenderContext &renderer, const void *address, uint64_t size) {
+  std::vector<GuestRange> ranges;
+  if (!renderer.GetBufferCache().TakeCpuWrites(ranges)) {
+    return true;
+  }
+  const auto begin = reinterpret_cast<uint64_t>(address);
+  return std::ranges::any_of(ranges, [&](const GuestRange &range) {
+    return range.address <= begin && begin + size <= range.address + range.size;
+  });
+}
+
+void CheckPm4DumpConstRamIsLogged(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  alignas(16) std::array<uint32_t, 8> dumped{};
+  const auto address = reinterpret_cast<uint64_t>(dumped.data());
+  const std::array<uint32_t, 4> payload{0u, static_cast<uint32_t>(dumped.size()),
+                                        static_cast<uint32_t>(address),
+                                        static_cast<uint32_t>(address >> 32u)};
+  DrainGuestWriteLog(renderer);
+  CpOpDumpConstRam(processor, 0xC0038300u, payload.data(), 0, 0);
+  Require("Pm4DumpConstRamIsLogged", "guest write log",
+          LoggedGuestWrite(renderer, dumped.data(), sizeof(dumped)),
+          "DUMP_CONST_RAM wrote guest memory without logging the write");
+  std::printf("[host]    %-32s ok\n", "Pm4DumpConstRamIsLogged");
+}
+
 void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -41141,7 +41177,9 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
     return processor.Process(execution, packet);
   };
 
+  DrainGuestWriteLog(renderer);
   const auto begin_result = dump(&results[0][0]);
+  const bool begin_logged = LoggedGuestWrite(renderer, &results[0][0], sizeof(results));
   bool begin_written = begin_result == Pm4ProcessResult::Complete;
   for (const auto &pair : results) {
     begin_written &= pair[0] == ready_bit && pair[1] == untouched;
@@ -41159,6 +41197,8 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
           begin_written && end_written && visible_samples == results.size(),
           "EVENT_WRITE did not publish valid nonzero begin/end counters to "
           "every PS5 DB");
+  Require("Pm4SyntheticOcclusionCounterDump", "guest write log", begin_logged,
+          "EVENT_WRITE wrote the occlusion results without logging the write");
   std::printf("[host]    %-32s ok\n", "Pm4SyntheticOcclusionCounterDump");
 }
 
@@ -43136,6 +43176,7 @@ int RunSelectedCases(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--occlusion-dump-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
+    CheckPm4DumpConstRamIsLogged(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--predication-only") == 0) {
@@ -43646,6 +43687,7 @@ int RunSelectedCases(int argc, char **argv) {
   CheckVulkan13FeatureRequirements();
   CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
+  CheckPm4DumpConstRamIsLogged(vulkan.RuntimeRenderer());
   CheckPm4Predication(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
   CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());

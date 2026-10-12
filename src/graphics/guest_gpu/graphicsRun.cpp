@@ -323,6 +323,7 @@ void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint3
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
+	NoteGuestWrite(dst, static_cast<uint64_t>(dw_num) * 4u);
 }
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
@@ -1392,6 +1393,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			for (uint32_t db = 0; db < 16u; db++) {
 				results[db * 2u] = value;
 			}
+			NoteGuestWrite(reinterpret_cast<const void*>(event_address), 16u * 2u * sizeof(uint64_t));
 			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
 			break;
 		}
