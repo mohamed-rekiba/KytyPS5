@@ -19756,8 +19756,9 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   if (vulkan->CannotRun("graphics", test.name, compiled.program)) {
     return;
   }
-  // The renderer draws such a shader as patches whose tessellation stages give it the values at
-  // each vertex (triangleVertexValueShader.h). The passthrough vertex shader here does not.
+  // On a host without per-vertex inputs, the renderer draws a pixel shader that reads raw vertex
+  // values as patches: their tessellation stages give it the value at each vertex
+  // (triangleVertexValueShader.h). The passthrough vertex shader here does not.
   ShaderRecompiler::IR::CompiledShaderInfo pixel_program{};
   pixel_program.info = compiled.program.info;
   ShaderPixelInputInfo pixel_info{};
@@ -19765,16 +19766,16 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   if (vulkan->CannotRun("graphics", test.name,
                         !vulkan->Host().faults.no_per_vertex_inputs ||
                             !ShaderPixelReadsVertexValues(pixel_info),
-                        "per-vertex pixel shader inputs (the harness has no vertex-value draw)",
-                        "no_per_vertex_inputs")) {
+                        "per-vertex pixel shader inputs", "fault: no_per_vertex_inputs")) {
     return;
   }
-  // Such a host reads the barycentrics of every sample at the pixel center (spirvEmitterFlow.cpp).
+  // A host with no_centroid_barycentric reads the barycentrics of every sample at the pixel
+  // center (spirvEmitterFlow.cpp): exact with one sample, not with more.
   if (vulkan->CannotRun("graphics", test.name,
                         !vulkan->Host().faults.no_centroid_barycentric ||
                             test.pixel_perspective_sample_vgpr == UINT32_MAX ||
                             test.samples == vk::SampleCountFlagBits::e1,
-                        "barycentrics at each sample", "no_centroid_barycentric")) {
+                        "barycentrics at each sample", "fault: no_centroid_barycentric")) {
     return;
   }
   const auto wrong_before = g_wrong_results.size();

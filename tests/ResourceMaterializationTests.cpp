@@ -847,7 +847,7 @@ void TestTapeBuildsEveryOperationTheWalkerEvaluates() {
       {6u, 3u, 2u, 1u, 0x40000000u, 0u, 7u, 0u},
       {0x80000001u, 31u, 0u, 5u, 0x3f800000u, 1u, 0xffffffffu, 2u},
   }};
-  uint32_t checked = 0;
+  uint32_t checked = 0; // operations evaluated by both, for at least one input
   for (uint32_t index = 0; index < static_cast<uint32_t>(ValueOpcode::Count); ++index) {
     const auto op = static_cast<ValueOpcode>(index);
     const auto arg_count = NumArgsOf(op);
@@ -896,6 +896,7 @@ void TestTapeBuildsEveryOperationTheWalkerEvaluates() {
     auto walk_plan = ExtractResourcePlan(program);
     walk_plan.srt_tape = nullptr;
     const auto name = std::string(ValueOpcodeName(op));
+    bool walked_once = false;
     for (const auto &user_data_words : inputs) {
       ResourceSnapshot walk_snapshot;
       ResourceSpecialization walk_specialization;
@@ -916,10 +917,14 @@ void TestTapeBuildsEveryOperationTheWalkerEvaluates() {
         std::fprintf(stderr, "ResourceMaterializationTests: operation: %s\n", name.c_str());
         Check(false, "the tape and the walker gave different results for an operation");
       }
-      checked += walked ? 1u : 0u;
+      walked_once |= walked;
     }
+    checked += walked_once ? 1u : 0u;
   }
-  Check(checked >= 40u, "too few operations were evaluated by both the tape and the walker");
+  // 43: the pure operations (PureArity) on scalar values, and GetShaderBase. Fewer means the
+  // filter above no longer reaches them. Reads, extracts and user data are in
+  // TestTapeMatchesWalker.
+  Check(checked >= 43u, "fewer operations were evaluated by both the tape and the walker");
 }
 
 } // namespace

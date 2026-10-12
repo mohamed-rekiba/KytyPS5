@@ -153,7 +153,7 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	note(!decision.faults.pushed_buffers_have_no_size,
 	     "a buffer size table for pushed descriptors (driver defect)");
 	note(!decision.faults.no_per_vertex_inputs, "per-vertex pixel shader inputs (driver defect)");
-	note(!decision.faults.no_centroid_barycentric, "centroid barycentrics (driver defect)");
+	note(!decision.faults.no_centroid_barycentric, "centroid and sample barycentrics (driver defect)");
 
 	return decision;
 }
