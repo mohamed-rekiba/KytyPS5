@@ -10,6 +10,7 @@
 namespace {
 
 using Libs::Graphics::AppendPipelineRecord;
+using Libs::Graphics::ListedPipelineScan;
 using Libs::Graphics::AppendProgramRecord;
 using Libs::Graphics::PipelineRecord;
 using Libs::Graphics::ReadPipelineRecords;
@@ -139,6 +140,16 @@ void TestLayoutChangeInPadding() {
 	      "a member offset is wrong");
 }
 
+void TestListedPipelinesAreScannedOnlyAfterAChange() {
+	ListedPipelineScan scan;
+	Check(scan.Due(0, false), "the first draw did not scan the listed pipelines");
+	Check(!scan.Due(0, false), "a draw scanned again with no new program");
+	Check(scan.Due(1, false), "a new program did not start a scan");
+	Check(!scan.Due(1, false), "a draw scanned again after the scan for the new program");
+	Check(scan.Due(1, true), "the end of the program list did not start a scan");
+	Check(!scan.Due(1, true), "a draw scanned again after the list was done");
+}
+
 int main() {
 	TestRoundTrip();
 	TestEqualRecordsGiveEqualBytes();
@@ -146,6 +157,7 @@ int main() {
 	TestDamagedRecord();
 	TestPipelineRoundTrip();
 	TestLayoutChangeInPadding();
+	TestListedPipelinesAreScannedOnlyAfterAChange();
 	std::puts("ProgramListTests: all cases passed");
 	return 0;
 }

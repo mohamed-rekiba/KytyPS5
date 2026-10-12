@@ -556,8 +556,13 @@ struct PipelineCache::ProgramCache {
 			permutation.identity = identity;
 			m_identity_of_id.emplace(permutation.handle.id, identity);
 		}
-		m_by_identity.try_emplace(identity, &entry, &permutation);
+		if (m_by_identity.try_emplace(identity, &entry, &permutation).second) {
+			m_names++;
+		}
 	}
+
+	// Grows each time a program gets a name the list knows (see ListedPipelineScan).
+	[[nodiscard]] uint64_t NameCount() const { return m_names; }
 
 	template <typename InputInfo>
 	static bool ReadInputInfo(const ProgramRecord& record, InputInfo& info) {
@@ -912,6 +917,7 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<uint64_t, uint64_t>                      m_identity_of_id;
 	std::FILE*                                                  m_list_file = nullptr;
 	uint64_t                                                    m_adopted   = 0;
+	uint64_t                                                    m_names     = 0;
 	vk::Device                                                  device;
 	HostGpu                                                     host;
 	uint64_t                                                    next_shader_id = 0;
@@ -1095,6 +1101,9 @@ void PipelineCache::QueueListedPipelines() {
 		return;
 	}
 	const bool list_built = m_program_cache->ListBuilt();
+	if (!m_listed_scan.Due(m_program_cache->NameCount(), list_built)) {
+		return;
+	}
 	std::erase_if(m_listed_pipelines, [this, list_built](const PipelineRecord& record) {
 		PipelineJob         job;
 		GraphicsPipelineKey key;

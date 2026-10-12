@@ -276,6 +276,26 @@ inline std::vector<PipelineRecord> ReadPipelineRecords(std::span<const uint8_t> 
 	return records;
 }
 
+// When the renderer looks again at the pipeline records whose programs were missing. A record
+// can only change its answer when a program got a name the list knows (`names`, a count that
+// only grows) or when the program list is done (`list_built`): then its missing programs never
+// come. Scanning before every draw cost records x draws lookups per frame.
+class ListedPipelineScan {
+public:
+	[[nodiscard]] bool Due(uint64_t names, bool list_built) noexcept {
+		if (names == m_names && list_built == m_list_built) {
+			return false;
+		}
+		m_names      = names;
+		m_list_built = list_built;
+		return true;
+	}
+
+private:
+	uint64_t m_names      = UINT64_MAX;
+	bool     m_list_built = false;
+};
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_PROGRAMLIST_H_

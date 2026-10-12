@@ -249,6 +249,7 @@ private:
 	// The pipeline list: the pipelines a game used, on disk, so the next start builds them
 	// before a draw asks. A record names its programs by their identity on the program list.
 	std::vector<PipelineRecord>  m_listed_pipelines; // read at start, not built yet
+	ListedPipelineScan           m_listed_scan;
 	std::unordered_set<uint64_t> m_pipelines_on_list;
 	std::FILE*                   m_pipeline_list = nullptr;
 
