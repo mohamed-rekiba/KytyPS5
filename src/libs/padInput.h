@@ -58,7 +58,7 @@ public:
 	static constexpr uint32_t HISTORY = 64;
 	// A trigger of 0 to 255 counts as pressed from this value on: lower values are sensor noise.
 	static constexpr int TRIGGER_PRESSED = 16;
-	// A gamepad becomes active when a stick moves this far from the centre (128), or a trigger
+	// A gamepad becomes active when a stick moves this far from the center (128), or a trigger
 	// this far. A drifting stick or a resting trigger stays below it.
 	static constexpr int STICK_CLAIM   = 64;
 	static constexpr int TRIGGER_CLAIM = 64;

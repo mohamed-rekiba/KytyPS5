@@ -55,8 +55,8 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		                  EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, size)));
 	}
 	// A host that cannot interpolate the barycentrics at the centroid reads them at the pixel
-	// centre. With one sample per pixel that is the centroid; with more, a pixel on the edge of a
-	// triangle gets the values of its centre, which may lie just outside the triangle.
+	// center. With one sample per pixel that is the centroid; with more, a pixel on the edge of a
+	// triangle gets the values of its center, which may lie just outside the triangle.
 	if (kind == IR::StageInputKind::BaryCoordSmoothCentroid &&
 	    state.host.faults.no_centroid_barycentric) {
 		kind = IR::StageInputKind::BaryCoordSmooth;

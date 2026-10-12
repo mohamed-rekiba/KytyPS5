@@ -51,7 +51,7 @@ void TestTheStickTiltedFurtherWins() {
 	Check(AxisOf(input, Axis::LeftX) == 0, "a full gamepad tilt lost to a keyboard tilt");
 	input.SetAxis(1, Axis::LeftX, 128, 5);
 	input.SetAxis(KEYBOARD, Axis::LeftX, 128, 6);
-	Check(AxisOf(input, Axis::LeftX) == 128, "the stick did not return to the centre");
+	Check(AxisOf(input, Axis::LeftX) == 128, "the stick did not return to the center");
 	input.SetAxis(KEYBOARD, Axis::TriggerLeft, 255, 7);
 	input.SetAxis(1, Axis::TriggerLeft, 40, 8);
 	Check(AxisOf(input, Axis::TriggerLeft) == 255, "a lighter trigger overrode a held key");

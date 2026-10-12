@@ -6775,17 +6775,17 @@ void TestPerspectiveCentroidInputs() {
     CheckSpirvBinaryValidates(result.spirv);
 
     // A host that cannot interpolate the barycentrics at the centroid (MoltenVK) reads them at
-    // the pixel centre, which is the centroid with one sample per pixel.
+    // the pixel center, which is the centroid with one sample per pixel.
     options.host.faults.no_centroid_barycentric = true;
-    const auto centre = RecompileForTest(shader, options);
-    Check(DisassembleSpirvBinary(centre.spirv).find("InterpolateAtCentroid") ==
+    const auto at_center = RecompileForTest(shader, options);
+    Check(DisassembleSpirvBinary(at_center.spirv).find("InterpolateAtCentroid") ==
                   std::string::npos &&
-              !SpirvContainsCapability(centre.spirv, 52u) &&
-              SpirvHasDecorationValue(centre.spirv, 11u, 5286u) &&
-              !ShaderRecompiler::Spirv::FindMissingCapability(centre.program, options.host)
+              !SpirvContainsCapability(at_center.spirv, 52u) &&
+              SpirvHasDecorationValue(at_center.spirv, 11u, 5286u) &&
+              !ShaderRecompiler::Spirv::FindMissingCapability(at_center.program, options.host)
                    .has_value(),
-          "a host without centroid barycentrics did not read them at the pixel centre");
-    CheckSpirvBinaryValidates(centre.spirv);
+          "a host without centroid barycentrics did not read them at the pixel center");
+    CheckSpirvBinaryValidates(at_center.spirv);
   }
 }
 
