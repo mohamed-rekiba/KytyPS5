@@ -79,19 +79,27 @@ struct CapturedDrawSize {
 };
 
 // The storage a draw with `records` records needs, or nothing when the draw is over the byte
-// limit above.
+// limit above. From a record's bytes and the vertices drawn for it, as the renderer has them.
 [[nodiscard]] constexpr std::optional<CapturedDrawSize>
-PlanCapturedDraw(const CapturedVertexLayout& layout, uint64_t records) {
-	if (!layout.Valid() || records == 0) {
+PlanCapturedDraw(uint64_t record_bytes, uint64_t vertices_per_record, uint64_t records) {
+	if (record_bytes == 0 || vertices_per_record == 0 || records == 0) {
 		return std::nullopt;
 	}
-	if (records > kCapturedDrawByteLimit / layout.RecordBytes()) {
+	if (records > kCapturedDrawByteLimit / record_bytes) {
 		return std::nullopt;
 	}
 	// Under the byte limit the vertex count fits 32 bits: a primitive takes 8 bytes and is drawn
 	// with 3 vertices.
-	return CapturedDrawSize {records * layout.RecordBytes(),
-	                         static_cast<uint32_t>(records * layout.VerticesPerRecord())};
+	return CapturedDrawSize {records * record_bytes,
+	                         static_cast<uint32_t>(records * vertices_per_record)};
+}
+
+[[nodiscard]] constexpr std::optional<CapturedDrawSize>
+PlanCapturedDraw(const CapturedVertexLayout& layout, uint64_t records) {
+	if (!layout.Valid()) {
+		return std::nullopt;
+	}
+	return PlanCapturedDraw(layout.RecordBytes(), layout.VerticesPerRecord(), records);
 }
 
 } // namespace Libs::Graphics

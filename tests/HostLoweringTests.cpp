@@ -88,6 +88,16 @@ void TestCapturedDrawSizeAndLimit() {
 	Check(!PlanCapturedDraw(layout, most + 1).has_value(), "a draw over the byte limit is not");
 	Check(!PlanCapturedDraw(layout, 0).has_value(), "a draw with no record is not planned");
 	Check(!PlanCapturedDraw({}, 1).has_value(), "an invalid layout is not planned");
+	// The renderer plans from the record size it has (renderDraw.cpp): the same answer.
+	for (const uint64_t records : {uint64_t {1}, most, most + 1}) {
+		const auto by_layout = PlanCapturedDraw(layout, records);
+		const auto by_size =
+		    PlanCapturedDraw(layout.RecordBytes(), layout.VerticesPerRecord(), records);
+		Check(by_layout.has_value() == by_size.has_value() &&
+		          (!by_size || (by_size->bytes == by_layout->bytes &&
+		                        by_size->vertices == by_layout->vertices)),
+		      "a draw planned from its record size differs from the plan by layout");
+	}
 	Check(kCapturedDrawByteLimit >= 500'797'440u,
 	      "the largest emulated mesh draw seen in Crash Bandicoot 4 (478 MiB) fits");
 }

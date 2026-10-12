@@ -1359,16 +1359,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_emulated) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		EXIT_IF(pipeline.mesh_compute == nullptr || mesh.max_primitives == 0);
-		const uint64_t slots = static_cast<uint64_t>(mesh_groups) * draw.instance_count;
-		const uint64_t bytes = slots * pipeline.mesh_slot_words * sizeof(uint32_t);
-		// Under the byte limit the vertex count fits 32 bits (see PlanCapturedDraw).
-		if (bytes == 0 || bytes > kCapturedDrawByteLimit) {
+		const uint64_t slots        = static_cast<uint64_t>(mesh_groups) * draw.instance_count;
+		const uint64_t record_bytes = uint64_t {pipeline.mesh_slot_words} * sizeof(uint32_t);
+		const auto     planned =
+		    PlanCapturedDraw(record_bytes, uint64_t {mesh.max_primitives} * 3u, slots);
+		if (!planned) {
 			EXIT("emulated mesh draw is too large: %llu groups, %llu bytes\n",
-			     static_cast<unsigned long long>(slots), static_cast<unsigned long long>(bytes));
+			     static_cast<unsigned long long>(slots),
+			     static_cast<unsigned long long>(slots * record_bytes));
 		}
-		mesh_vertex_count = static_cast<uint32_t>(slots * mesh.max_primitives * 3u);
+		mesh_vertex_count = planned->vertices;
 		auto& scheduler   = m_context.GetCommandScheduler();
-		auto& records     = AcquireScratch(bytes);
+		auto& records     = AcquireScratch(planned->bytes);
 		const auto address = records.BufferDeviceAddress();
 		mesh_draw_data     = {draw.index_count,
 		                      draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
