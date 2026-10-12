@@ -40,27 +40,22 @@ void TestWithoutASnapshotTheTargetIsCopied() {
 void TestAnUnchangedTargetIsReadAgain() {
 	Check(PlanDepthSnapshot(Held()) == DepthSnapshotStep::Reuse,
 	      "same target, same generation, same pass: reuse");
-	auto clearing               = Held();
-	clearing.load_clear         = true;
-	clearing.clear_value        = 0.5f;
-	clearing.cached_load_clear  = true;
-	clearing.cached_clear_value = 0.5f;
-	Check(PlanDepthSnapshot(clearing) == DepthSnapshotStep::Reuse,
-	      "a clearing pass with the same clear value reuses the fill");
 }
 
 // The renderer counts every draw of a clearing pass as a write of the depth image (a new
 // content generation), and each draw restarts the pass with the clear. The fill does not depend
-// on what the image held: the next draw of the pass reads it again.
+// on what the image held: the next draw of the pass reads it again, whatever the generation.
 void TestAClearingPassReusesTheFillAcrossItsDraws() {
 	auto clearing               = Held();
 	clearing.load_clear         = true;
 	clearing.clear_value        = 0.5f;
 	clearing.cached_load_clear  = true;
 	clearing.cached_clear_value = 0.5f;
-	clearing.content_generation = clearing.cached_generation + 1;
-	Check(PlanDepthSnapshot(clearing) == DepthSnapshotStep::Reuse,
-	      "the next draw of a clearing pass filled the snapshot again");
+	for (const uint64_t writes : {uint64_t {0}, uint64_t {1}, uint64_t {5}}) {
+		clearing.content_generation = clearing.cached_generation + writes;
+		Check(PlanDepthSnapshot(clearing) == DepthSnapshotStep::Reuse,
+		      "a draw of a clearing pass with the same clear value filled the snapshot again");
+	}
 	auto other_layer         = clearing;
 	other_layer.target_layer = 1;
 	Check(PlanDepthSnapshot(other_layer) == DepthSnapshotStep::Fill,
