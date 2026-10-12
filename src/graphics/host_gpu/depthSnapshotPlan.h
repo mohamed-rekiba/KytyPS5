@@ -14,6 +14,10 @@ namespace Libs::Graphics {
 // nothing has written the image since (its content generation), and the pass clear state is the
 // same: a pass that clears depth first gives every pixel the clear value, and the snapshot is a
 // fill with that value instead of a copy.
+//
+// A fill does not depend on what the image held, so in a clearing pass the content generation
+// is not compared: the renderer counts each draw of the pass as a write, and each depth-bounds
+// draw ends the pass, so the next one starts again with the clear.
 struct DepthSnapshotState {
 	// The target of this draw: the image (slot and generation) and its layer. The snapshot is
 	// taken of mip 0 only.
@@ -41,9 +45,10 @@ enum class DepthSnapshotStep : uint8_t {
 };
 
 [[nodiscard]] constexpr DepthSnapshotStep PlanDepthSnapshot(const DepthSnapshotState& s) noexcept {
+	const bool both_clear  = s.load_clear && s.cached_load_clear;
 	const bool same_target = s.cached && s.cached_target_image == s.target_image &&
 	                         s.cached_target_layer == s.target_layer &&
-	                         s.cached_generation == s.content_generation;
+	                         (both_clear || s.cached_generation == s.content_generation);
 	const bool same_clear =
 	    s.cached_load_clear == s.load_clear && (!s.load_clear || s.cached_clear_value == s.clear_value);
 	if (same_target && same_clear) {
