@@ -36,14 +36,10 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
-	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
-	bool                               attachment_feedback_loop_enabled      = false;
-	bool                               provoking_vertex_last_enabled         = false;
 	// What the device enabled, not only what it supports, and the known defects of its driver.
 	HostGpu                                   host;
-	bool                               supports_block_texel_view              = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
@@ -108,7 +104,7 @@ struct GraphicContext {
 	}
 
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
-		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+		return subgroup_size == 64u || host.capabilities.compute_subgroup_size_control;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

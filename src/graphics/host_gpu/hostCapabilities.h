@@ -37,6 +37,16 @@ struct HostCapabilities {
 	// A packed 10-10-10-2 scaled vertex attribute is fetched by the host. Without it the vertex
 	// shader fetches the packed word and unpacks it.
 	bool packed_scaled_vertex_input = false;
+	// The last vertex of a primitive can be its provoking vertex (VK_EXT_provoking_vertex).
+	bool provoking_vertex_last = false;
+	// A depth target can be sampled while it is attached (VK_EXT_attachment_feedback_loop_layout
+	// and its dynamic state).
+	bool attachment_feedback_loop = false;
+	// Compute shaders can run with a subgroup size of 64 (subgroupSizeControl).
+	bool compute_subgroup_size_control = false;
+	// A block-compressed image can have an uncompressed view of one block per texel
+	// (VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT).
+	bool block_texel_view = false;
 	// Stages that may use subgroup operations: VkPhysicalDeviceVulkan11Properties::
 	// subgroupSupportedStages, as VkShaderStageFlagBits values.
 	uint32_t subgroup_supported_stages = 0;
@@ -63,6 +73,10 @@ struct HostCapabilities {
 		all.compute_derivatives       = true;
 		all.push_descriptors          = true;
 		all.packed_scaled_vertex_input = true;
+		all.provoking_vertex_last         = true;
+		all.attachment_feedback_loop      = true;
+		all.compute_subgroup_size_control = true;
+		all.block_texel_view              = true;
 		all.subgroup_supported_stages     = ~0u;
 		all.subgroup_supported_operations = ~0u;
 		return all;

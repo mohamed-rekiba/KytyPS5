@@ -68,6 +68,14 @@ struct DeviceFacts {
 	bool robust_image_access = false;
 	bool dynamic_rendering   = false;
 	bool synchronization2    = false;
+	bool subgroup_size_control = false;
+
+	// VkPhysicalDeviceSubgroupSizeControlProperties.
+	uint32_t min_subgroup_size             = 0;
+	uint32_t max_subgroup_size             = 0;
+	uint32_t required_subgroup_size_stages = 0;
+	// A BC1 image can be created with VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT.
+	bool block_texel_view = false;
 
 	// Features of extensions.
 	bool color_write_enable               = false; // VK_EXT_color_write_enable
@@ -78,6 +86,10 @@ struct DeviceFacts {
 	bool workgroup_memory_explicit_layout = false; // VK_KHR_workgroup_memory_explicit_layout
 	bool shader_image_int64_atomics       = false; // VK_EXT_shader_image_atomic_int64
 	bool mesh_shader                      = false; // VK_EXT_mesh_shader
+	bool provoking_vertex_last            = false; // VK_EXT_provoking_vertex
+	// VK_EXT_attachment_feedback_loop_layout and VK_EXT_attachment_feedback_loop_dynamic_state.
+	bool attachment_feedback_loop_layout        = false;
+	bool attachment_feedback_loop_dynamic_state = false;
 	// computeDerivativeGroupQuads of VK_KHR_compute_shader_derivatives.
 	bool compute_derivative_group_quads = false;
 };

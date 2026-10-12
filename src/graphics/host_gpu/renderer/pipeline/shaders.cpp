@@ -424,8 +424,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	// The vertex shader of a captured mesh draw puts the guest's provoking vertex first, so such
 	// a draw takes flat values from the first vertex on every host.
 	const bool provoking_last = static_params.provoking_vtx_last && !mesh_emulated;
-	EXIT_NOT_IMPLEMENTED(provoking_last && !graphics.provoking_vertex_last_enabled);
-	if (graphics.provoking_vertex_last_enabled) {
+	EXIT_NOT_IMPLEMENTED(provoking_last && !graphics.host.capabilities.provoking_vertex_last);
+	if (graphics.host.capabilities.provoking_vertex_last) {
 		provoking_vertex.provokingVertexMode = provoking_last
 		                                           ? vk::ProvokingVertexModeEXT::eLastVertex
 		                                           : vk::ProvokingVertexModeEXT::eFirstVertex;
@@ -559,7 +559,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (host.color_write_enable && rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
-	if (graphics.attachment_feedback_loop_enabled) {
+	if (graphics.host.capabilities.attachment_feedback_loop) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}
 
@@ -660,7 +660,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
 	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
+	if (graphics.host.capabilities.compute_subgroup_size_control &&
 	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;

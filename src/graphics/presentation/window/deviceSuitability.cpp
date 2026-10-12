@@ -15,6 +15,9 @@ constexpr const char* kDepthClipEnableExtension = "VK_EXT_depth_clip_enable";
 constexpr const char* kImageAtomic64Extension   = "VK_EXT_shader_image_atomic_int64";
 constexpr const char* kMeshShaderExtension      = "VK_EXT_mesh_shader";
 constexpr const char* kComputeDerivativesExtension = "VK_KHR_compute_shader_derivatives";
+constexpr const char* kProvokingVertexExtension    = "VK_EXT_provoking_vertex";
+constexpr const char* kFeedbackLayoutExtension     = "VK_EXT_attachment_feedback_loop_layout";
+constexpr const char* kFeedbackDynamicExtension    = "VK_EXT_attachment_feedback_loop_dynamic_state";
 
 bool HasExtension(const std::vector<std::string>& extensions, const std::string& name) {
 	return std::find(extensions.begin(), extensions.end(), name) != extensions.end();
@@ -97,6 +100,17 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	    with_extension(facts.compute_derivative_group_quads, kComputeDerivativesExtension);
 	caps.push_descriptors   = HasExtension(facts.extensions, kPushDescriptorExtension);
 	caps.packed_scaled_vertex_input = facts.packed_scaled_vertex_format;
+	caps.provoking_vertex_last =
+	    with_extension(facts.provoking_vertex_last, kProvokingVertexExtension);
+	caps.attachment_feedback_loop =
+	    with_extension(facts.attachment_feedback_loop_layout, kFeedbackLayoutExtension) &&
+	    with_extension(facts.attachment_feedback_loop_dynamic_state, kFeedbackDynamicExtension);
+	// Guest compute shaders run in waves of 64.
+	constexpr uint32_t compute_stage = 0x20u; // VK_SHADER_STAGE_COMPUTE_BIT
+	caps.compute_subgroup_size_control =
+	    facts.subgroup_size_control && (facts.required_subgroup_size_stages & compute_stage) != 0u &&
+	    facts.min_subgroup_size <= 64u && facts.max_subgroup_size >= 64u;
+	caps.block_texel_view          = facts.block_texel_view;
 	caps.subgroup_supported_stages = facts.subgroup_supported_stages;
 	caps.subgroup_supported_operations = facts.subgroup_supported_operations;
 
@@ -132,6 +146,10 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	note(caps.mesh_shader, "meshShader");
 	note(caps.compute_derivatives, "computeDerivativeGroupQuads");
 	note(caps.push_descriptors, "push descriptors");
+	note(caps.provoking_vertex_last, "provokingVertexLast");
+	note(caps.attachment_feedback_loop, "attachment feedback loops");
+	note(caps.compute_subgroup_size_control, "a compute subgroup size of 64");
+	note(caps.block_texel_view, "block texel views");
 	note(!decision.faults.pushed_buffers_have_no_size,
 	     "a buffer size table for pushed descriptors (driver defect)");
 	note(!decision.faults.no_per_vertex_inputs, "per-vertex pixel shader inputs (driver defect)");

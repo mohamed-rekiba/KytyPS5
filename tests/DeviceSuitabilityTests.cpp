@@ -46,7 +46,18 @@ DeviceFacts FullFacts() {
 	                                                     "VK_EXT_depth_clip_enable",
 	                                                     "VK_EXT_shader_image_atomic_int64",
 	                                                     "VK_EXT_mesh_shader",
-	                                                     "VK_KHR_compute_shader_derivatives"};
+	                                                     "VK_KHR_compute_shader_derivatives",
+	                                                     "VK_EXT_provoking_vertex",
+	                                                     "VK_EXT_attachment_feedback_loop_layout",
+	                                                     "VK_EXT_attachment_feedback_loop_dynamic_state"};
+	f.provoking_vertex_last                           = true;
+	f.attachment_feedback_loop_layout                 = true;
+	f.attachment_feedback_loop_dynamic_state          = true;
+	f.subgroup_size_control                           = true;
+	f.min_subgroup_size                               = 32;
+	f.max_subgroup_size                               = 64;
+	f.required_subgroup_size_stages                   = 0x20; // compute
+	f.block_texel_view                                = true;
 	f.subgroup_supported_stages                       = ~0u;
 	f.subgroup_supported_operations                   = ~0u;
 	f.depth_clamp                                     = true;
@@ -363,7 +374,29 @@ void TestEveryMandatoryFeatureRejectsByName() {
 
 } // namespace
 
+// Guest compute shaders need waves of 64: a device whose sizes exclude 64 cannot set it.
+void TestComputeSubgroupSizeControlNeedsSize64() {
+	auto f              = FullFacts();
+	f.max_subgroup_size = 32;
+	Check(!EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.compute_subgroup_size_control,
+	      "subgroup size control without 64 in its range was taken");
+	f                               = FullFacts();
+	f.required_subgroup_size_stages = 0x10; // fragment only
+	Check(!EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.compute_subgroup_size_control,
+	      "subgroup size control without the compute stage was taken");
+}
+
+// Feedback loops need the layout and the dynamic state together.
+void TestFeedbackLoopsNeedBothFeatures() {
+	auto f                                   = FullFacts();
+	f.attachment_feedback_loop_dynamic_state = false;
+	Check(!EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.attachment_feedback_loop,
+	      "feedback loops without their dynamic state were taken");
+}
+
 int main() {
+	TestComputeSubgroupSizeControlNeedsSize64();
+	TestFeedbackLoopsNeedBothFeatures();
 	TestMoltenVkLikeDeviceIsAccepted();
 	TestDriverDefectsAreNotCapabilities();
 	TestMissingRequiredFeatureIsRejectedByName();

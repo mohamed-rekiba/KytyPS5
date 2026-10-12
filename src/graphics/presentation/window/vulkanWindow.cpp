@@ -161,6 +161,9 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	vk::PhysicalDeviceImageViewMinLodFeaturesEXT               min_lod {};
 	vk::PhysicalDeviceDepthClipEnableFeaturesEXT               depth_clip_enable {};
 	vk::PhysicalDeviceDepthClipControlFeaturesEXT              depth_clip_control {};
+	vk::PhysicalDeviceProvokingVertexFeaturesEXT               provoking_vertex {};
+	vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT  feedback_layout {};
+	vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic {};
 	vk::PhysicalDeviceVulkan11Features                         features11 {};
 	vk::PhysicalDeviceVulkan12Features                         features12 {};
 	vk::PhysicalDeviceVulkan13Features                         features13 {};
@@ -172,15 +175,20 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	min_lod.pNext            = &color_write;
 	depth_clip_enable.pNext  = &min_lod;
 	depth_clip_control.pNext = &depth_clip_enable;
-	features11.pNext         = &depth_clip_control;
+	provoking_vertex.pNext   = &depth_clip_control;
+	feedback_layout.pNext    = &provoking_vertex;
+	feedback_dynamic.pNext   = &feedback_layout;
+	features11.pNext         = &feedback_dynamic;
 	features12.pNext         = &features11;
 	features13.pNext         = &features12;
 	features2.pNext          = &features13;
 	device.getFeatures2(&features2);
 
-	vk::PhysicalDeviceVulkan11Properties properties11 {};
-	vk::PhysicalDeviceVulkan12Properties properties12 {};
-	vk::PhysicalDeviceProperties2        properties2 {};
+	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
+	vk::PhysicalDeviceVulkan11Properties            properties11 {};
+	vk::PhysicalDeviceVulkan12Properties            properties12 {};
+	vk::PhysicalDeviceProperties2                   properties2 {};
+	properties11.pNext = &subgroup_size_control;
 	properties12.pNext = &properties11;
 	properties2.pNext  = &properties12;
 	device.getProperties2(&properties2);
@@ -237,6 +245,20 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	facts.robust_image_access         = features13.robustImageAccess == VK_TRUE;
 	facts.dynamic_rendering           = features13.dynamicRendering == VK_TRUE;
 	facts.synchronization2            = features13.synchronization2 == VK_TRUE;
+	facts.subgroup_size_control       = features13.subgroupSizeControl == VK_TRUE;
+	facts.min_subgroup_size           = subgroup_size_control.minSubgroupSize;
+	facts.max_subgroup_size           = subgroup_size_control.maxSubgroupSize;
+	facts.required_subgroup_size_stages =
+	    static_cast<vk::ShaderStageFlags::MaskType>(subgroup_size_control.requiredSubgroupSizeStages);
+	const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info {
+	    .format = vk::Format::eBc1RgbaUnormBlock,
+	    .type   = vk::ImageType::e2D,
+	    .tiling = vk::ImageTiling::eOptimal,
+	    .usage  = vk::ImageUsageFlagBits::eSampled,
+	    .flags  = vk::ImageCreateFlagBits::eBlockTexelViewCompatible,
+	};
+	facts.block_texel_view =
+	    device.getImageFormatProperties2(block_texel_view_info).result == vk::Result::eSuccess;
 
 	facts.color_write_enable          = color_write.colorWriteEnable == VK_TRUE;
 	facts.packed_scaled_vertex_format =
@@ -252,6 +274,11 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	facts.shader_image_int64_atomics = image_atomic_int64.shaderImageInt64Atomics == VK_TRUE;
 	facts.mesh_shader                = mesh.meshShader == VK_TRUE;
 	facts.compute_derivative_group_quads = derivatives.computeDerivativeGroupQuads == VK_TRUE;
+	facts.provoking_vertex_last          = provoking_vertex.provokingVertexLast == VK_TRUE;
+	facts.attachment_feedback_loop_layout =
+	    feedback_layout.attachmentFeedbackLoopLayout == VK_TRUE;
+	facts.attachment_feedback_loop_dynamic_state =
+	    feedback_dynamic.attachmentFeedbackLoopDynamicState == VK_TRUE;
 	return facts;
 }
 
@@ -535,23 +562,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
 	graphics.required_subgroup_size_stages = subgroup_size_control.requiredSubgroupSizeStages;
-	graphics.compute_subgroup_size_control_enabled =
-	    supported_features13.subgroupSizeControl == VK_TRUE &&
-	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
-	    subgroup_size_control.minSubgroupSize <= 64 &&
-	    subgroup_size_control.maxSubgroupSize >= 64;
 
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
-	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
+	     graphics.host.capabilities.compute_subgroup_size_control ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
-	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
-	graphics.attachment_feedback_loop_enabled =
-	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
-	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
+	// Decided by the device decision; on only when the extensions are among the enabled ones.
+	caps.provoking_vertex_last    = caps.provoking_vertex_last && provoking_extension;
+	caps.attachment_feedback_loop = caps.attachment_feedback_loop && feedback_extensions;
 	LOGF("Vulkan depth feedback support: %s\n",
-	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
+	     graphics.host.capabilities.attachment_feedback_loop ? "true" : "false");
 	if (caps.mesh_shader) {
 		LOGF("Vulkan MeshEXT: invocations=%u vertices=%u primitives=%u shared=%u\n",
 		     graphics.mesh_shader_properties.maxMeshWorkGroupInvocations,
@@ -602,7 +623,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    robustness2_ext_enabled ? static_cast<void*>(&robustness2) : below_robustness;
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
-	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	    graphics.host.capabilities.compute_subgroup_size_control ? VK_TRUE : VK_FALSE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
@@ -614,10 +635,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	mesh_features.meshShader            = caps.mesh_shader ? VK_TRUE : VK_FALSE;
 	feedback_dynamic.pNext =
 	    mesh_extension ? static_cast<void*>(&mesh_features) : static_cast<void*>(&features13);
-	create_info.pNext = graphics.attachment_feedback_loop_enabled
+	create_info.pNext = graphics.host.capabilities.attachment_feedback_loop
 	                        ? static_cast<void*>(&feedback_layout)
 	                        : feedback_dynamic.pNext;
-	if (graphics.provoking_vertex_last_enabled) {
+	if (graphics.host.capabilities.provoking_vertex_last) {
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
@@ -984,17 +1005,6 @@ void WindowContext::CreateVulkan() {
 		Log::WriteToConsoleAndLog(fmt::format("Host GPU: {}\n", line));
 	}
 
-	const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info {
-	    .format = vk::Format::eBc1RgbaUnormBlock,
-	    .type = vk::ImageType::e2D,
-	    .tiling = vk::ImageTiling::eOptimal,
-	    .usage = vk::ImageUsageFlagBits::eSampled,
-	    .flags = vk::ImageCreateFlagBits::eBlockTexelViewCompatible,
-	};
-	const auto block_texel_view_props =
-	    graphic_ctx.physical_device.getImageFormatProperties2(block_texel_view_info);
-	graphic_ctx.supports_block_texel_view = block_texel_view_props.result == vk::Result::eSuccess;
-	LOGF("Block Texel View support: %s\n", graphic_ctx.supports_block_texel_view ? "Yes" : "No");
 
 	{
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(

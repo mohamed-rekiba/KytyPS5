@@ -12185,7 +12185,7 @@ public:
       // ImageUsageFlags in image.cpp), only where the host can store to BC3.
       auto &atlas_graphics = context.GetGraphics();
       const bool bc3_storage =
-          atlas_graphics.supports_block_texel_view &&
+          atlas_graphics.host.capabilities.block_texel_view &&
           atlas_graphics.GetImageFormatProperties(
               vk::Format::eBc3UnormBlock, vk::ImageType::e2D, vk::ImageTiling::eOptimal,
               vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
@@ -13462,7 +13462,7 @@ public:
       const auto &disjoint_image = texture_cache.GetImage(disjoint_depth_id);
       // A depth target that is also sampled: the renderer's layout for it (renderDraw.cpp).
       const auto sampled_attachment_layout =
-          context.GetGraphics().attachment_feedback_loop_enabled
+          context.GetGraphics().host.capabilities.attachment_feedback_loop
               ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
               : vk::ImageLayout::eGeneral;
       Require(name, "disjoint depth sampling during depth writes",
@@ -13479,7 +13479,7 @@ public:
 
       // A sampled view that overlaps the written level is a feedback loop.
       if (!CannotRun("gpu", "DepthFeedbackViews",
-                     context.GetGraphics().attachment_feedback_loop_enabled,
+                     context.GetGraphics().host.capabilities.attachment_feedback_loop,
                      "a depth target sampled while it is written",
                      "attachmentFeedbackLoopDynamicState")) {
         auto overlapping_sampled_desc = disjoint_sampled_desc;
@@ -13832,7 +13832,7 @@ public:
       bounds_dependency.pMemoryBarriers = &bounds_host_barrier;
       // The first pass samples the depth target it clears: a feedback loop.
       if (!CannotRun("gpu", "DeferredClearSampledDepthBounds",
-                     context.GetGraphics().attachment_feedback_loop_enabled,
+                     context.GetGraphics().host.capabilities.attachment_feedback_loop,
                      "a depth target sampled while it is written",
                      "attachmentFeedbackLoopDynamicState")) {
         // Attachment acquisition consumes pending HTile clears using DB_DEPTH_CLEAR.
@@ -14204,7 +14204,7 @@ public:
         // Stencil written while it is sampled: a feedback loop.
         if (stencil_write &&
             CannotRun("gpu", "SampledStencilWrites",
-                      context.GetGraphics().attachment_feedback_loop_enabled,
+                      context.GetGraphics().host.capabilities.attachment_feedback_loop,
                       "a stencil target sampled while it is written",
                       "attachmentFeedbackLoopDynamicState")) {
           continue;
@@ -16361,7 +16361,7 @@ public:
         const vk::Bool32 write = true;
         cmd.setColorWriteEnableEXT(1, &write);
       }
-      if (m_runtime_context.attachment_feedback_loop_enabled) {
+      if (m_runtime_context.host.capabilities.attachment_feedback_loop) {
         cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
       }
       const vk::DeviceSize offset = 0;
@@ -18543,8 +18543,8 @@ private:
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
     m_runtime_context.host = m_host;
-    m_runtime_context.attachment_feedback_loop_enabled = m_feedback_loop_supported;
-    m_runtime_context.provoking_vertex_last_enabled = m_provoking_last_supported;
+    m_runtime_context.host.capabilities.attachment_feedback_loop = m_feedback_loop_supported;
+    m_runtime_context.host.capabilities.provoking_vertex_last = m_provoking_last_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -18554,7 +18554,7 @@ private:
     };
     const auto block_texel_view_props =
         m_physical_device.getImageFormatProperties2(block_texel_view_info);
-    m_runtime_context.supports_block_texel_view =
+    m_runtime_context.host.capabilities.block_texel_view =
         block_texel_view_props.result == vk::Result::eSuccess;
 
     VmaVulkanFunctions functions{};
