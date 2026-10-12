@@ -753,15 +753,79 @@ void TestTapeMatchesWalker() {
         "a plan without its user data materialized");
 }
 
-// A select decides at runtime which value the walker reads: such a plan keeps the walker.
-void TestRuntimeChoiceKeepsWalker() {
+// A plan whose walk depends on runtime values, or that needs the strict reader, keeps the walker.
+// Each case changes the plain program in one way; the plan is made as the renderer makes it.
+void TestRuntimeChoicesKeepTheWalker() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  auto program = TapeProgram();
-  auto &block = *program.blocks[0];
-  auto &choice = block.AppendNewInst(ValueOpcode::SelectU32,
-      {Value(true), program.srt_reads[0].value, Value(0u)});
-  program.srt_reads[1].value = Value(&choice);
-  Check(ExtractResourcePlan(program).srt_tape == nullptr, "a runtime choice got a tape");
+  struct Case {
+    const char *name;
+    void (*change)(Program &program);
+  };
+  const Case cases[] = {
+      {"a select", [](Program &program) {
+         auto &block = *program.blocks[0];
+         program.srt_reads[1].value = Value(&block.AppendNewInst(
+             ValueOpcode::SelectU32, {Value(true), program.srt_reads[0].value, Value(0u)}));
+       }},
+      {"a short-circuit and", [](Program &program) {
+         auto &block = *program.blocks[0];
+         program.srt_reads[1].value = Value(&block.AppendNewInst(
+             ValueOpcode::LogicalAnd, {Value(true), Value(false)}));
+       }},
+      {"a short-circuit or", [](Program &program) {
+         auto &block = *program.blocks[0];
+         program.srt_reads[1].value = Value(&block.AppendNewInst(
+             ValueOpcode::LogicalOr, {Value(false), Value(true)}));
+       }},
+      {"a phi of two values", [](Program &program) {
+         auto &block = *program.blocks[0];
+         auto &phi = block.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+         phi.AddPhiOperand(&block, Value(1u));
+         phi.AddPhiOperand(&block, program.srt_reads[0].value);
+         program.srt_reads[1].value = Value(&phi);
+       }},
+      {"an undefined value", [](Program &program) {
+         auto &block = *program.blocks[0];
+         program.srt_reads[1].value = Value(&block.AppendNewInst(ValueOpcode::UndefU32));
+       }},
+      {"a uniform buffer read (captured reads)", [](Program &program) {
+         auto &block = *program.blocks[0];
+         program.memory_info.push_back({.kind = ResourceKind::Buffer});
+         auto &buffer = block.AppendNewInst(ValueOpcode::GetBufferResource,
+             {Value(0x1000u), Value(0u), Value(16u), Value(0u)});
+         auto &read = block.AppendNewInst(ValueOpcode::LoadBufferU32,
+             {Value(&buffer), Value(0u), Value(0u), Value(0u), Value(true)});
+         read.SetFlags(MemoryFlags{.index = static_cast<uint32_t>(program.memory_info.size() - 1)});
+         // A plan that captures reads has only raw reads as SRT reads.
+         program.srt_reads.resize(1);
+         program.descriptor_sources[0].dwords[3] = Value(&read);
+       }},
+      {"a branch", [](Program &program) {
+         program.srt_reads.resize(1); // a branch captures reads: only raw reads as SRT reads
+         auto &condition = program.blocks[0]->AppendNewInst(
+             ValueOpcode::IEqual32, {program.srt_reads[0].value, Value(4u)});
+         AddValueBlock(program);
+         AddValueBlock(program);
+         program.blocks[0]->condition = Value(&condition);
+         program.blocks[0]->terminator.kind =
+             Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+         program.blocks[0]->terminator.true_block = program.blocks[1];
+         program.blocks[0]->terminator.false_block = program.blocks[2];
+         program.blocks[1]->terminator.kind =
+             Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+         program.blocks[2]->terminator.kind =
+             Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+       }},
+  };
+  Check(ExtractResourcePlan(TapeProgram()).srt_tape != nullptr, "the plain program got no tape");
+  for (const auto &test : cases) {
+    auto program = TapeProgram();
+    test.change(program);
+    if (ExtractResourcePlan(program).srt_tape != nullptr) {
+      std::fprintf(stderr, "ResourceMaterializationTests: case: %s\n", test.name);
+      Check(false, "a plan whose walk depends on runtime values got a tape");
+    }
+  }
 }
 
 } // namespace
@@ -826,7 +890,7 @@ int main() {
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSpecializationFitsTheShader();
   TestTapeMatchesWalker();
-  TestRuntimeChoiceKeepsWalker();
+  TestRuntimeChoicesKeepTheWalker();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }
