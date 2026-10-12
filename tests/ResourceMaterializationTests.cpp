@@ -1,9 +1,12 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 
@@ -153,6 +156,7 @@ void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
   auto plan = ExtractResourcePlan(SrtProgram(reinterpret_cast<uint64_t>(&dword)));
+  Check(plan.srt_tape != nullptr, "a mapped SRT plan got no tape");
   uint32_t specialization_reads = 0;
   const SrtRuntime runtime{.userdata = &specialization_reads,
                            .read_specialization_memory =
@@ -648,6 +652,118 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+// The flat step list (SrtTape) of a plan gives what the walker gives, with the same reads. The
+// plan reads guest memory through an address in user data, shares one value between an SRT read
+// and a descriptor, checks a constant buffer's bounds, and extracts a carry.
+Libs::Graphics::ShaderRecompiler::IR::Program TapeProgram() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  const auto user_data = [&](uint32_t index) {
+    return Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                      {Value(static_cast<ScalarReg>(index))}));
+  };
+  const auto low = user_data(0);
+  const auto high = user_data(1);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer});
+
+  auto &address = block.AppendNewInst(ValueOpcode::GetAddressResource, {low, high});
+  auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+      {Value(&address), Value(4u), Value(0u), Value(true)});
+  read.SetFlags(MemoryFlags{.index = 0});
+  auto &buffer = block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {low, high, Value(16u), Value(0u)});
+  auto &bounded = block.AppendNewInst(ValueOpcode::ReadConstBuffer,
+      {Value(&buffer), Value(8u)});
+  bounded.SetFlags(MemoryFlags{.index = 1});
+  // Shared by an SRT read and a descriptor: the walker reads `read` once per call.
+  auto &shared = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&read), user_data(2)});
+  auto &carry = block.AppendNewInst(ValueOpcode::IAddCarry32,
+                                    {user_data(3), Value(0xffffffffu)});
+  auto &carry_out = block.AppendNewInst(ValueOpcode::CompositeExtractU32x2,
+                                        {Value(&carry), Value(1u)});
+  program.srt_reads.push_back({Value(&read), 0});
+  program.srt_reads.push_back({Value(&shared), 1});
+
+  DescriptorSource source;
+  source.dwords = {Value(&shared), Value(&carry_out), Value(&bounded), user_data(2)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  return program;
+}
+
+void TestTapeMatchesWalker() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto program = TapeProgram();
+  auto tape_plan = ExtractResourcePlan(program);
+  auto walk_plan = ExtractResourcePlan(program);
+  Check(tape_plan.srt_tape != nullptr, "a plain plan got no tape");
+  walk_plan.srt_tape = nullptr;
+
+  const std::array<uint32_t, 4> memory{0x11u, 0x22u, 0x33u, 0x44u};
+  const auto base = reinterpret_cast<uint64_t>(memory.data());
+  struct Reads { uint32_t count = 0; } tape_reads, walk_reads;
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    ++static_cast<Reads *>(data)->count;
+    std::memcpy(words.data(), reinterpret_cast<const void *>(address), sizeof(uint32_t));
+    return true;
+  };
+  for (const uint32_t carry_in : {0u, 1u}) {
+    const std::array<uint32_t, 4> user_data{static_cast<uint32_t>(base),
+                                            static_cast<uint32_t>(base >> 32u), 5u, carry_in};
+    ResourceSnapshot tape_snapshot;
+    ResourceSnapshot walk_snapshot;
+    ResourceSpecialization tape_specialization;
+    ResourceSpecialization walk_specialization;
+    Check(MaterializeResources(tape_plan,
+                               {.user_data = user_data, .read_memory = read, .userdata = &tape_reads},
+                               tape_snapshot, tape_specialization),
+          "the tape failed a plain plan");
+    Check(MaterializeResources(walk_plan,
+                               {.user_data = user_data, .read_memory = read, .userdata = &walk_reads},
+                               walk_snapshot, walk_specialization),
+          "the walker failed a plain plan");
+    Check(tape_snapshot.flattened_srt == std::vector<uint32_t>{0x22u, 0x27u} &&
+              tape_snapshot.flattened_srt == walk_snapshot.flattened_srt,
+          "the tape and the walker gave different SRT reads");
+    Check(tape_snapshot.buffers.size() == 1 && walk_snapshot.buffers.size() == 1 &&
+              tape_snapshot.buffers[0] == walk_snapshot.buffers[0] &&
+              tape_snapshot.buffers[0].dwords[0] == 0x27u &&
+              tape_snapshot.buffers[0].dwords[1] == carry_in &&
+              tape_snapshot.buffers[0].dwords[2] == 0x33u,
+          "the tape and the walker gave different descriptors");
+    Check(tape_specialization.buffers.size() == walk_specialization.buffers.size() &&
+              tape_specialization.buffers[0].packed_stride ==
+                  walk_specialization.buffers[0].packed_stride,
+          "the tape and the walker gave different specializations");
+  }
+  Check(tape_reads.count == walk_reads.count && tape_reads.count == 4,
+        "the tape did not read what the walker read");
+
+  // Missing user data fails both.
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(!MaterializeResources(tape_plan, {}, snapshot, specialization) &&
+            !MaterializeResources(walk_plan, {}, snapshot, specialization),
+        "a plan without its user data materialized");
+}
+
+// A select decides at runtime which value the walker reads: such a plan keeps the walker.
+void TestRuntimeChoiceKeepsWalker() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = TapeProgram();
+  auto &block = *program.blocks[0];
+  auto &choice = block.AppendNewInst(ValueOpcode::SelectU32,
+      {Value(true), program.srt_reads[0].value, Value(0u)});
+  program.srt_reads[1].value = Value(&choice);
+  Check(ExtractResourcePlan(program).srt_tape == nullptr, "a runtime choice got a tape");
+}
+
 } // namespace
 
 namespace Common {
@@ -709,6 +825,8 @@ int main() {
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSpecializationFitsTheShader();
+  TestTapeMatchesWalker();
+  TestRuntimeChoiceKeepsWalker();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

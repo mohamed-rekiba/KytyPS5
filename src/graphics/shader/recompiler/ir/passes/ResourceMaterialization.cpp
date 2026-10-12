@@ -14,6 +14,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <optional>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -1076,6 +1077,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 	}
 	if (capture_indirect_reads) plan.resource_tracking_complete &= !program.has_address_writes;
+	plan.srt_tape = SrtTape::Build(plan);
 	return plan;
 }
 
@@ -1096,11 +1098,24 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		                                         ? CaptureStrictRead : nullptr;
 		observed.read_memory = CaptureOrdinaryRead;
 	}
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed,
-	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return false;
+	// A plan with a tape runs it in place of the walkers. Its plan has no indirect descriptor,
+	// no uniform fill, and no captured reads, so the walkers below are not used.
+	const auto*              tape = program.srt_tape.get();
+	std::optional<SrtWalker> clean;
+	std::optional<SrtWalker> walker;
+	if (tape != nullptr) {
+		tape->Run(program, observed);
+		program.active_sources.clear();
+		if (!tape->FlatBuffer(program, snapshot.flattened_srt)) {
+			return false;
+		}
+	} else {
+		clean.emplace(program, CleanRuntime(observed));
+		walker.emplace(program, observed,
+		               capture_reads || program.requires_specialization_memory ? &*clean : nullptr);
+		if (!walker->RefreshFlatBuffer(snapshot.flattened_srt)) {
+			return false;
+		}
 	}
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	snapshot.uniform_fill = {};
@@ -1109,7 +1124,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	std::array<uint32_t, 4> stored {};
 	bool uniform_fill = words != 0;
 	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
-		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
+		uniform_fill = clean->Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
 	}
 	if (uniform_fill) {
 		snapshot.uniform_fill = fill.fill;
@@ -1120,7 +1135,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			return false;
 		}
 		if (active.empty() || active[source]) {
-			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value);
+			if (tape != nullptr) {
+				return tape->Descriptor(program, source, value);
+			}
+			return (capture_reads && written ? *clean : *walker).EvaluateDescriptor(source, value);
 		}
 		value = {};
 		value.dword_count = program.descriptor_sources[source].dword_count;
@@ -1140,7 +1158,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
 					if (!MaterializeIndirectDescriptor(
-					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
+					        program, *source->indirect_descriptor, i, 4u, observed, *clean, snapshot,
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
 					        NormalizeIndirectStoreBuffer))
 						return false;
@@ -1200,7 +1218,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
 			if (!MaterializeIndirectDescriptor(
-			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
+			        program, indirect, i, 8u, observed, *clean, snapshot, snapshot.images,
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
