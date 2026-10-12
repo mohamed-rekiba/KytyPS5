@@ -318,6 +318,17 @@ constexpr uint64_t kCarryFlag    = 1u << 0u;
 constexpr uint64_t kZeroFlag     = 1u << 6u;
 constexpr uint64_t kOverflowFlag = 1u << 11u;
 
+// ADOX is not emulated: the stop names it, and why.
+void TestAdoxIsNamedAsUnsupported() {
+	constexpr uint8_t kAdoxRaxRdx[] = {0xf3, 0x48, 0x0f, 0x38, 0xf6, 0xc2}; // adox rax, rdx
+	const char*       reason = Loader::X64InstructionEmulator::UnsupportedReason(kAdoxRaxRdx);
+	Check(reason != nullptr && std::strstr(reason, "ADOX") != nullptr,
+	      "an illegal ADOX gives no reason that names it");
+	constexpr uint8_t kAdcx[] = {0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc2}; // adcx rax, rdx
+	Check(Loader::X64InstructionEmulator::UnsupportedReason(kAdcx) == nullptr,
+	      "ADCX, which is emulated, was given a reason");
+}
+
 void TestAdcx() {
 	auto           fn = MapCode<AdxBlobFn>(kAdcxRaxRdx);
 	uint64_t       out[2] {};
@@ -535,6 +546,7 @@ int main() {
 	TestMwaitxEmulated();
 	TestAdcx();
 	TestAdcx32Memory();
+	TestAdoxIsNamedAsUnsupported();
 	TestUnknownInstructionRefused();
 	TestPatchedExtrqImmediate();
 	TestPatchedExtrqRexHigh();

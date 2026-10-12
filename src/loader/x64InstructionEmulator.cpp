@@ -891,4 +891,23 @@ bool TryEmulate(void* native_context) {
 	       TryEmulateCpuExtensions(context);
 }
 
+const char* UnsupportedReason(const void* code) {
+	ZydisDecoder            decoder {};
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (code == nullptr ||
+	    !ZYAN_SUCCESS(
+	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)) ||
+	    !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, code, ZYDIS_MAX_INSTRUCTION_LENGTH,
+	                                         &instruction, operands))) {
+		return nullptr;
+	}
+	if (instruction.mnemonic == ZYDIS_MNEMONIC_ADOX) {
+		// See EmulateAddCarryX.
+		return "ADOX (ADX) is not emulated: the host has no ADX, and Rosetta 2 hands the signal "
+		       "handler stale flags before ADOX (OF is lost), so a result would be wrong";
+	}
+	return nullptr;
+}
+
 } // namespace Loader::X64InstructionEmulator
