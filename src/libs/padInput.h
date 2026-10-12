@@ -11,6 +11,17 @@
 namespace Libs::Controller {
 
 constexpr int PAD_AXES = static_cast<int>(Axis::AxisMax);
+// The axes of a pad that nobody touches: sticks at the center, triggers released.
+constexpr std::array<int, PAD_AXES> PAD_AXES_AT_REST {128, 128, 128, 128, 0, 0};
+
+// The motion sensor values of the active gamepad.
+struct PadMotion {
+	std::array<float, 3> accel {0.0f, 1.0f, 0.0f};
+	std::array<float, 3> gyro {};
+	std::array<float, 4> orientation {0.0f, 0.0f, 0.0f, 1.0f};
+
+	bool operator==(const PadMotion&) const = default;
+};
 
 // What the game reads for player 1 at one moment.
 struct PadState {
@@ -23,18 +34,9 @@ struct PadState {
 
 	uint64_t                  time    = 0;
 	uint32_t                  buttons = 0;
-	std::array<int, PAD_AXES> axes {128, 128, 128, 128, 0, 0};
+	std::array<int, PAD_AXES> axes    = PAD_AXES_AT_REST;
 	std::array<Touch, 2>      touch {};
-	std::array<float, 3>      accel {0.0f, 1.0f, 0.0f};
-	std::array<float, 3>      gyro {};
-	std::array<float, 4>      orientation {0.0f, 0.0f, 0.0f, 1.0f};
-};
-
-// The motion sensor values of the active gamepad.
-struct PadMotion {
-	std::array<float, 3> accel {0.0f, 1.0f, 0.0f};
-	std::array<float, 3> gyro {};
-	std::array<float, 4> orientation {0.0f, 0.0f, 0.0f, 1.0f};
+	PadMotion                 motion;
 };
 
 // The input of player 1, made from the host keyboard and mouse (HOST_INPUT_CONTROLLER_ID) and from
@@ -101,7 +103,7 @@ private:
 	struct Source {
 		int                            id      = 0;
 		uint32_t                       buttons = 0;
-		std::array<int, PAD_AXES>      axes {128, 128, 128, 128, 0, 0};
+		std::array<int, PAD_AXES>      axes    = PAD_AXES_AT_REST;
 		std::array<PadState::Touch, 2> touch {};
 		// When this gamepad last sent real input, in calls of Claim(); 0 for never.
 		uint64_t claimed = 0;

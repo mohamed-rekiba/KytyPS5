@@ -169,16 +169,16 @@ static void pad_fill_data(PadData* data, const PadState& state, bool connected,
 	data->right_stick_y     = state.axes[static_cast<int>(Axis::RightY)];
 	data->analog_buttons_l2 = state.axes[static_cast<int>(Axis::TriggerLeft)];
 	data->analog_buttons_r2 = state.axes[static_cast<int>(Axis::TriggerRight)];
-	data->acceleration_x     = state.accel[0];
-	data->acceleration_y     = state.accel[1];
-	data->acceleration_z     = state.accel[2];
-	data->angular_velocity_x = state.gyro[0];
-	data->angular_velocity_y = state.gyro[1];
-	data->angular_velocity_z = state.gyro[2];
-	data->orientation_x      = state.orientation[0];
-	data->orientation_y      = state.orientation[1];
-	data->orientation_z      = state.orientation[2];
-	data->orientation_w      = state.orientation[3];
+	data->acceleration_x     = state.motion.accel[0];
+	data->acceleration_y     = state.motion.accel[1];
+	data->acceleration_z     = state.motion.accel[2];
+	data->angular_velocity_x = state.motion.gyro[0];
+	data->angular_velocity_y = state.motion.gyro[1];
+	data->angular_velocity_z = state.motion.gyro[2];
+	data->orientation_x      = state.motion.orientation[0];
+	data->orientation_y      = state.motion.orientation[1];
+	data->orientation_z      = state.motion.orientation[2];
+	data->orientation_w      = state.motion.orientation[3];
 	for (const auto& touch: state.touch) {
 		if (touch.down) {
 			auto& output = data->touch_data.touch[data->touch_data.touch_num++];
@@ -496,8 +496,7 @@ void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t t
 	if (id != m_input.ActiveId() || !m_motion_enabled) {
 		return;
 	}
-	const auto& latest = m_input.Latest();
-	PadMotion   motion {latest.accel, latest.gyro, latest.orientation};
+	PadMotion motion = m_input.Latest().motion;
 
 	// Convert acceleration to G; angular velocity is already in rad/s.
 	if (sensor == Sensor::Accel) {
@@ -564,18 +563,18 @@ void GameController::SetMotionSensorState(bool enable) {
 		m_gyro_time          = 0;
 		m_up_reference_valid = false;
 		PadMotion motion;
-		motion.orientation = m_input.Latest().orientation;
+		motion.orientation = m_input.Latest().motion.orientation;
 		m_input.SetMotion(motion, LibKernel::KernelGetProcessTime());
 	}
 }
 
 void GameController::ResetOrientation() {
 	Common::LockGuard lock(m_mutex);
-	const auto& latest   = m_input.Latest();
+	PadMotion motion     = m_input.Latest().motion;
+	motion.orientation   = PadMotion {}.orientation;
 	m_gyro_time          = 0;
 	m_up_reference_valid = false;
-	m_input.SetMotion({latest.accel, latest.gyro, {0.0f, 0.0f, 0.0f, 1.0f}},
-	                  LibKernel::KernelGetProcessTime());
+	m_input.SetMotion(motion, LibKernel::KernelGetProcessTime());
 }
 
 void GameController::ResetInputState() {

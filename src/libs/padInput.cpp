@@ -24,8 +24,7 @@ bool SameInput(const PadState& a, const PadState& b) {
 		       first.y == second.y;
 	};
 	return a.buttons == b.buttons && a.axes == b.axes && same_touch(a.touch[0], b.touch[0]) &&
-	       same_touch(a.touch[1], b.touch[1]) && a.accel == b.accel && a.gyro == b.gyro &&
-	       a.orientation == b.orientation;
+	       same_touch(a.touch[1], b.touch[1]) && a.motion == b.motion;
 }
 
 } // namespace
@@ -175,7 +174,7 @@ void PadInput::SetMotion(const PadMotion& motion, uint64_t time) {
 void PadInput::Reset(uint64_t time) {
 	for (auto& source: m_sources) {
 		source.buttons = 0;
-		source.axes    = {128, 128, 128, 128, 0, 0};
+		source.axes    = PAD_AXES_AT_REST;
 		source.touch   = {};
 	}
 	m_next_touch_id = 1;
@@ -184,10 +183,8 @@ void PadInput::Reset(uint64_t time) {
 
 void PadInput::Update(uint64_t time) {
 	PadState state;
-	state.time        = time;
-	state.accel       = m_motion.accel;
-	state.gyro        = m_motion.gyro;
-	state.orientation = m_motion.orientation;
+	state.time   = time;
+	state.motion = m_motion;
 
 	const Source* stick_left  = nullptr;
 	const Source* stick_right = nullptr;
