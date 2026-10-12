@@ -1084,10 +1084,10 @@ static int ConvertSocketOptionName(int level, int option) {
 #endif
 }
 
-// The guest kernel is FreeBSD: getsockopt of a boolean socket option returns the option's flag
-// bit (SO_BROADCAST gives 0x20), not 1. A Linux or Windows host returns 1, a macOS host the bit.
-static int GuestBooleanOption(int guest_option, int value) {
-	return value != 0 ? guest_option : 0;
+// The guest kernel is FreeBSD: getsockopt(SO_BROADCAST) gives the option's flag bit, 0x20, not 1.
+// A Linux or Windows host gives 1, a macOS host the bit. Only SO_BROADCAST is converted.
+static int GuestBroadcastValue(int value) {
+	return value != 0 ? 0x0020 : 0;
 }
 
 static int* P2pSocketOption(P2pEndpoint& endpoint, int option) {
@@ -2166,7 +2166,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 		if (*optlen < sizeof(int)) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
-		const int result = (optname == 0x0020 ? GuestBooleanOption(optname, *value) : *value);
+		const int result = (optname == 0x0020 ? GuestBroadcastValue(*value) : *value);
 		std::memcpy(optval, &result, sizeof(int));
 		*optlen = sizeof(int);
 		return 0;
@@ -2215,7 +2215,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	}
 	if (broadcast && len >= static_cast<SocketLength>(sizeof(int))) {
 		auto* enabled = static_cast<int*>(optval);
-		*enabled      = GuestBooleanOption(optname_guest, *enabled);
+		*enabled      = GuestBroadcastValue(*enabled);
 	}
 	*optlen = static_cast<uint32_t>(len);
 	return 0;
