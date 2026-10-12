@@ -140,10 +140,7 @@ void CommandScheduler::Shutdown() {
 		Submit();
 	}
 	m_master.WaitRetired(CurrentTick() - 1);
-	WaitPriorityOperations(CurrentTick() - 1);
-	// Also for the other scheduler and the presents, and with nothing committed until every
-	// deferred operation has run.
-	m_graphics.WithQueueIdle([this] { PopPendingOperations(); });
+	RunRetiredOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
 	m_operation_available.notify_all();
@@ -258,10 +255,7 @@ void CommandScheduler::Finish() {
 	if (!pending) {
 		return;
 	}
-	WaitPriorityOperations(CurrentTick() - 1);
-	// Also for the other scheduler and the presents, and with nothing committed until every
-	// deferred operation has run.
-	m_graphics.WithQueueIdle([this] { PopPendingOperations(); });
+	RunRetiredOperations();
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
@@ -279,6 +273,13 @@ void CommandScheduler::Wait(uint64_t tick) {
 	} else {
 		m_master.Wait(tick);
 	}
+}
+
+void CommandScheduler::RunRetiredOperations() {
+	WaitPriorityOperations(CurrentTick() - 1);
+	// Also for the other scheduler and the presents, and with nothing committed until every
+	// deferred operation has run.
+	m_graphics.WithQueueIdle([this] { PopPendingOperations(); });
 }
 
 void CommandScheduler::PopPendingOperations() {

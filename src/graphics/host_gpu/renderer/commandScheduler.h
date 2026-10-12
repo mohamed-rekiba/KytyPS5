@@ -60,6 +60,9 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Runs the deferred operations of every submission so far. The caller has waited until
+	// they retired.
+	void                      RunRetiredOperations();
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	// The same, also while no guest context is bound: a resource that is destroyed then, for

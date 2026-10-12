@@ -15,8 +15,9 @@ namespace Libs::Graphics {
 //
 // So every image of at most READBACK_TINY_EXTENT pixels on each side, with one layer and one
 // slice, is copied back, tiled or linear: such images are read back far more often than sampled
-// again, and each copy is a few bytes. Block-compressed images are left out; the GPU does not render them. Larger linear images
-// are copied back only when the setting asks for it (--readback-linear-images).
+// again, and each copy is a few bytes. Block-compressed images are left out; the GPU does not
+// render them. Larger linear images are copied back only when the setting asks for it
+// (--readback-linear-images).
 inline constexpr uint32_t READBACK_TINY_EXTENT = 4;
 
 struct ReadbackImage {
