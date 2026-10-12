@@ -73,6 +73,8 @@ ctest_only=(
 	emulator_present_mode_invalid
 	emulator_user_name_cli
 	emulator_user_name_too_long
+	emulator_video_out_resolution_cli
+	emulator_video_out_resolution_invalid
 	guest_red_zone_patcher
 )
 
