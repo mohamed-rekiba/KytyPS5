@@ -87,6 +87,40 @@ void TestTheGamepadThatSendsInputIsActive() {
 	      "the other gamepad's buttons stayed after it lost player 1");
 }
 
+// A resting trigger is not input: only a trigger pulled to TRIGGER_CLAIM takes player 1.
+void TestARestingTriggerDoesNotTakeOver() {
+	PadInput input;
+	input.Connect(7);
+	input.Connect(8);
+	input.SetAxis(8, Axis::TriggerLeft, PadInput::TRIGGER_CLAIM - 1, 1);
+	Check(input.ActiveId() == 7, "a resting trigger took over the active gamepad");
+	input.SetAxis(8, Axis::TriggerLeft, PadInput::TRIGGER_CLAIM, 2);
+	Check(input.ActiveId() == 8, "a pulled trigger did not take over the active gamepad");
+}
+
+// Each new touch gets the next id, 1 to 127, and keeps it while the finger stays down.
+void TestTouchesGetTheirOwnIds() {
+	PadInput input;
+	input.Connect(7);
+	input.SetTouch(7, 0, true, 100, 100, 1);
+	const auto first = input.Latest().touch[0].id;
+	input.SetTouch(7, 0, true, 120, 100, 2);
+	Check(first == 1 && input.Latest().touch[0].id == first, "a moving touch changed its id");
+	input.SetTouch(7, 1, true, 500, 300, 3);
+	Check(input.Latest().touch[1].id == 2, "a second finger did not get the next id");
+	input.SetTouch(7, 0, false, 120, 100, 4);
+	input.SetTouch(7, 0, true, 50, 50, 5);
+	Check(input.Latest().touch[0].id == 3, "a new touch reused an old id");
+	for (uint64_t time = 6; time < 6 + 2 * 124; time += 2) {
+		input.SetTouch(7, 0, false, 0, 0, time);
+		input.SetTouch(7, 0, true, 0, 0, time + 1);
+	}
+	Check(input.Latest().touch[0].id == 127, "the touch ids did not count up to 127");
+	input.SetTouch(7, 0, false, 0, 0, 1000);
+	input.SetTouch(7, 0, true, 0, 0, 1001);
+	Check(input.Latest().touch[0].id == 1, "the touch ids did not start again at 1 after 127");
+}
+
 void TestAConnectionChangeKeepsHeldInput() {
 	PadInput input;
 	input.Connect(KEYBOARD);
@@ -134,6 +168,8 @@ int main() {
 	TestTheStickTiltedFurtherWins();
 	TestTriggerNoiseIsNotAPress();
 	TestTheGamepadThatSendsInputIsActive();
+	TestARestingTriggerDoesNotTakeOver();
+	TestTouchesGetTheirOwnIds();
 	TestAConnectionChangeKeepsHeldInput();
 	TestReadGivesTheNewestUnreadStates();
 	std::puts("PadInputTests: passed");
