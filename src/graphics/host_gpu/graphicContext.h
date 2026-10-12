@@ -9,7 +9,6 @@
 #include "graphics/host_gpu/queueCommits.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
-#include <atomic>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -23,11 +22,6 @@ struct VulkanImage;
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
 struct GraphicContext {
-	// Pipelines of the game's list built ahead at this start, for the window title: the player
-	// sees that the start is doing something while they are built.
-	std::atomic<uint32_t> pipelines_ahead_total {0};
-	std::atomic<uint32_t> pipelines_ahead_built {0};
-
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
 	vk::PhysicalDevice                 physical_device                       = nullptr;

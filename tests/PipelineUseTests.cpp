@@ -6,6 +6,7 @@
 
 namespace {
 
+using Libs::Graphics::AheadBuildProgress;
 using Libs::Graphics::DrawEffects;
 using Libs::Graphics::FrameWaitBudget;
 using Libs::Graphics::GRACE_WAIT_BUDGET_US;
@@ -157,6 +158,23 @@ void TestBuildersLeaveCoresForTheGame() {
 	Check(PipelineBuilderCount(0) == 1, "an unknown core count builds on one thread");
 }
 
+void TestTheTitleCountsPipelinesBuiltAhead() {
+	AheadBuildProgress progress;
+	Check(!progress.Building(), "a start without a list shows no count");
+	progress.Listed(3);
+	const auto started = progress.Building();
+	Check(started && started->built == 0 && started->total == 3,
+	      "a list of 3 pipelines shows 0 of 3 built");
+	progress.Built();
+	progress.Built();
+	const auto two = progress.Building();
+	Check(two && two->built == 2 && two->total == 3, "two built pipelines show 2 of 3");
+	progress.Built();
+	Check(!progress.Building(), "the count goes away once the list is built");
+	progress.Listed(0);
+	Check(!progress.Building(), "an empty list shows no count");
+}
+
 } // namespace
 
 int main() {
@@ -172,6 +190,7 @@ int main() {
 	TestAPipelineWaitsOnceAFrame();
 	TestShortWaitsHaveABudgetPerFrame();
 	TestBuildersLeaveCoresForTheGame();
+	TestTheTitleCountsPipelinesBuiltAhead();
 	if (g_failures != 0) {
 		std::cerr << g_failures << " check(s) failed\n";
 		return 1;

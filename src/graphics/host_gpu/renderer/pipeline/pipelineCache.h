@@ -122,6 +122,8 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	// For the window title. Safe to read without the renderer's lock.
+	[[nodiscard]] const AheadBuildProgress& BuiltAhead() const { return m_built_ahead; }
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -195,6 +197,7 @@ private:
 	};
 
 	GraphicContext&               m_graphics;
+	AheadBuildProgress            m_built_ahead;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	// One for each worker thread, when the driver builds the pipelines of a cache one at a time

@@ -2,7 +2,9 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_PIPELINEUSE_H_
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <optional>
 
 // What a draw does when its graphics pipeline is not built yet.
 //
@@ -87,6 +89,33 @@ enum class PipelineUse : uint8_t {
 	constexpr uint32_t Most     = 10;
 	return std::clamp(host_threads > Reserved ? host_threads - Reserved : 1u, 1u, Most);
 }
+
+// The pipelines of the game's list built ahead at this start. The window title shows the count
+// while they build: the player sees that the start is doing something.
+class AheadBuildProgress {
+public:
+	struct Count {
+		uint32_t built = 0;
+		uint32_t total = 0;
+	};
+
+	void Listed(uint32_t total) noexcept {
+		m_built.store(0, std::memory_order_relaxed);
+		m_total.store(total, std::memory_order_relaxed);
+	}
+	// A listed pipeline is built, dropped, or was built already.
+	void Built() noexcept { m_built.fetch_add(1, std::memory_order_relaxed); }
+	// The count while pipelines of the list are left to build; nothing once all are built.
+	[[nodiscard]] std::optional<Count> Building() const noexcept {
+		const Count count {.built = m_built.load(std::memory_order_relaxed),
+		                   .total = m_total.load(std::memory_order_relaxed)};
+		return count.built < count.total ? std::optional(count) : std::nullopt;
+	}
+
+private:
+	std::atomic<uint32_t> m_built {0};
+	std::atomic<uint32_t> m_total {0};
+};
 
 // The time draws into reset targets may wait for their pipelines in one frame: one refresh at
 // 60 Hz, so such a frame takes at most that much longer.

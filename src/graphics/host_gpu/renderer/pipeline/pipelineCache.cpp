@@ -974,8 +974,7 @@ void PipelineCache::OpenPipelineList(const std::filesystem::path& path, bool wri
 	}
 	PipelineCacheLog("Pipeline list: {} pipeline(s) to build ahead from {}",
 	                 m_listed_pipelines.size(), Common::PathToString(path));
-	m_graphics.pipelines_ahead_total.store(static_cast<uint32_t>(m_listed_pipelines.size()),
-	                                       std::memory_order_relaxed);
+	m_built_ahead.Listed(static_cast<uint32_t>(m_listed_pipelines.size()));
 	// The list is written again without what was dropped (another build, a damaged tail), into
 	// a temporary file that then takes the list's place: a stop in between leaves the old list.
 	// New records are appended to it.
@@ -1092,7 +1091,7 @@ void PipelineCache::QueueListedPipelines() {
 		GraphicsPipelineKey key;
 		// Dropped or already built: done as far as the title's count goes.
 		const auto done = [this] {
-			m_graphics.pipelines_ahead_built.fetch_add(1, std::memory_order_relaxed);
+			m_built_ahead.Built();
 			return true;
 		};
 		// A program that is not built yet is asked for again at the next draw. Once the program
@@ -1812,7 +1811,7 @@ void PipelineCache::BuildPipelines(std::stop_token stop, uint32_t builder) {
 			job.target->ready.store(true, std::memory_order_release);
 		}
 		if (job.listed) {
-			m_graphics.pipelines_ahead_built.fetch_add(1, std::memory_order_relaxed);
+			m_built_ahead.Built();
 		}
 		m_job_done.notify_all();
 	}
