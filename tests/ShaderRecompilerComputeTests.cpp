@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/cacheCollection.h"
 #include "graphics/host_gpu/bufferChunk.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
@@ -274,6 +275,13 @@ struct TextureCacheTestAccess {
         cache.m_slot_images[id].lru_id = cache.m_lru_cache.Insert(id, tick);
       }
     }
+  }
+
+  // The next pass is an idle one (cacheCollection.h): memory is not short.
+  static void ConfigureIdleCollection(TextureCache &cache, std::span<const ImageId> oldest,
+                                      uint64_t tick) {
+    ConfigureGarbageCollection(cache, oldest, tick, UINT64_MAX);
+    cache.m_trigger_gc_memory = UINT64_MAX;
   }
 
   static bool Contains(const TextureCache &cache, ImageId id) {
@@ -5632,6 +5640,74 @@ public:
       // No GPU work wrote it: the image is dropped without a read-back.
       texture_cache.GetImage(id).ClearGpuModified();
       TextureCacheTestAccess::DeleteImage(texture_cache, id);
+    }
+    scheduler.Finish();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // An idle pass keeps a GPU-written image and marks it used, so the next passes do not visit it
+  // again; the images it keeps count toward the pass's limit of deletions (56ca0e9e).
+  void CheckIdleCollectionKeepsGpuWrittenImages() {
+    constexpr const char *name = "IdleCollectionKeepsGpuWrittenImages";
+    constexpr uintptr_t base = 0x0000000208800000ull;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    if (CannotRun("graphics", name, context.GetGraphics().UsesSystemMemory(),
+                  "idle collection passes", "a host that shares memory with the CPU")) {
+      return;
+    }
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    uint64_t address = base;
+    const auto make_image = [&](bool gpu_written) {
+      ImageInfo info{};
+      info.type = Prospero::ImageType::kColor2D;
+      info.data = {address, 0x10000};
+      info.extent = {64, 64, 1};
+      info.resources = {1, 1};
+      info.samples = 1;
+      info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+      info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+      info.bytes_per_block = 4;
+      info.pitch = 64;
+      info.mip_layout = {ImageMipInfo{0, 0x10000, 64, 64}};
+      address += 0x10000;
+      const auto id = TextureCacheTestAccess::InsertImage(texture_cache, info);
+      if (gpu_written) {
+        texture_cache.GetImage(id).MarkGpuModified();
+      }
+      return id;
+    };
+    // Ten GPU-written images, the pass's limit, then a clean one: all unused for the idle age.
+    std::vector<ImageId> oldest;
+    for (int index = 0; index < 10; ++index) {
+      oldest.push_back(make_image(true));
+    }
+    const auto clean = make_image(false);
+    oldest.push_back(clean);
+    uint64_t tick = Libs::Graphics::IDLE_COLLECT_AGE + 1;
+    TextureCacheTestAccess::ConfigureIdleCollection(texture_cache, oldest, tick);
+    texture_cache.RunGarbageCollector();
+    bool kept = true;
+    for (size_t index = 0; index + 1 < oldest.size(); ++index) {
+      kept &= TextureCacheTestAccess::Contains(texture_cache, oldest[index]);
+    }
+    Require(name, "GPU-written images kept", kept,
+            "an idle pass freed a GPU-written image");
+    Require(name, "kept images count toward the limit",
+            TextureCacheTestAccess::Contains(texture_cache, clean),
+            "an idle pass went past its limit of deletions over kept images");
+    texture_cache.RunGarbageCollector();
+    Require(name, "kept images marked used",
+            !TextureCacheTestAccess::Contains(texture_cache, clean),
+            "the kept images were visited again, so the clean image stayed");
+    for (size_t index = 0; index + 1 < oldest.size(); ++index) {
+      texture_cache.GetImage(oldest[index]).ClearGpuModified();
+      TextureCacheTestAccess::DeleteImage(texture_cache, oldest[index]);
     }
     scheduler.Finish();
     std::printf("[gpu]     %-32s ok\n", name);
@@ -43758,6 +43834,7 @@ int RunSelectedCases(int argc, char **argv) {
     vulkan.CheckUploadBatchStagingWait();
     vulkan.CheckTextureDecodeMemo();
     vulkan.CheckTinyImageReadbackEnrolment();
+    vulkan.CheckIdleCollectionKeepsGpuWrittenImages();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -43968,6 +44045,7 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckUploadBatchStagingWait();
   vulkan.CheckTextureDecodeMemo();
   vulkan.CheckTinyImageReadbackEnrolment();
+  vulkan.CheckIdleCollectionKeepsGpuWrittenImages();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
