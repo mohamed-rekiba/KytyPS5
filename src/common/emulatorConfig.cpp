@@ -170,10 +170,6 @@ bool ProfilerEnabled() {
 	return g_config->profiler_enabled;
 }
 
-bool PerfCountersEnabled() {
-	return g_config->perf_counters_enabled;
-}
-
 bool SpirvDebugPrintfEnabled() {
 	return g_config->spirv_debug_printf_enabled;
 }

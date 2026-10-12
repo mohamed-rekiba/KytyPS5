@@ -135,7 +135,6 @@ LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
 
 bool ProfilerEnabled();
-bool PerfCountersEnabled();
 
 bool SpirvDebugPrintfEnabled();
 

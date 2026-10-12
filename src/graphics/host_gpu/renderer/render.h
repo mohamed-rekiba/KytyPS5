@@ -4,7 +4,6 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/pipelineUse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
