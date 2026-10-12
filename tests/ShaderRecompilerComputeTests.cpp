@@ -18797,6 +18797,9 @@ private:
     device_features.shaderFloat64 = caps.float64;
     device_features.fillModeNonSolid = true;
     device_features.tessellationShader = true;
+    // The vertex subgroup probe stores from the vertex stage; the emulator's device enables it
+    // too (deviceSuitability.cpp requires it).
+    device_features.vertexPipelineStoresAndAtomics = true;
     device_features.depthClamp = caps.depth_clamp;
     device_features.depthBounds = caps.depth_bounds;
     device_features.shaderCullDistance = caps.cull_distance;
