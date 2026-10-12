@@ -202,18 +202,21 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding& input,
                                          uint32_t component) {
 	const auto kind  = VertexParameterScalarKind(state, input.location);
-	if (kind == VertexInputScalarKind::Uscaled1010102) {
-		// Fields at bits 0, 10, 20 and 30, 10 bits wide but the last, 2. As floats.
+	if (IsPacked1010102(kind)) {
+		// Fields at bits 0, 10, 20 and 30, 10 bits wide but the last, 2. As floats; the signed
+		// form sign-extends each field.
 		EXIT_IF(component > 3u);
+		const bool sign  = kind == VertexInputScalarKind::Sscaled1010102;
 		const auto word  = state.builder.AllocateId();
 		const auto field = state.builder.AllocateId();
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), word, input.variable_id);
-		state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), field, word,
-		                          ConstantU32(state, component * 10u),
+		state.builder.AddFunction(sign ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract,
+		                          TypeU32(state), field, word, ConstantU32(state, component * 10u),
 		                          ConstantU32(state, component == 3u ? 2u : 10u));
-		state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), value, field);
+		state.builder.AddFunction(sign ? spv::OpConvertSToF : spv::OpConvertUToF, TypeF32(state),
+		                          value, field);
 		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
 		return bits;
 	}

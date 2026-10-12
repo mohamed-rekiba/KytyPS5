@@ -435,6 +435,7 @@ VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint3
 			return state.host.capabilities.packed_scaled_vertex_input
 			           ? VertexInputScalarKind::Float
 			           : VertexInputScalarKind::Uscaled1010102;
+		case Prospero::BufferFormat::k10_10_10_2SScaled: return VertexInputScalarKind::Sscaled1010102;
 		default: return VertexInputScalarKind::Float;
 	}
 }
@@ -447,7 +448,8 @@ uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind ki
 	switch (kind) {
 		case VertexInputScalarKind::Sint: return TypeI32(state);
 		case VertexInputScalarKind::Uint:
-		case VertexInputScalarKind::Uscaled1010102: return TypeU32(state);
+		case VertexInputScalarKind::Uscaled1010102:
+		case VertexInputScalarKind::Sscaled1010102: return TypeU32(state);
 		case VertexInputScalarKind::Float:
 		default: return TypeF32(state);
 	}
@@ -590,9 +592,8 @@ void DefineInputs(EmitterState& state) {
 				    state.program.stage == ShaderType::Local) {
 					const auto kind = VertexParameterScalarKind(state, input.location);
 					type            = VertexParameterScalarType(state, kind);
-					const auto components = kind == VertexInputScalarKind::Uscaled1010102
-					                            ? 1u
-					                            : VertexParameterComponentCount(input);
+					const auto components =
+					    IsPacked1010102(kind) ? 1u : VertexParameterComponentCount(input);
 					if (components > 1u) {
 						type = state.builder.Type(spv::OpTypeVector, type, components);
 					}

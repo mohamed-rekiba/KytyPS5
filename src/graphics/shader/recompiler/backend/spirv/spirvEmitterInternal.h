@@ -302,7 +302,14 @@ struct ValueEmitContext {
 
 // Uscaled1010102: the attribute's packed 32-bit word, unpacked by the shader, on a host that cannot
 // fetch packed 10-10-10-2 scaled values (HostCapabilities::packed_scaled_vertex_input).
-enum class VertexInputScalarKind { Float, Sint, Uint, Uscaled1010102 };
+// Sscaled1010102: the signed form, unpacked by the shader on every host (the capability is checked
+// for the unsigned form only).
+enum class VertexInputScalarKind { Float, Sint, Uint, Uscaled1010102, Sscaled1010102 };
+
+[[nodiscard]] inline bool IsPacked1010102(VertexInputScalarKind kind) {
+	return kind == VertexInputScalarKind::Uscaled1010102 ||
+	       kind == VertexInputScalarKind::Sscaled1010102;
+}
 
 constexpr uint32_t NoImageComponent = 0xffffffffu;
 

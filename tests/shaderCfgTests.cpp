@@ -11610,6 +11610,17 @@ void TestEmbeddedFetchPreservesSharedScalarLoad() {
         "a host that fetches packed scaled attributes still unpacked them in the shader");
   Check(packed_source(false).find("OpBitFieldUExtract") != std::string::npos,
         "a host without packed scaled vertex fetch did not unpack the attribute's word");
+
+  // The signed form: every host fetches the packed word, and the shader sign-extends each field.
+  packed.resources[0].fields[3] =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k10_10_10_2SScaled) << 12u) |
+      DstSel(4, 5, 6, 7);
+  for (const bool host_fetch : {false, true}) {
+    const auto source = packed_source(host_fetch);
+    Check(source.find("OpBitFieldSExtract") != std::string::npos &&
+              source.find("OpConvertSToF") != std::string::npos,
+          "a signed packed scaled attribute was not sign-extended in the shader");
+  }
 }
 
 void TestEmbeddedVertexFormatSwizzle() {

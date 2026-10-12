@@ -121,7 +121,8 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		return;
 	}
 
-	if (fmt == Prospero::BufferFormat::k10_10_10_2UScaled && !host.packed_scaled_vertex_input) {
+	if ((fmt == Prospero::BufferFormat::k10_10_10_2UScaled && !host.packed_scaled_vertex_input) ||
+	    fmt == Prospero::BufferFormat::k10_10_10_2SScaled) {
 		// The packed word: the vertex shader unpacks it (see VertexInputScalarKind).
 		format = vk::Format::eR32Uint;
 		size   = 1;
