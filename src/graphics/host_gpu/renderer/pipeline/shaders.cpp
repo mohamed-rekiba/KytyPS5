@@ -411,14 +411,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		rasterizer.pNext            = &clip_ext;
 	} else if (!static_params.depth_clip_enable) {
 		// No clipping and a clamp: what depth clamping alone does.
-		if (!host.depth_clamp) {
+		if (!HostDepthIsExact(host, false, false)) {
 			EXIT("draw with depth clipping off needs depthClamp, which the host GPU does not "
 			     "enable\n");
 		}
 		rasterizer.depthClampEnable = VK_TRUE;
 	}
-	// TODO: the remaining case, clipping on without VK_EXT_depth_clip_enable, is clipped as the
-	// guest asks, but depth is not clamped after polygon offset. It must be done exactly or stop.
+	// Clipping on without VK_EXT_depth_clip_enable: clipped as the guest asks and not clamped.
+	// Exact while polygon offset does not move depth past the range (HostDepthIsExact); the draw
+	// warns once when it does not hold, and goes on.
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex {};
 	// The vertex shader of a captured mesh draw puts the guest's provoking vertex first, so such
 	// a draw takes flat values from the first vertex on every host.

@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/depthSnapshotPlan.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/hostLowering.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -399,6 +400,16 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
+	if (!HostDepthIsExact(buffer.GetContext().GetGraphics().host.capabilities,
+	                      ctx.GetClipControl().IsZClipEnabled(), depth_bias_enable)) {
+		// Not stopped: polygon offset is common (decals, shadows), and MoltenVK has no
+		// VK_EXT_depth_clip_enable. Only depth that the offset moves past the range is wrong.
+		static std::atomic<bool> warned {false};
+		if (!warned.exchange(true)) {
+			LOGF("Warning: depth with polygon offset is not clamped on this host: it lacks depthClamp "
+			     "with VK_EXT_depth_clip_enable\n");
+		}
+	}
 	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.

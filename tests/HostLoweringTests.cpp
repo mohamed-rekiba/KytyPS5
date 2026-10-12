@@ -94,7 +94,36 @@ void TestCapturedDrawSizeAndLimit() {
 
 } // namespace
 
+void TestDepthIsExactWithClampAndClipControl() {
+	HostCapabilities host;
+	host.depth_clamp       = true;
+	host.depth_clip_enable = true;
+	Check(HostDepthIsExact(host, true, true) && HostDepthIsExact(host, false, true),
+	      "a host with depth clamping and VK_EXT_depth_clip_enable gives every draw exact depth");
+}
+
+void TestADrawThatDoesNotClipNeedsDepthClamp() {
+	HostCapabilities host;
+	host.depth_clamp = true;
+	Check(HostDepthIsExact(host, false, true), "depth clamping alone gives a draw that does not clip");
+	host.depth_clamp = false;
+	Check(!HostDepthIsExact(host, false, false), "a draw that does not clip needs depth clamping");
+}
+
+// Without VK_EXT_depth_clip_enable a draw that clips runs without a clamp: exact until polygon
+// offset moves its depth past the range.
+void TestPolygonOffsetNeedsTheClampWhenADrawClips() {
+	HostCapabilities host;
+	host.depth_clamp = true;
+	Check(HostDepthIsExact(host, true, false), "a draw that clips, without polygon offset, is exact");
+	Check(!HostDepthIsExact(host, true, true),
+	      "a draw that clips with polygon offset was taken as exact without a clamp");
+}
+
 int main() {
+	TestDepthIsExactWithClampAndClipControl();
+	TestADrawThatDoesNotClipNeedsDepthClamp();
+	TestPolygonOffsetNeedsTheClampWhenADrawClips();
 	TestDescriptorsArePushedWhenTheDeviceCan();
 	TestNoPushWithoutTheCapability();
 	TestPushedBuffersWithoutSizeAreNotPushed();
