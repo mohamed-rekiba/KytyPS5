@@ -2,7 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RANGESET_H_
 
 #include "common/assert.h"
-#include "graphics/host_gpu/bufferChunk.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 
 #include <algorithm>
 #include <cstdint>

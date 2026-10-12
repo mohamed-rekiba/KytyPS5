@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_BUFFERCHUNK_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_BUFFERCHUNK_H_
 
+#include "graphics/host_gpu/regionDefinitions.h"
+
 #include <algorithm>
 #include <cstdint>
 
@@ -18,12 +20,6 @@ namespace Libs::Graphics {
 // the mapping that holds it. A buffer is never freed because it is idle (see cacheCollection.h),
 // so fewer, larger buffers are what bound the count.
 inline constexpr uint64_t BUFFER_CHUNK_SIZE = uint64_t {2} * 1024 * 1024;
-
-// [begin, end); empty when begin == end.
-struct GuestSpan {
-	uint64_t begin = 0;
-	uint64_t end   = 0;
-};
 
 // The range a new buffer covers, for a first use `request` inside the guest mapping `mapped`, in
 // chunks of `chunk_size` bytes. The result always holds the request, also where the request leaves
