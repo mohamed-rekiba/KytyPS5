@@ -337,15 +337,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	// A buffer that the GPU writes again in every submission would keep a waiting caller here
-	// without end. After this many waits the GPU thread does the waiting, which always ends.
-	constexpr int MaxCallerWaits  = 3;
+	// See ReadbackCallerCanWait: after a few waits the GPU thread does the waiting.
 	const bool    on_other_thread = !GuestGpu::IsGpuThread();
 	auto&         gpu             = m_scheduler.Context().GetGpu();
 	for (int waits = 0;; ++waits) {
 		std::optional<uint64_t> wait_tick;
 		auto round = [&] {
-			wait_tick = ReadBack(vaddr, size, is_write, on_other_thread && waits < MaxCallerWaits);
+			wait_tick = ReadBack(vaddr, size, is_write, ReadbackCallerCanWait(on_other_thread, waits));
 		};
 		// The GPU thread no longer takes work, or the device no longer answers: the emulator is
 		// shutting down. This thread cannot go on without the page, and must not stop the

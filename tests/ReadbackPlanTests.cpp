@@ -7,6 +7,8 @@
 namespace {
 
 using Libs::Graphics::PlanReadback;
+using Libs::Graphics::READBACK_MAX_CALLER_WAITS;
+using Libs::Graphics::ReadbackCallerCanWait;
 using Libs::Graphics::ReadbackPlan;
 using Libs::Graphics::ReadbackState;
 using Libs::Graphics::ReadbackStep;
@@ -90,6 +92,17 @@ void TestABufferTheGpuNeverWroteIsPublishedAtOnce() {
 
 } // namespace
 
+// A buffer the GPU writes in every submission: the caller waits a few times, then the GPU thread
+// waits, so the read-back ends.
+void TestACallerThatWaitedTooOftenLeavesTheWaitToTheGpuThread() {
+	Check(ReadbackCallerCanWait(true, 0), "a guest thread could not wait for its first read-back");
+	Check(ReadbackCallerCanWait(true, READBACK_MAX_CALLER_WAITS - 1),
+	      "a guest thread could not wait before its limit");
+	Check(!ReadbackCallerCanWait(true, READBACK_MAX_CALLER_WAITS),
+	      "a guest thread kept waiting past its limit");
+	Check(!ReadbackCallerCanWait(false, 0), "the GPU thread was taken as a caller that can wait");
+}
+
 int main() {
 	TestMemoryTheCpuCannotReadIsCopiedThroughTheGpu();
 	TestAFinishedWriteIsPublishedAtOnce();
@@ -97,6 +110,7 @@ int main() {
 	TestAWriteInFlightIsWaitedForOnTheGpuThreadWhenTheCallerCannot();
 	TestAWriteInTheOpenSubmissionIsSubmittedFirst();
 	TestABufferTheGpuNeverWroteIsPublishedAtOnce();
+	TestACallerThatWaitedTooOftenLeavesTheWaitToTheGpuThread();
 	if (g_failures != 0) {
 		std::cerr << g_failures << " failure(s)\n";
 		return 1;

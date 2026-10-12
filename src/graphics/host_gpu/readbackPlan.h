@@ -15,6 +15,10 @@
 // only, and whoever asked does the waiting. A guest thread that faulted waits itself, and the GPU
 // thread goes on recording. The GPU thread only does what must be done there: submit, when the
 // write still sits in the open command buffer, and publish, when the write has finished.
+//
+// One exception: a buffer the GPU writes again in every submission would keep a waiting caller
+// asking without end. After READBACK_MAX_CALLER_WAITS waits the GPU thread waits instead, which
+// always ends (ReadbackCallerCanWait).
 
 namespace Libs::Graphics {
 
@@ -51,6 +55,14 @@ struct ReadbackPlan {
 
 	bool operator==(const ReadbackPlan&) const = default;
 };
+
+inline constexpr int READBACK_MAX_CALLER_WAITS = 3;
+
+// Whether the caller of a read-back can wait for it (ReadbackState::caller_can_wait): only off the
+// GPU thread, and only for its first READBACK_MAX_CALLER_WAITS waits.
+[[nodiscard]] constexpr bool ReadbackCallerCanWait(bool off_gpu_thread, int waits) noexcept {
+	return off_gpu_thread && waits < READBACK_MAX_CALLER_WAITS;
+}
 
 [[nodiscard]] constexpr ReadbackPlan PlanReadback(const ReadbackState& state) noexcept {
 	if (!state.cpu_readable) {
