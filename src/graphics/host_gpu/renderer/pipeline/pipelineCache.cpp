@@ -1815,18 +1815,27 @@ PipelineCache::Pipeline* PipelineCache::WhenReady(GraphicsEntry& entry, const Dr
 		}
 		return nullptr;
 	};
-	// A build the driver has cached takes about a millisecond: a wait that short is no visible
-	// stop, and the picture stays exact on a host that builds fast.
+	// A short wait first (see GRACE_WAIT_US): once per pipeline and frame, within the frame's
+	// budget.
 	const auto grace_wait = [&]() -> Pipeline* {
-		constexpr auto GraceWait = std::chrono::milliseconds(2);
 		Promote(entry);
+		const auto wait_us =
+		    GraceWaitUs(entry.grace_wait_frame, frame, m_grace_wait_budget.Left(frame));
+		if (wait_us == 0) {
+			return leave_out();
+		}
+		entry.grace_wait_frame = frame;
+		const auto begin       = std::chrono::steady_clock::now();
+		bool       built       = false;
 		{
 			std::unique_lock lock(m_jobs_mutex);
-			if (m_job_done.wait_for(lock, GraceWait, ready)) {
-				return &entry.pipeline;
-			}
+			built = m_job_done.wait_for(lock, std::chrono::microseconds(wait_us), ready);
 		}
-		return leave_out();
+		m_grace_wait_budget.Spend(
+		    frame, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                     std::chrono::steady_clock::now() - begin)
+		                                     .count()));
+		return built ? &entry.pipeline : leave_out();
 	};
 	switch (PlanPipelineUse(effects, ready(), m_always_wait)) {
 		case PipelineUse::Draw: return &entry.pipeline;

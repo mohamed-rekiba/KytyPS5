@@ -91,13 +91,22 @@ enum class PipelineUse : uint8_t {
 // 60 Hz, so such a frame takes at most that much longer.
 inline constexpr uint64_t RESET_TARGET_WAIT_BUDGET_US = 16'000;
 
+// A draw that is left out first waits this long for its pipeline: a build the driver has cached
+// takes about a millisecond, so on a host that builds fast the picture stays exact.
+inline constexpr uint64_t GRACE_WAIT_US = 2'000;
+// All such short waits of one frame together.
+inline constexpr uint64_t GRACE_WAIT_BUDGET_US = 4'000;
+
 class FrameWaitBudget {
 public:
+	explicit FrameWaitBudget(uint64_t per_frame_us = RESET_TARGET_WAIT_BUDGET_US) noexcept
+	    : m_per_frame(per_frame_us), m_left(per_frame_us) {}
+
 	// Microseconds left to wait in `frame`.
 	[[nodiscard]] uint64_t Left(uint64_t frame) noexcept {
 		if (frame != m_frame) {
 			m_frame = frame;
-			m_left  = RESET_TARGET_WAIT_BUDGET_US;
+			m_left  = m_per_frame;
 		}
 		return m_left;
 	}
@@ -109,9 +118,20 @@ public:
 	}
 
 private:
+	uint64_t m_per_frame;
 	uint64_t m_frame = UINT64_MAX;
-	uint64_t m_left  = RESET_TARGET_WAIT_BUDGET_US;
+	uint64_t m_left;
 };
+
+// Microseconds a draw that is left out waits for its pipeline in `frame`. `last_wait_frame`: the
+// frame of the pipeline's last such wait. `budget_left`: what is left of GRACE_WAIT_BUDGET_US.
+[[nodiscard]] constexpr uint64_t GraceWaitUs(uint64_t last_wait_frame, uint64_t frame,
+                                             uint64_t budget_left) noexcept {
+	if (last_wait_frame == frame) {
+		return 0;
+	}
+	return std::min(GRACE_WAIT_US, budget_left);
+}
 
 // What the renderer remembers of one draw target (an image, mip and layer): the frame of its last
 // draw, the image's content generation after that draw, and the frame in which a write other

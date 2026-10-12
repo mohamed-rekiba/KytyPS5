@@ -8,6 +8,9 @@ namespace {
 
 using Libs::Graphics::DrawEffects;
 using Libs::Graphics::FrameWaitBudget;
+using Libs::Graphics::GRACE_WAIT_BUDGET_US;
+using Libs::Graphics::GRACE_WAIT_US;
+using Libs::Graphics::GraceWaitUs;
 using Libs::Graphics::RESET_TARGET_WAIT_BUDGET_US;
 using Libs::Graphics::PipelineBuilderCount;
 using Libs::Graphics::PipelineUse;
@@ -121,6 +124,30 @@ void TestEveryDrawWaitsWhenAsked() {
 	      "with --pipeline-wait a visual draw waits too");
 }
 
+// Many draws of one frame can share a pipeline that is still building: only the first waits, so
+// a frame does not stop for 2 ms per draw.
+void TestAPipelineWaitsOnceAFrame() {
+	Check(GraceWaitUs(UINT64_MAX, 7, GRACE_WAIT_BUDGET_US) == GRACE_WAIT_US,
+	      "the first draw of a building pipeline did not wait");
+	Check(GraceWaitUs(7, 7, GRACE_WAIT_BUDGET_US) == 0,
+	      "a second draw of the same pipeline in the frame waited again");
+	Check(GraceWaitUs(7, 8, GRACE_WAIT_BUDGET_US) == GRACE_WAIT_US,
+	      "the pipeline did not wait again in the next frame");
+}
+
+// At a level start a frame can ask for hundreds of new pipelines: the waits of a frame have a cap.
+void TestShortWaitsHaveABudgetPerFrame() {
+	FrameWaitBudget budget(GRACE_WAIT_BUDGET_US);
+	Check(budget.Left(3) == GRACE_WAIT_BUDGET_US, "a frame starts with the whole short-wait budget");
+	budget.Spend(3, GRACE_WAIT_BUDGET_US - 500);
+	Check(GraceWaitUs(UINT64_MAX, 3, budget.Left(3)) == 500,
+	      "a wait was longer than what is left of the frame's budget");
+	budget.Spend(3, 500);
+	Check(GraceWaitUs(UINT64_MAX, 3, budget.Left(3)) == 0,
+	      "a draw waited after the frame's budget was spent");
+	Check(budget.Left(4) == GRACE_WAIT_BUDGET_US, "the next frame has the whole budget again");
+}
+
 void TestBuildersLeaveCoresForTheGame() {
 	Check(PipelineBuilderCount(14) == 10, "a 14-core host builds on 10 threads, 4 cores stay free");
 	Check(PipelineBuilderCount(8) == 4, "an 8-core host builds on 4 threads");
@@ -142,6 +169,8 @@ int main() {
 	TestAResetAcrossAFrameGapIsKept();
 	TestAPendingUploadCountsAsAReset();
 	TestEveryDrawWaitsWhenAsked();
+	TestAPipelineWaitsOnceAFrame();
+	TestShortWaitsHaveABudgetPerFrame();
 	TestBuildersLeaveCoresForTheGame();
 	if (g_failures != 0) {
 		std::cerr << g_failures << " check(s) failed\n";

@@ -206,6 +206,8 @@ private:
 	struct GraphicsEntry {
 		std::atomic<bool> ready {false};
 		Pipeline          pipeline;
+		// The frame of the last short wait for this pipeline (GraceWaitUs). GPU thread only.
+		uint64_t          grace_wait_frame = UINT64_MAX;
 	};
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsEntry>, GraphicsPipelineKeyHash>
 	                                                             m_graphics_pipelines;
@@ -239,6 +241,7 @@ private:
 	// Draws that waited only because a target of theirs was reset in this frame (pipelineUse.h).
 	uint64_t        m_reset_target_waits = 0;
 	FrameWaitBudget m_reset_target_budget;
+	FrameWaitBudget m_grace_wait_budget {GRACE_WAIT_BUDGET_US};
 	uint64_t m_builds         = 0;
 	uint64_t m_build_us       = 0; // under m_jobs_mutex
 	uint64_t m_longest_us     = 0; // under m_jobs_mutex
