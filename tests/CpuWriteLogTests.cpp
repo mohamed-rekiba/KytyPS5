@@ -84,6 +84,20 @@ void TestHotRangesWaitForTheNextSubmission() {
 	Check(log.Take(out) && out.empty(), "a hot range was due twice");
 }
 
+// Hot ranges count against the capacity as written ranges do: past it a full pass is cheaper,
+// and the log does not grow without a limit.
+void TestHotRangesOverflowToAFullPass() {
+	CpuWriteLog             log(2);
+	std::vector<GuestRange> out;
+	(void)log.Take(out);
+	log.RecordHot({0x1000, 1});
+	log.RecordHot({0x3000, 1});
+	log.RecordHot({0x5000, 1});
+	log.BeginSubmission();
+	Check(!log.Take(out), "more hot ranges than the capacity did not ask for a full pass");
+	Check(log.Take(out) && out.empty(), "the full pass did not start a new log");
+}
+
 // A hot range uploaded in many submissions before a pass is due once.
 void TestHotRangesAreDueOnce() {
 	CpuWriteLog             log(4);
@@ -117,6 +131,7 @@ int main() {
 	TestWritesAreSortedAndMerged();
 	TestOverflowAsksForAFullPass();
 	TestHotRangesWaitForTheNextSubmission();
+	TestHotRangesOverflowToAFullPass();
 	TestHotRangesAreDueOnce();
 	TestHotAndWrittenRangesMerge();
 	if (g_failures != 0) {

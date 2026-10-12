@@ -44,8 +44,17 @@ public:
 		m_writes.push_back(range);
 	}
 
+	// Past the capacity the next submission starts a full pass, as for writes.
 	void RecordHot(GuestRange range) {
 		std::scoped_lock lock {m_mutex};
+		if (m_hot_overflow) {
+			return;
+		}
+		if (m_hot_next.size() >= m_capacity && !m_hot_next.contains(range.address)) {
+			m_hot_next.clear();
+			m_hot_overflow = true;
+			return;
+		}
 		auto& size = m_hot_next[range.address];
 		size       = std::max(size, range.size);
 	}
@@ -58,6 +67,12 @@ public:
 			due       = std::max(due, size);
 		}
 		m_hot_next.clear();
+		if (m_hot_overflow || m_hot_due.size() > m_capacity) {
+			m_hot_overflow = false;
+			m_hot_due.clear();
+			m_writes.clear();
+			m_full_pass = true;
+		}
 	}
 
 	// Every buffer must be synchronized at the next pass (the mapping changed).
@@ -105,7 +120,9 @@ private:
 	std::vector<GuestRange>      m_writes;
 	std::map<uint64_t, uint64_t> m_hot_next; // address -> size, due after the next submission
 	std::map<uint64_t, uint64_t> m_hot_due;  // address -> size, due at the next pass
-	bool                         m_full_pass = true;
+	// More hot ranges than the capacity came before the next submission.
+	bool                         m_hot_overflow = false;
+	bool                         m_full_pass    = true;
 };
 
 } // namespace Libs::Graphics
