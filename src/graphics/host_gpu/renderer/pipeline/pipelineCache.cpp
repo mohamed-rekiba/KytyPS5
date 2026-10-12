@@ -137,28 +137,6 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
-// Writes a list into a temporary file that then takes the list's place, so that a stop in
-// between leaves the old list. Returns the list opened for appending, or null.
-std::FILE* RewriteList(const std::filesystem::path& path, std::span<const uint8_t> bytes) {
-	std::error_code error;
-	std::filesystem::create_directories(path.parent_path(), error);
-	auto temp_path = path;
-	temp_path += ".tmp";
-	bool written = false;
-	if (std::FILE* file = std::fopen(Common::PathToString(temp_path).c_str(), "wb")) {
-		written = std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
-		written = std::fclose(file) == 0 && written;
-	}
-	if (written) {
-		std::filesystem::rename(temp_path, path, error);
-		written = !error;
-	}
-	if (!written) {
-		std::filesystem::remove(temp_path, error);
-		return nullptr;
-	}
-	return std::fopen(Common::PathToString(path).c_str(), "ab");
-}
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
@@ -739,20 +717,18 @@ struct PipelineCache::ProgramCache {
 		if (current) {
 			// A program recorded again (its first record was stale, see Prebuilt) has the later
 			// record.
-			std::unordered_map<uint64_t, size_t> index_of;
-			std::vector<uint32_t>                static_state;
-			for (auto& record: ReadProgramRecords(std::span(bytes).subspan(signature.size()))) {
+			std::vector<uint32_t> static_state;
+			const auto            identity_of =
+			    [&](const ProgramRecord& record) -> std::optional<uint64_t> {
 				if (!StaticStateOf(record, static_state)) {
-					continue;
+					return std::nullopt;
 				}
-				const auto identity        = Identity(record, static_state);
-				const auto [it, inserted] = index_of.try_emplace(identity, m_records.size());
-				if (inserted) {
-					m_listed.insert(identity);
-					m_records.push_back(std::move(record));
-				} else {
-					m_records[it->second] = std::move(record);
-				}
+				return Identity(record, static_state);
+			};
+			for (auto& [identity, record]: LatestByIdentity(
+			         ReadProgramRecords(std::span(bytes).subspan(signature.size())), identity_of)) {
+				m_listed.insert(identity);
+				m_records.push_back(std::move(record));
 			}
 		}
 		if (writable) {

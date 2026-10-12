@@ -4,9 +4,16 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include "common/stringUtils.h"
+
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <optional>
 #include <span>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -295,6 +302,53 @@ private:
 	uint64_t m_names      = UINT64_MAX;
 	bool     m_list_built = false;
 };
+
+// The records to keep, each with its identity, in the order of first appearance. A record
+// recorded again replaces the earlier one in its place: the later record wins. `identity_of`
+// gives nothing for a record to drop.
+template <typename Record, typename IdentityOf>
+[[nodiscard]] std::vector<std::pair<uint64_t, Record>> LatestByIdentity(std::vector<Record> records,
+                                                                        IdentityOf&& identity_of) {
+	std::unordered_map<uint64_t, size_t>     index_of;
+	std::vector<std::pair<uint64_t, Record>> kept;
+	for (auto& record: records) {
+		const std::optional<uint64_t> identity = identity_of(record);
+		if (!identity) {
+			continue;
+		}
+		const auto [it, inserted] = index_of.try_emplace(*identity, kept.size());
+		if (inserted) {
+			kept.emplace_back(*identity, std::move(record));
+		} else {
+			kept[it->second].second = std::move(record);
+		}
+	}
+	return kept;
+}
+
+// Writes a list into a temporary file that then takes the list's place, so that a stop in
+// between leaves the old list. Returns the list opened for appending, or null.
+inline std::FILE* RewriteList(const std::filesystem::path& path,
+                              std::span<const uint8_t>     bytes) {
+	std::error_code error;
+	std::filesystem::create_directories(path.parent_path(), error);
+	auto temp_path = path;
+	temp_path += ".tmp";
+	bool written = false;
+	if (std::FILE* file = std::fopen(Common::PathToString(temp_path).c_str(), "wb")) {
+		written = std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
+		written = std::fclose(file) == 0 && written;
+	}
+	if (written) {
+		std::filesystem::rename(temp_path, path, error);
+		written = !error;
+	}
+	if (!written) {
+		std::filesystem::remove(temp_path, error);
+		return nullptr;
+	}
+	return std::fopen(Common::PathToString(path).c_str(), "ab");
+}
 
 } // namespace Libs::Graphics
 

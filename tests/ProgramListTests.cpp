@@ -5,12 +5,19 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace {
 
 using Libs::Graphics::AppendPipelineRecord;
+using Libs::Graphics::LatestByIdentity;
 using Libs::Graphics::ListedPipelineScan;
+using Libs::Graphics::RewriteList;
 using Libs::Graphics::AppendProgramRecord;
 using Libs::Graphics::PipelineRecord;
 using Libs::Graphics::ReadPipelineRecords;
@@ -140,6 +147,51 @@ void TestLayoutChangeInPadding() {
 	      "a member offset is wrong");
 }
 
+// A program recorded again has the later record, in the place of the first one.
+void TestTheLaterRecordWins() {
+	struct Record {
+		uint64_t    identity;
+		std::string text;
+	};
+	std::vector<Record> records {{1, "first"}, {2, "two"}, {1, "again"}, {3, "dropped"}};
+	const auto kept = LatestByIdentity(std::move(records), [](const Record& record) {
+		return record.identity == 3 ? std::nullopt : std::optional<uint64_t> {record.identity};
+	});
+	Check(kept.size() == 2 && kept[0].first == 1 && kept[0].second.text == "again" &&
+	          kept[1].first == 2 && kept[1].second.text == "two",
+	      "a program recorded again did not keep its later record in its first place");
+}
+
+std::string ReadFile(const std::filesystem::path& path) {
+	std::ifstream file(path, std::ios::binary);
+	return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+}
+
+// The list is written into a temporary file that then takes its place, and stays open to append.
+void TestAListIsRewrittenThroughATemporaryFile() {
+	const auto folder = std::filesystem::temp_directory_path() / "kyty_program_list_tests";
+	std::filesystem::remove_all(folder);
+	const auto path = folder / "title.programs";
+	std::filesystem::create_directories(folder);
+	std::ofstream(path, std::ios::binary) << "old list";
+	const std::string bytes = "new list";
+	std::FILE* file = RewriteList(path, std::span(reinterpret_cast<const uint8_t*>(bytes.data()),
+	                                              bytes.size()));
+	Check(file != nullptr, "a list could not be rewritten");
+	std::fputs("+appended", file);
+	std::fclose(file);
+	Check(ReadFile(path) == "new list+appended", "the rewritten list did not replace the old one");
+	auto temp_path = path;
+	temp_path += ".tmp";
+	Check(!std::filesystem::exists(temp_path), "the temporary file was left behind");
+
+	// A folder that cannot be made: nothing is written and the caller gets no file.
+	std::ofstream(folder / "blocker") << "a file, not a folder";
+	Check(RewriteList(folder / "blocker" / "title.programs", {}) == nullptr,
+	      "a list under a file was taken as written");
+	std::filesystem::remove_all(folder);
+}
+
 void TestListedPipelinesAreScannedOnlyAfterAChange() {
 	ListedPipelineScan scan;
 	Check(scan.Due(0, false), "the first draw did not scan the listed pipelines");
@@ -158,6 +210,8 @@ int main() {
 	TestPipelineRoundTrip();
 	TestLayoutChangeInPadding();
 	TestListedPipelinesAreScannedOnlyAfterAChange();
+	TestTheLaterRecordWins();
+	TestAListIsRewrittenThroughATemporaryFile();
 	std::puts("ProgramListTests: all cases passed");
 	return 0;
 }
