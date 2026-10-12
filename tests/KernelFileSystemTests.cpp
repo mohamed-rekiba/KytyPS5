@@ -1556,6 +1556,17 @@ void CheckSocketWakeup() {
               actual == (value != 0 ? 0x20 : 0) && size == sizeof(actual),
           "Net UDP broadcast option returns its FreeBSD flag bit when enabled");
   }
+  // A P2P datagram socket keeps its options itself: the same flag bit.
+  const int p2p = Net::Socket(2, 6, 0);
+  Check(p2p >= 0, "create a P2P datagram socket");
+  for (const int value : {1, 0}) {
+    int actual = -1;
+    uint32_t size = sizeof(actual);
+    Check(net_setsockopt(p2p, 0xffff, 0x20, &value, sizeof(value)) == 0 &&
+              net_getsockopt(p2p, 0xffff, 0x20, &actual, &size) == 0 &&
+              actual == (value != 0 ? 0x20 : 0) && size == sizeof(actual),
+          "P2P broadcast option returns its FreeBSD flag bit when enabled");
+  }
   int timeout = 0;
   int *timeout_value = &timeout;
 #if defined(__linux__)
@@ -1659,6 +1670,7 @@ void CheckSocketWakeup() {
   Check(net_sendto(-1, payload, sizeof(payload), 0, address.data(), address_size) ==
             Libs::Network::NET_ERROR_EBADF && *net_errno == Libs::Posix::POSIX_EBADF,
         "Net sendto translates an invalid socket");
+  Check(Net::SocketClose(p2p) == 0, "close the P2P datagram socket");
   Check(Net::SocketClose(datagram) == 0 && Net::SocketClose(datagram_writer) == 0,
         "close Net loopback datagrams");
   Check(net_send(-1, payload, sizeof(payload), 0) == Libs::Network::NET_ERROR_EBADF &&
