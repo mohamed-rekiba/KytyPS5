@@ -116,8 +116,8 @@ public:
 	void               ProcessFaultBuffer();
 	// Between Begin and End, uploads share one barrier before the first copy and one after the
 	// last. A barrier between two copies makes the Metal backend start a new blit encoder for
-	// each copy; a run of copies with nothing in between shares one. No draw or dispatch may be
-	// recorded inside a batch.
+	// each copy; a run of copies with nothing in between shares one. Only SynchronizeBuffersInRange
+	// may run inside a batch: no draw, no dispatch, no ObtainBuffer.
 	void               BeginUploadBatch();
 	void               EndUploadBatch();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);

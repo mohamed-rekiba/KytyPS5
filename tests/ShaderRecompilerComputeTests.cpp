@@ -5407,6 +5407,94 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // An upload pass records its copies and runs them when it ends (copyWorkers.h). A staging map
+  // that has to wait submits the pass's GPU copies first, so the recorded copies must run before
+  // that wait: the buffers then hold the guest bytes.
+  void CheckUploadBatchStagingWait() {
+    constexpr const char *name = "UploadBatchStagingWait";
+    constexpr uintptr_t base = 0x0000000208000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t piece = 0x8000;
+    constexpr uint32_t pieces = 6; // 192 KiB through a 64 KiB staging ring
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &cache = context.GetBufferCache();
+    BufferCacheTestAccess::SetUnusedStagingBufferSize(cache, 0x10000);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "upload-batch direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "upload-batch fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::vector<uint8_t> expected(pieces * piece);
+    for (uint64_t index = 0; index < expected.size(); ++index) {
+      expected[index] = static_cast<uint8_t>(index * 37u + index / piece);
+    }
+    std::memcpy(memory, expected.data(), expected.size());
+    context.MapMemory(base, allocation_size);
+
+    // One buffer per piece, uploaded in one pass as RenderContext::PrepareBda does.
+    std::vector<std::pair<Libs::Graphics::Buffer *, uint64_t>> uploaded;
+    for (uint32_t index = 0; index < pieces; ++index) {
+      auto &buffer = cache.GetBuffer(cache.FindBuffer(base + index * piece, piece));
+      uploaded.emplace_back(&buffer, base + index * piece - buffer.CpuAddress());
+    }
+    const auto first_tick = scheduler.CurrentTick();
+    cache.BeginUploadBatch();
+    cache.SynchronizeBuffersInRange(base, pieces * piece);
+    cache.EndUploadBatch();
+    Require(name, "staging wait", scheduler.CurrentTick() > first_tick,
+            "the batch did not wrap the staging ring, so the case tested nothing");
+
+    auto readback = CreateHostBuffer(name, pieces * piece, vk::BufferUsageFlagBits::eTransferDst, {});
+    for (uint32_t index = 0; index < pieces; ++index) {
+      const vk::BufferCopy copy{uploaded[index].second, index * piece, piece};
+      scheduler.Current().Handle().copyBuffer(uploaded[index].first->Handle(), readback.buffer, 1,
+                                              &copy);
+    }
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    const auto words = ReadBuffer(name, readback, pieces * piece / sizeof(uint32_t));
+    Require(name, "uploaded bytes",
+            std::memcmp(words.data(), expected.data(), expected.size()) == 0,
+            "a buffer of the upload batch did not hold the guest bytes after a staging wait");
+    DestroyBuffer(&readback);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "upload-batch direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "upload-batch direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaPageTableUploads() {
     constexpr const char *name = "BdaPageTableUploads";
     constexpr uintptr_t base = 0x0000000207b00000ull;
@@ -43525,6 +43613,7 @@ int RunSelectedCases(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
+    vulkan.CheckUploadBatchStagingWait();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -43732,6 +43821,7 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckUploadBatchStagingWait();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

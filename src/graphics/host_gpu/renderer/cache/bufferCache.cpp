@@ -716,6 +716,9 @@ void BufferCache::RunBatchCopies() {
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	// A batch copies guest bytes when it ends. A written buffer protects its pages before that,
+	// and the copy would fault on its own page (see BeginUploadBatch).
+	EXIT_IF(m_upload_batch_open);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
