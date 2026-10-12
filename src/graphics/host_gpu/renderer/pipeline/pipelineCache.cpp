@@ -48,6 +48,26 @@ namespace Libs::Graphics {
 
 namespace {
 
+// Converts to any field type, to count an aggregate's fields.
+struct AnyField {
+	template <typename T>
+	operator T() const;
+};
+
+// The number of fields of an aggregate of scalars: the most initializers it takes.
+template <typename T, typename... Fields>
+consteval size_t FieldCount() {
+	if constexpr (requires { T {Fields {}..., AnyField {}}; }) {
+		return FieldCount<T, Fields..., AnyField>();
+	} else {
+		return sizeof...(Fields);
+	}
+}
+
+} // namespace
+
+namespace {
+
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
 		case Prospero::BlendFactor::kSrcAlpha:
@@ -585,12 +605,11 @@ struct PipelineCache::ProgramCache {
 
 	// The host as the list's signature sees it: every field by value, never the object's bytes,
 	// which have padding. A new field must be added here, or programs built for another host
-	// would be taken from the list.
+	// would be taken from the list. The field count catches a new field also where the size
+	// does not change (a bool in padding).
 	uint64_t HostWords() const {
 		const auto& c = host.capabilities;
 		const auto& f = host.faults;
-		static_assert(sizeof(HostCapabilities) == 24 && sizeof(DriverFaults) == 8,
-		              "a host field was added: add it to the list signature");
 		const uint32_t words[] = {
 		    c.image_view_min_lod,
 		    c.cull_distance,
@@ -618,6 +637,8 @@ struct PipelineCache::ProgramCache {
 		    f.pipeline_cache_serializes_builds,
 		    f.vertex_subgroups_unreported,
 		};
+		static_assert(std::size(words) == FieldCount<HostCapabilities>() + FieldCount<DriverFaults>(),
+		              "a host field was added: add it to the list signature");
 		return XXH3_64bits(words, sizeof(words));
 	}
 
