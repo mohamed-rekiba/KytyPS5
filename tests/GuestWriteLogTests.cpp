@@ -1,13 +1,13 @@
 // Tests for the log of guest memory the CPU wrote, which upload passes synchronize.
 
-#include "graphics/host_gpu/cpuWriteLog.h"
+#include "graphics/host_gpu/guestWriteLog.h"
 
 #include <iostream>
 #include <vector>
 
 namespace {
 
-using Libs::Graphics::CpuWriteLog;
+using Libs::Graphics::GuestWriteLog;
 using Libs::Graphics::GuestRange;
 
 int g_failures = 0;
@@ -33,7 +33,7 @@ bool Same(const std::vector<GuestRange>& got, const std::vector<GuestRange>& wan
 
 // A new log has no history, so the first pass synchronizes everything.
 void TestTheFirstPassIsFull() {
-	CpuWriteLog             log(16);
+	GuestWriteLog             log(16);
 	std::vector<GuestRange> out;
 	Check(!log.Take(out), "the first pass was not a full one");
 	Check(log.Take(out) && out.empty(), "a second pass with nothing written was not empty");
@@ -41,7 +41,7 @@ void TestTheFirstPassIsFull() {
 
 // A pass gets each written run once: sorted, with overlapping and adjacent ranges merged.
 void TestWritesAreSortedAndMerged() {
-	CpuWriteLog             log(16);
+	GuestWriteLog             log(16);
 	std::vector<GuestRange> out;
 	(void)log.Take(out);
 	log.Record({0x3000, 0x100});
@@ -57,7 +57,7 @@ void TestWritesAreSortedAndMerged() {
 
 // When the log fills up, the next pass synchronizes everything instead.
 void TestOverflowAsksForAFullPass() {
-	CpuWriteLog             log(2);
+	GuestWriteLog             log(2);
 	std::vector<GuestRange> out;
 	(void)log.Take(out);
 	log.Record({0x1000, 1});
@@ -73,7 +73,7 @@ void TestOverflowAsksForAFullPass() {
 // A hot range stays open after an upload, so the CPU's next writes to it do not fault. It is
 // uploaded again once the next guest submission starts, not at every pass of the same one.
 void TestHotRangesWaitForTheNextSubmission() {
-	CpuWriteLog             log(16);
+	GuestWriteLog             log(16);
 	std::vector<GuestRange> out;
 	(void)log.Take(out);
 	log.RecordHot({0x8000, 0x4000});
@@ -87,7 +87,7 @@ void TestHotRangesWaitForTheNextSubmission() {
 // Hot ranges count against the capacity as written ranges do: past it a full pass is cheaper,
 // and the log does not grow without a limit.
 void TestHotRangesOverflowToAFullPass() {
-	CpuWriteLog             log(2);
+	GuestWriteLog             log(2);
 	std::vector<GuestRange> out;
 	(void)log.Take(out);
 	log.RecordHot({0x1000, 1});
@@ -100,7 +100,7 @@ void TestHotRangesOverflowToAFullPass() {
 
 // A hot range uploaded in many submissions before a pass is due once.
 void TestHotRangesAreDueOnce() {
-	CpuWriteLog             log(4);
+	GuestWriteLog             log(4);
 	std::vector<GuestRange> out;
 	(void)log.Take(out);
 	for (int submission = 0; submission < 10; submission++) {
@@ -114,7 +114,7 @@ void TestHotRangesAreDueOnce() {
 
 // Hot ranges and written ranges that touch are merged into one run.
 void TestHotAndWrittenRangesMerge() {
-	CpuWriteLog             log(16);
+	GuestWriteLog             log(16);
 	std::vector<GuestRange> out;
 	(void)log.Take(out);
 	log.RecordHot({0x1000, 0x1000});
@@ -137,6 +137,6 @@ int main() {
 	if (g_failures != 0) {
 		return 1;
 	}
-	std::cout << "CpuWriteLogTests: all cases passed\n";
+	std::cout << "GuestWriteLogTests: all cases passed\n";
 	return 0;
 }

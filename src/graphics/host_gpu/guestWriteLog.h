@@ -1,5 +1,5 @@
-#ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_CPUWRITELOG_H_
-#define EMULATOR_SRC_GRAPHICS_HOST_GPU_CPUWRITELOG_H_
+#ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_GUESTWRITELOG_H_
+#define EMULATOR_SRC_GRAPHICS_HOST_GPU_GUESTWRITELOG_H_
 
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -10,9 +10,10 @@
 #include <mutex>
 #include <vector>
 
-// Where the CPU wrote guest memory since the last upload pass (RenderContext::PrepareBda): a
-// shader that reads through device addresses can read any cached buffer, so before it runs every
-// buffer must hold the CPU's latest bytes, and the pass synchronizes only the logged ranges.
+// Where guest memory changed outside the host GPU since the last upload pass
+// (RenderContext::PrepareBda): by the guest CPU, or by the GPU thread itself. A shader that reads
+// through device addresses can read any cached buffer, so before it runs every buffer must hold
+// the latest bytes, and the pass synchronizes only the logged ranges.
 //
 // Two kinds of ranges come in:
 // - A write: a fault on a watched page, a write by the GPU thread itself (WRITE_DATA, a label),
@@ -26,10 +27,10 @@
 
 namespace Libs::Graphics {
 
-class CpuWriteLog final {
+class GuestWriteLog final {
 public:
 	// `capacity`: the writes a pass takes before a full pass is cheaper.
-	explicit CpuWriteLog(size_t capacity): m_capacity(capacity) {}
+	explicit GuestWriteLog(size_t capacity): m_capacity(capacity) {}
 
 	void Record(GuestRange range) {
 		std::scoped_lock lock {m_mutex};
@@ -127,4 +128,4 @@ private:
 
 } // namespace Libs::Graphics
 
-#endif /* EMULATOR_SRC_GRAPHICS_HOST_GPU_CPUWRITELOG_H_ */
+#endif /* EMULATOR_SRC_GRAPHICS_HOST_GPU_GUESTWRITELOG_H_ */

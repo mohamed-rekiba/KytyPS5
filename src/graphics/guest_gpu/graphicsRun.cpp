@@ -595,7 +595,7 @@ bool GuestGpu::Process(Submission& submission) {
 	if (first_slice) {
 		submission.started = true;
 		cp.SetSubmitId(++m_submit_id);
-		m_renderer.GetBufferCache().NoteGuestSubmission();
+		m_renderer.GetBufferCache().BeginSubmission();
 		cp.ResetDeCe();
 		cp.SetFlip({});
 	}

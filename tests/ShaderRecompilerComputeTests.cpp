@@ -41433,7 +41433,7 @@ void CheckPm4AcquireMemNoOp(RenderContext &renderer) {
 // Empties the buffer cache's log of guest writes; the first take can be a full pass.
 void DrainGuestWriteLog(RenderContext &renderer) {
   std::vector<GuestRange> ranges;
-  while (!renderer.GetBufferCache().TakeCpuWrites(ranges)) {
+  while (!renderer.GetBufferCache().TakeGuestWrites(ranges)) {
   }
 }
 
@@ -41441,7 +41441,7 @@ void DrainGuestWriteLog(RenderContext &renderer) {
 // submission sees the GPU thread's write also on a page left open.
 bool LoggedGuestWrite(RenderContext &renderer, const void *address, uint64_t size) {
   std::vector<GuestRange> ranges;
-  if (!renderer.GetBufferCache().TakeCpuWrites(ranges)) {
+  if (!renderer.GetBufferCache().TakeGuestWrites(ranges)) {
     return true;
   }
   const auto begin = reinterpret_cast<uint64_t>(address);

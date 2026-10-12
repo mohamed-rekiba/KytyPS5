@@ -134,7 +134,7 @@ public:
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	// The GPU thread writes guest memory (a packet's data, a label): a later shader of the same
-	// submission must see it, also on a page the buffer cache keeps open (cpuWriteLog.h).
+	// submission must see it, also on a page the buffer cache keeps open (guestWriteLog.h).
 	// WriteGuest copies and logs. NoteGuestWrite only logs, for a write made in place.
 	void WriteGuest(void* dst, const void* src, uint64_t size);
 	void NoteGuestWrite(const void* dst, uint64_t size);

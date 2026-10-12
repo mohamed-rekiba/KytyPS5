@@ -162,7 +162,7 @@ void RenderContext::PrepareBda(bool shader_writes_addresses) {
 		}
 		~UploadBatch() { cache.EndUploadBatch(); }
 	} upload_batch {m_buffer_cache};
-	if (!m_buffer_cache.TakeCpuWrites(m_bda_cpu_writes)) {
+	if (!m_buffer_cache.TakeGuestWrites(m_bda_guest_writes)) {
 		KYTY_PROFILER_BLOCK("PrepareBda: every buffer");
 		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
@@ -171,7 +171,7 @@ void RenderContext::PrepareBda(bool shader_writes_addresses) {
 	}
 	KYTY_PROFILER_BLOCK("PrepareBda: written ranges");
 	// The ranges come sorted and merged: a buffer is visited once for each run of written bytes.
-	for (const auto& write: m_bda_cpu_writes) {
+	for (const auto& write: m_bda_guest_writes) {
 		m_mapped_ranges.ForEachInRange(
 		    write.address, write.size, [this](uint64_t start, uint64_t end) {
 			    m_buffer_cache.SynchronizeBuffersInRange(start, end - start);

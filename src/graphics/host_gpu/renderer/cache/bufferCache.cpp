@@ -280,7 +280,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	// After the dirty state is published: whoever takes this entry also sees the dirty bytes.
-	RecordCpuWrite(vaddr, size);
+	RecordGuestWrite(vaddr, size);
 }
 
 void BufferCache::ReplaceMemory(uint64_t vaddr, const void* data, uint64_t size) {
@@ -295,7 +295,7 @@ void BufferCache::ReplaceMemory(uint64_t vaddr, const void* data, uint64_t size)
 	m_memory_tracker.InvalidateRegion(vaddr, size, [] {});
 	LibKernel::Memory::WriteBacking(vaddr, data, size);
 	// After the dirty state is published: whoever takes this entry also sees the dirty bytes.
-	RecordCpuWrite(vaddr, size);
+	RecordGuestWrite(vaddr, size);
 }
 
 void BufferCache::InvalidateWrittenMemory(uint64_t fault_vaddr, bool window_is_mapped) {
@@ -543,7 +543,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	}
 	Register(id);
 	// A new buffer starts with guest bytes the GPU has not seen: it counts as a CPU write.
-	RecordCpuWrite(overlap.begin, overlap.end - overlap.begin);
+	RecordGuestWrite(overlap.begin, overlap.end - overlap.begin);
 	return id;
 }
 
@@ -567,7 +567,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		for (const auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			if (m_memory_tracker.IsRegionCpuModified(address, copy.size)) {
-				m_cpu_write_log.RecordHot({address, copy.size});
+				m_guest_write_log.RecordHot({address, copy.size});
 			}
 		}
 	}
@@ -865,24 +865,24 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
 
-void BufferCache::RecordCpuWrite(uint64_t vaddr, uint64_t size) {
-	m_cpu_write_log.Record({vaddr, size});
+void BufferCache::RecordGuestWrite(uint64_t vaddr, uint64_t size) {
+	m_guest_write_log.Record({vaddr, size});
 }
 
 void BufferCache::RecordGpuThreadWrite(uint64_t vaddr, uint64_t size) {
-	RecordCpuWrite(vaddr, size);
+	RecordGuestWrite(vaddr, size);
 }
 
-void BufferCache::NoteGuestSubmission() {
-	m_cpu_write_log.BeginSubmission();
+void BufferCache::BeginSubmission() {
+	m_guest_write_log.BeginSubmission();
 }
 
-bool BufferCache::TakeCpuWrites(std::vector<GuestRange>& ranges) {
-	return m_cpu_write_log.Take(ranges);
+bool BufferCache::TakeGuestWrites(std::vector<GuestRange>& ranges) {
+	return m_guest_write_log.Take(ranges);
 }
 
 void BufferCache::RequestFullSynchronization() {
-	m_cpu_write_log.RequestFullPass();
+	m_guest_write_log.RequestFullPass();
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {

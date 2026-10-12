@@ -26,12 +26,12 @@ names=(
 	ces
 	controller_settings
 	copy_workers
-	cpu_write_log
 	depth_snapshot_plan
 	device_suitability
 	event_queue_lifetime
 	fence_retirement
 	file_lock
+	guest_write_log
 	host_lowering
 	http_uri_parse
 	image_page_table

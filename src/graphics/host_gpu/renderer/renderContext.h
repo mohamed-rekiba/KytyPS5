@@ -83,7 +83,7 @@ private:
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
-	std::vector<GuestRange>   m_bda_cpu_writes; // scratch for PrepareBda
+	std::vector<GuestRange>   m_bda_guest_writes; // scratch for PrepareBda
 	uint64_t                  m_last_heat_cool_ms = 0;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;

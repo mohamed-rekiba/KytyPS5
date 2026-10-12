@@ -14,7 +14,7 @@
 // change in the fault handler, and another one when the renderer has uploaded the page. A page
 // that keeps coming back like this is "hot": it stays open and counts as written, and the
 // renderer uploads it at every use: at every bind, and once per guest submission for shaders
-// that read through device addresses (cpuWriteLog.h). That is always correct, since an upload of
+// that read through device addresses (guestWriteLog.h). That is always correct, since an upload of
 // unchanged bytes changes nothing; it trades the faults for copies.
 //
 // The heat is a lease of LeaseFrames guest frames (RegionManager::NoteFrame). At the first upload

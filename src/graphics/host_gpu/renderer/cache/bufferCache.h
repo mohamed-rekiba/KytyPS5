@@ -7,7 +7,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/bufferChunk.h"
 #include "graphics/host_gpu/copyWorkers.h"
-#include "graphics/host_gpu/cpuWriteLog.h"
+#include "graphics/host_gpu/guestWriteLog.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -93,12 +93,12 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Moves into `ranges` the guest ranges that gained bytes the GPU has not seen since the last
-	// call, sorted and merged (cpuWriteLog.h). False when the log overflowed or a full pass was
+	// call, sorted and merged (guestWriteLog.h). False when the log overflowed or a full pass was
 	// requested; the caller must then synchronize every buffer.
-	[[nodiscard]] bool TakeCpuWrites(std::vector<GuestRange>& ranges);
+	[[nodiscard]] bool TakeGuestWrites(std::vector<GuestRange>& ranges);
 	void               RequestFullSynchronization();
-	// GPU thread. A guest submission starts (see CpuWriteLog::BeginSubmission).
-	void NoteGuestSubmission();
+	// GPU thread. A guest submission starts (see GuestWriteLog::BeginSubmission).
+	void BeginSubmission();
 	// GPU thread. The GPU thread itself wrote guest memory (WRITE_DATA, a label): a later
 	// draw of the same submission must see it, also on a page that stays open.
 	void RecordGpuThreadWrite(uint64_t vaddr, uint64_t size);
@@ -160,9 +160,9 @@ private:
 	// Copies the guest bytes of the open upload batch to the staging buffer.
 	void RunBatchCopies();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	static constexpr size_t  MaxCpuWriteLog = 4096;
-	// Records a range for TakeCpuWrites.
-	void RecordCpuWrite(uint64_t vaddr, uint64_t size);
+	static constexpr size_t  MaxGuestWriteLog = 4096;
+	// Records a range for TakeGuestWrites.
+	void RecordGuestWrite(uint64_t vaddr, uint64_t size);
 	// GPU thread. One round of a read-back, by the rule of readbackPlan.h. Returns the submission
 	// the caller must wait for before it asks again, or nothing when guest memory is current.
 	[[nodiscard]] std::optional<uint64_t> ReadBack(uint64_t vaddr, uint64_t size, bool is_write,
@@ -196,8 +196,8 @@ private:
 	WriteWatchSet                                      m_write_watches;
 	bool                                              m_upload_batch_open    = false;
 	bool                                              m_upload_batch_started = false;
-	// See TakeCpuWrites. Written by the fault thread and the GPU thread.
-	CpuWriteLog                                       m_cpu_write_log {MaxCpuWriteLog};
+	// See TakeGuestWrites. Written by the fault thread and the GPU thread.
+	GuestWriteLog                                     m_guest_write_log {MaxGuestWriteLog};
 	StreamBuffer                                      m_staging_buffer;
 	// In an upload batch, UploadCopies records the CPU copies to the staging buffer, and the
 	// copy workers run them all at once before the batch ends: the upload passes of a frame make
