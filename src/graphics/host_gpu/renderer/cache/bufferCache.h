@@ -161,6 +161,13 @@ private:
 	void RunBatchCopies();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	static constexpr size_t  MaxGuestWriteLog = 4096;
+	// The workers that copy an upload batch together with the GPU thread (copyWorkers.h).
+	static constexpr uint32_t BatchCopyWorkers = 3;
+	// A range of the staging buffer to flush after the batch copies.
+	struct StagingFlush {
+		uint64_t offset = 0;
+		uint64_t size   = 0;
+	};
 	// Records a range for TakeGuestWrites.
 	void RecordGuestWrite(uint64_t vaddr, uint64_t size);
 	// GPU thread. One round of a read-back, by the rule of readbackPlan.h. Returns the submission
@@ -203,9 +210,9 @@ private:
 	// copy workers run them all at once before the batch ends: the upload passes of a frame make
 	// about a thousand uploads of about 140 KB each, too small to share one by one. The guest
 	// memory stays mapped until then: PrepareBda ends the batch before it unlocks the mapping.
-	CopyWorkers                                       m_copy_workers {3};
+	CopyWorkers                                       m_copy_workers {BatchCopyWorkers};
 	std::vector<CopyWorkers::Copy>                    m_batch_copies;
-	std::vector<std::pair<uint64_t, uint64_t>>        m_batch_flushes; // staging offset, size
+	std::vector<StagingFlush>                         m_batch_flushes;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;

@@ -668,7 +668,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			copy.srcOffset += base_offset;
 		}
 		if (m_upload_batch_open && !m_staging_buffer.IsCoherent()) {
-			m_batch_flushes.emplace_back(base_offset, total_size);
+			m_batch_flushes.push_back({.offset = base_offset, .size = total_size});
 		}
 		m_staging_buffer.Commit();
 		return m_staging_buffer.Handle();
@@ -707,8 +707,8 @@ void BufferCache::RunBatchCopies() {
 	KYTY_PROFILER_BLOCK("UploadCopies: batch copy");
 	m_copy_workers.Run(m_batch_copies);
 	m_batch_copies.clear();
-	for (const auto& [offset, size]: m_batch_flushes) {
-		m_staging_buffer.Flush(offset, size);
+	for (const auto& flush: m_batch_flushes) {
+		m_staging_buffer.Flush(flush.offset, flush.size);
 	}
 	m_batch_flushes.clear();
 }
