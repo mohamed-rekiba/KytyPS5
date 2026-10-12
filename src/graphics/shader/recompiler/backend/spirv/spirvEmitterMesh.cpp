@@ -138,8 +138,19 @@ uint32_t MeshPrimitivePointer(EmitterState& state) {
 	                   ConstantU32(state, state.lane_half));
 }
 
+// `value`, at most `most`.
+uint32_t MeshClampU32(EmitterState& state, uint32_t value, uint32_t most) {
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), clamped, GlslStd450(state),
+	                          GLSLstd450UMin, value, ConstantU32(state, most));
+	return clamped;
+}
+
+// The guest's counts are clamped to the stage's maximums: the outputs and the capture records
+// have room for those only.
 void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
+	const auto& mesh = state.input_info.vertex->mesh;
 	const auto first = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), first,
 	                          EmitLocalInvocationIndex(state), ConstantU32(state, 0));
@@ -153,7 +164,9 @@ void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto pointer =
 			    MeshElement(state, state.mesh_allocation, spv::StorageClassWorkgroup,
 			                TypeU32(state), ConstantU32(state, field));
-			state.builder.AddFunction(spv::OpStore, pointer, value);
+			state.builder.AddFunction(
+			    spv::OpStore, pointer,
+			    MeshClampU32(state, value, field == 0 ? mesh.max_vertices : mesh.max_primitives));
 		}
 	});
 }
@@ -383,8 +396,11 @@ void EmitMeshComputeEntryPoint(EmitterState& state) {
 				    ConstantU32(state, state.input_info.vertex->mesh.provoking_vertex *
 				                           CapturedVertexLayout::kIndexBits),
 				    ConstantU32(state, CapturedVertexLayout::kIndexBits));
-				layer = MeshLoad(state, output.mesh_data_variable, spv::StorageClassWorkgroup,
-				                 TypeU32(state), provoking);
+				// The shared array has room for the stage's maximum vertices.
+				layer = MeshLoad(
+				    state, output.mesh_data_variable, spv::StorageClassWorkgroup, TypeU32(state),
+				    MeshClampU32(state, provoking,
+				                 state.input_info.vertex->mesh.max_vertices - 1u));
 			}
 			StoreRecordWord(state, record, EmitAddU32(state, word, ConstantU32(state, 1)), layer);
 		});
