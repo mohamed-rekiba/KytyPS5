@@ -17,21 +17,34 @@ void Check(bool condition, const char* text) {
 
 void TestTinyImagesAreReadBack() {
 	// The 1x1 target Unreal Engine renders a sky light's average brightness into is tiled.
-	Check(ReadsBackToGuest(1, 1, true, false, false), "a tiled 1x1 target was not read back");
-	Check(ReadsBackToGuest(4, 4, true, false, false), "a tiled 4x4 target was not read back");
-	Check(ReadsBackToGuest(1, 1, false, false, false), "a linear 1x1 target was not read back");
-	Check(!ReadsBackToGuest(5, 1, true, false, false), "a 5x1 target counted as tiny");
-	Check(!ReadsBackToGuest(1, 5, true, false, false), "a 1x5 target counted as tiny");
-	Check(!ReadsBackToGuest(4, 4, true, true, false),
+	Check(ReadsBackToGuest({.width = 1, .height = 1, .tiled = true}, false),
+	      "a tiled 1x1 target was not read back");
+	Check(ReadsBackToGuest({.width = 4, .height = 4, .tiled = true}, false),
+	      "a tiled 4x4 target was not read back");
+	Check(ReadsBackToGuest({.width = 1, .height = 1}, false),
+	      "a linear 1x1 target was not read back");
+	Check(!ReadsBackToGuest({.width = 5, .height = 1, .tiled = true}, false),
+	      "a 5x1 target counted as tiny");
+	Check(!ReadsBackToGuest({.width = 1, .height = 5, .tiled = true}, false),
+	      "a 1x5 target counted as tiny");
+	Check(!ReadsBackToGuest({.width = 4, .height = 4, .tiled = true, .block_compressed = true}, false),
 	      "a block-compressed image counted as a readback target");
 }
 
+// A tiny array or volume image is not a few bytes: each of its layers or slices is copied.
+void TestTinyArraysAndVolumesAreNotReadBack() {
+	Check(!ReadsBackToGuest({.width = 4, .height = 4, .layers = 64, .tiled = true}, false),
+	      "a 4x4 array of 64 layers counted as tiny");
+	Check(!ReadsBackToGuest({.width = 4, .height = 4, .depth = 64, .tiled = true}, false),
+	      "a 4x4x64 volume counted as tiny");
+}
+
 void TestLargerImagesFollowTheSetting() {
-	Check(!ReadsBackToGuest(64, 64, false, false, false),
+	Check(!ReadsBackToGuest({.width = 64, .height = 64}, false),
 	      "a linear 64x64 image was read back with the setting off");
-	Check(ReadsBackToGuest(64, 64, false, false, true),
+	Check(ReadsBackToGuest({.width = 64, .height = 64}, true),
 	      "a linear 64x64 image was not read back with the setting on");
-	Check(!ReadsBackToGuest(64, 64, true, false, true),
+	Check(!ReadsBackToGuest({.width = 64, .height = 64, .tiled = true}, true),
 	      "a tiled 64x64 image was read back by the linear setting");
 }
 
@@ -39,6 +52,7 @@ void TestLargerImagesFollowTheSetting() {
 
 int main() {
 	TestTinyImagesAreReadBack();
+	TestTinyArraysAndVolumesAreNotReadBack();
 	TestLargerImagesFollowTheSetting();
 	std::puts("ImageReadbackTests: passed");
 	return 0;

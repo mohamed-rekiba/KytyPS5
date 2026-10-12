@@ -13,18 +13,27 @@ namespace Libs::Graphics {
 // target is tiled. Guest memory kept its old bytes, the CPU read a brightness of 0, the reflections
 // were divided by it, and leaves and walls came out white.
 //
-// So every image of at most READBACK_TINY_EXTENT pixels on each side is copied back, tiled or
-// linear: such images are read back far more often than sampled again, and each copy is a few
-// bytes. Block-compressed images are left out; the GPU does not render them. Larger linear images
+// So every image of at most READBACK_TINY_EXTENT pixels on each side, with one layer and one
+// slice, is copied back, tiled or linear: such images are read back far more often than sampled
+// again, and each copy is a few bytes. Block-compressed images are left out; the GPU does not render them. Larger linear images
 // are copied back only when the setting asks for it (--readback-linear-images).
 inline constexpr uint32_t READBACK_TINY_EXTENT = 4;
 
-[[nodiscard]] constexpr bool ReadsBackToGuest(uint32_t width, uint32_t height, bool tiled,
-                                              bool block_compressed,
+struct ReadbackImage {
+	uint32_t width            = 1;
+	uint32_t height           = 1;
+	uint32_t depth            = 1;
+	uint32_t layers           = 1;
+	bool     tiled            = false;
+	bool     block_compressed = false;
+};
+
+[[nodiscard]] constexpr bool ReadsBackToGuest(const ReadbackImage& image,
                                               bool readback_linear_images) noexcept {
-	const bool tiny =
-	    width <= READBACK_TINY_EXTENT && height <= READBACK_TINY_EXTENT && !block_compressed;
-	return tiny || (readback_linear_images && !tiled);
+	const bool tiny = image.width <= READBACK_TINY_EXTENT &&
+	                  image.height <= READBACK_TINY_EXTENT && image.depth == 1 &&
+	                  image.layers == 1 && !image.block_compressed;
+	return tiny || (readback_linear_images && !image.tiled);
 }
 
 } // namespace Libs::Graphics

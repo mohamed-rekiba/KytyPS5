@@ -454,7 +454,12 @@ void TextureCache::UntrackImageTail(ImageId id) {
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	const auto& info = image.info;
-	if (ReadsBackToGuest(info.extent.width, info.extent.height, info.IsTiled(), info.IsBlock(),
+	if (ReadsBackToGuest({.width            = info.extent.width,
+	                      .height           = info.extent.height,
+	                      .depth            = info.extent.depth,
+	                      .layers           = info.resources.layers,
+	                      .tiled            = info.IsTiled(),
+	                      .block_compressed = info.IsBlock()},
 	                     m_readback_linear_images) &&
 	    !info.data.Empty()) {
 		if (!image.IsGpuModified()) {
