@@ -235,6 +235,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--controller-volume" << QString::number(info.controller.speaker_volume);
 	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
 	args << "--present-mode" << EnumToText(info.present_mode);
+	args << "--video-out-resolution" << EnumToText(info.video_out_resolution);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
 	}
@@ -258,6 +259,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--shader-optimization-type" << EnumToText(info.shader_optimization_type);
 	args << "--shader-log-direction" << EnumToText(info.shader_log_direction);
 	args << "--shader-log-folder" << info.shader_log_folder;
+	if (!info.pipeline_cache_folder.isEmpty()) {
+		args << "--pipeline-cache-folder" << info.pipeline_cache_folder;
+	}
 	args << "--command-buffer-dump" << BoolArg(info.command_buffer_dump_enabled);
 	args << "--command-buffer-dump-folder" << info.command_buffer_dump_folder;
 	args << "--printf-direction" << EnumToText(info.printf_direction);
