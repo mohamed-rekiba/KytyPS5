@@ -287,7 +287,8 @@ private:
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	// Dropped whole when full: a frame of Crash Bandicoot 4 decodes about 1,500 different ones.
 	static constexpr size_t                MaxDecodedTextures = 4096;
-	std::unordered_map<TextureDecodeKey, DecodedTexture, TextureDecodeKeyHash> m_decoded_textures;
+	std::unordered_map<TextureDecodeKey, DecodedTexture, TextureDecodeKeyHash, TextureDecodeKeyEqual>
+	    m_decoded_textures;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

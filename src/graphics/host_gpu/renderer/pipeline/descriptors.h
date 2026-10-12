@@ -45,8 +45,20 @@ struct TextureDecodeKey {
 	bool operator==(const TextureDecodeKey& other) const = default;
 };
 
+// A lookup of the table by reference: the key, with its resource's vectors, is copied only when
+// it is added.
+struct TextureDecodeView {
+	const ShaderRecompiler::IR::DescriptorValue& value;
+	const ShaderRecompiler::IR::ImageResource&   resource;
+};
+
 struct TextureDecodeKeyHash {
+	using is_transparent = void;
+
 	size_t operator()(const TextureDecodeKey& key) const noexcept {
+		return (*this)(TextureDecodeView {key.value, key.resource});
+	}
+	size_t operator()(const TextureDecodeView& key) const noexcept {
 		uint64_t hash = key.value.dword_count;
 		for (const auto dword: key.value.dwords) {
 			hash = (hash ^ dword) * 0x100000001b3ull;
@@ -54,6 +66,18 @@ struct TextureDecodeKeyHash {
 		hash = (hash ^ key.resource.source) * 0x100000001b3ull;
 		hash = (hash ^ static_cast<uint32_t>(key.resource.written)) * 0x100000001b3ull;
 		return static_cast<size_t>(hash);
+	}
+};
+
+struct TextureDecodeKeyEqual {
+	using is_transparent = void;
+
+	bool operator()(const TextureDecodeKey& a, const TextureDecodeKey& b) const { return a == b; }
+	bool operator()(const TextureDecodeView& a, const TextureDecodeKey& b) const {
+		return a.value == b.value && a.resource == b.resource;
+	}
+	bool operator()(const TextureDecodeKey& a, const TextureDecodeView& b) const {
+		return (*this)(b, a);
 	}
 };
 

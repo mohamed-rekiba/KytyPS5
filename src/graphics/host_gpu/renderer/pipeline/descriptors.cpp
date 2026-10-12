@@ -538,14 +538,14 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
-	TextureDecodeKey key {value, resource};
-	auto             decoded = m_decoded_textures.find(key);
+	auto decoded = m_decoded_textures.find(TextureDecodeView {value, resource});
 	if (decoded == m_decoded_textures.end()) {
 		if (m_decoded_textures.size() >= MaxDecodedTextures) {
 			m_decoded_textures.clear();
 		}
 		auto texture = DecodeTexture(resource, value);
-		decoded      = m_decoded_textures.emplace(std::move(key), std::move(texture)).first;
+		decoded = m_decoded_textures.emplace(TextureDecodeKey {value, resource}, std::move(texture))
+		              .first;
 	}
 	// The texture cache can change the description, and a later decode can drop the table.
 	auto  desc          = decoded->second.desc;
