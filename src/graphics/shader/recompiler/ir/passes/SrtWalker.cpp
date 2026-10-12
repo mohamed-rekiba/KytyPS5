@@ -21,6 +21,20 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 
 namespace {
 
+// The bits of an immediate, as SrtWalker::EvaluateWide and the tape read them. False: a type
+// they do not evaluate.
+bool ImmediateBits(Value value, uint64_t& bits) {
+	switch (value.GetType()) {
+		case Type::U1: bits = value.U1(); return true;
+		case Type::U8: bits = value.U8(); return true;
+		case Type::U16: bits = value.U16(); return true;
+		case Type::U32: bits = value.U32(); return true;
+		case Type::U64: bits = value.U64(); return true;
+		case Type::F32: bits = std::bit_cast<uint32_t>(value.F32Value()); return true;
+		default: return false;
+	}
+}
+
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
@@ -627,15 +641,7 @@ ResourcePlan::EvaluationContext& SrtWalker::AcquireContext(const ResourcePlan& p
 bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	value = value.Resolve();
 	if (value.IsImmediate()) {
-		switch (value.GetType()) {
-			case Type::U1: result = value.U1(); return true;
-			case Type::U8: result = value.U8(); return true;
-			case Type::U16: result = value.U16(); return true;
-			case Type::U32: result = value.U32(); return true;
-			case Type::U64: result = value.U64(); return true;
-			case Type::F32: result = std::bit_cast<uint32_t>(value.F32Value()); return true;
-			default: return false;
-		}
+		return ImmediateBits(value, result);
 	}
 	if (!m_active_mask.IsEmpty() && value == m_active_mask) {
 		result = 1u;
@@ -1012,15 +1018,10 @@ private:
 	bool Slot(Value value, uint32_t& slot) {
 		value = value.Resolve();
 		if (value.IsImmediate()) {
-			switch (value.GetType()) {
-				case Type::U1: slot = Constant(value.U1()); return true;
-				case Type::U8: slot = Constant(value.U8()); return true;
-				case Type::U16: slot = Constant(value.U16()); return true;
-				case Type::U32: slot = Constant(value.U32()); return true;
-				case Type::U64: slot = Constant(value.U64()); return true;
-				case Type::F32: slot = Constant(std::bit_cast<uint32_t>(value.F32Value())); return true;
-				default: return false;
-			}
+			uint64_t bits = 0;
+			if (!ImmediateBits(value, bits)) return false;
+			slot = Constant(bits);
+			return true;
 		}
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) return false;
@@ -1029,14 +1030,14 @@ private:
 			return true;
 		}
 		if (!m_visiting.insert(inst).second) return false;
-		const bool built = Build(*inst, slot);
+		const bool built = BuildStep(*inst, slot);
 		m_visiting.erase(inst);
 		if (built) m_slots.emplace(inst, slot);
 		return built;
 	}
 
 	// Mirrors SrtWalker::EvaluateInst for a walker without a clean evaluator or EXEC mask.
-	bool Build(const Inst& inst, uint32_t& slot) {
+	bool BuildStep(const Inst& inst, uint32_t& slot) {
 		using Kind    = SrtTape::StepKind;
 		const auto op = inst.GetOpcode();
 		if (const auto arity = PureArity(op); arity != 0u) {

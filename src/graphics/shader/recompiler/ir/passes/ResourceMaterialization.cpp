@@ -1117,6 +1117,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			return false;
 		}
 	}
+	// The tape builder refuses every plan that would reach the clean walker (SrtWalker.cpp).
+	const auto clean_walker = [&]() -> SrtWalker& {
+		EXIT_IF(!clean.has_value());
+		return *clean;
+	};
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
@@ -1124,7 +1129,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	std::array<uint32_t, 4> stored {};
 	bool uniform_fill = words != 0;
 	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
-		uniform_fill = clean->Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
+		uniform_fill = clean_walker().Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
 	}
 	if (uniform_fill) {
 		snapshot.uniform_fill = fill.fill;
@@ -1138,7 +1143,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (tape != nullptr) {
 				return tape->Descriptor(program, source, value);
 			}
-			return (capture_reads && written ? *clean : *walker).EvaluateDescriptor(source, value);
+			auto& source_walker = capture_reads && written ? clean_walker() : *walker;
+			return source_walker.EvaluateDescriptor(source, value);
 		}
 		value = {};
 		value.dword_count = program.descriptor_sources[source].dword_count;
@@ -1158,7 +1164,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
 					if (!MaterializeIndirectDescriptor(
-					        program, *source->indirect_descriptor, i, 4u, observed, *clean, snapshot,
+					        program, *source->indirect_descriptor, i, 4u, observed, clean_walker(), snapshot,
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
 					        NormalizeIndirectStoreBuffer))
 						return false;
@@ -1218,7 +1224,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
 			if (!MaterializeIndirectDescriptor(
-			        program, indirect, i, 8u, observed, *clean, snapshot, snapshot.images,
+			        program, indirect, i, 8u, observed, clean_walker(), snapshot, snapshot.images,
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
