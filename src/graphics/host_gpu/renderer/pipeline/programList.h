@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include "common/hash.h"
 #include "common/stringUtils.h"
 
 #include <cstdint>
@@ -39,9 +40,9 @@ struct ProgramRecord {
 namespace ProgramListDetail {
 
 inline uint64_t Checksum(std::span<const uint8_t> bytes) {
-	uint64_t hash = 0xcbf29ce484222325ull;
+	uint64_t hash = Common::FNV64_OFFSET;
 	for (const auto byte: bytes) {
-		hash = (hash ^ byte) * 0x100000001b3ull;
+		hash = Common::Fnv64Step(hash, byte);
 	}
 	return hash;
 }

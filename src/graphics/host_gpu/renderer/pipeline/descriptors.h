@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DESCRIPTORS_H_
 
 #include "common/assert.h"
+#include "common/hash.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -31,7 +32,7 @@ struct TextureBinding {
 // texture, so a frame that binds the same texture thousands of times decodes it once.
 struct DecodedTexture {
 	TextureCache::ImageDesc desc;
-	bool                    null              = false;
+	bool                    null_descriptor   = false;
 	bool                    shader_conversion = false;
 	vk::Format              pixel_format      = vk::Format::eUndefined;
 	vk::Format              view_format       = vk::Format::eUndefined;
@@ -61,10 +62,10 @@ struct TextureDecodeKeyHash {
 	size_t operator()(const TextureDecodeView& key) const noexcept {
 		uint64_t hash = key.value.dword_count;
 		for (const auto dword: key.value.dwords) {
-			hash = (hash ^ dword) * 0x100000001b3ull;
+			hash = Common::Fnv64Step(hash, dword);
 		}
-		hash = (hash ^ key.resource.source) * 0x100000001b3ull;
-		hash = (hash ^ static_cast<uint32_t>(key.resource.written)) * 0x100000001b3ull;
+		hash = Common::Fnv64Step(hash, key.resource.source);
+		hash = Common::Fnv64Step(hash, static_cast<uint32_t>(key.resource.written));
 		return static_cast<size_t>(hash);
 	}
 };

@@ -550,15 +550,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	// The texture cache can change the description, and a later decode can drop the table.
 	auto  desc          = decoded->second.desc;
 	auto& texture_cache = m_context.GetTextureCache();
-	if (decoded->second.null) {
+	if (decoded->second.null_descriptor) {
 		const auto id = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		return {.image_id = id, .desc = std::move(desc)};
 	}
 	const auto pixel_format = decoded->second.pixel_format;
 	const auto view_format  = decoded->second.view_format;
 	const auto size         = decoded->second.size;
 	const bool storage      = resource.written;
 	const auto descriptor   = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const auto swizzle      = descriptor.DstSelXYZW();
 
 	auto       id                  = texture_cache.FindImage(desc, decoded->second.shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
@@ -572,12 +573,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		}
 		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size);
 	} else if (storage) {
-		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+		ValidateStorageColorView(image->info.pixel_format, view_format, swizzle);
 	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
-		                             descriptor.DstSelXYZW());
+		(void)SelectSampledColorView(image->info.pixel_format, pixel_format, swizzle);
 	}
-	return {id, nullptr, std::move(desc)};
+	return {.image_id = id, .desc = std::move(desc)};
 }
 
 DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageResource&   resource,
@@ -595,7 +595,7 @@ DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageRe
 		DecodedTexture texture;
 		texture.desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                                 : TextureCache::BindingType::Texture);
-		texture.null = true;
+		texture.null_descriptor = true;
 		return texture;
 	}
 
