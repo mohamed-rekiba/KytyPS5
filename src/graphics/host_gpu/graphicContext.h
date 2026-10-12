@@ -57,7 +57,7 @@ struct GraphicContext {
 	void WithQueueIdle(Then&& then) {
 		Common::LockGuard lock(queue_mutex);
 		if (!queue_commits.AllDone()) {
-			EXIT_NOT_IMPLEMENTED(queue.waitIdle() != vk::Result::eSuccess);
+			RequireVulkanSuccess(queue.waitIdle(), "vkQueueWaitIdle");
 			queue_commits.NoteIdle();
 		}
 		then();
