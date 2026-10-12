@@ -768,6 +768,9 @@ struct PipelineCache::ProgramCache {
 		if (m_records.empty()) {
 			return;
 		}
+		// These threads come on top of the pipeline builders (PipelineBuilderCount) until the
+		// list is translated, so at a start the two together can use the cores the builders
+		// leave free. Not tuned together: the builder count was measured alone.
 		const auto threads = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
 		m_workers_running  = threads;
 		for (uint32_t i = 0; i < threads; i++) {

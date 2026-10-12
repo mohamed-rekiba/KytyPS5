@@ -78,7 +78,8 @@ enum class PipelineUse : uint8_t {
 
 // The threads that build pipelines on a host with `host_threads` hardware threads. A build is
 // mostly the host's shader compiler, which runs builds in parallel; at a level start a game asks
-// for hundreds at once. Four threads stay free for the game's threads and the GPU thread. Measured
+// for hundreds at once. Four threads stay free for the game's threads and the GPU thread, except
+// while the program list is translated at a start: its threads come on top (pipelineCache.cpp). Measured
 // on an M4 Max (14 threads), building a list of 544 pipelines: 3 threads 8.4 s, 6 threads 6.7 s,
 // 10 threads 6.2 s with the compiler's cache warm; past 10 threads nothing was measured.
 [[nodiscard]] constexpr uint32_t PipelineBuilderCount(uint32_t host_threads) noexcept {
