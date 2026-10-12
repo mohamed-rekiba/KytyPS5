@@ -6827,6 +6827,20 @@ void TestPerspectiveSampleInputs() {
     Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 17u),
           "sample interpolation changed the shared barycentric input location");
     CheckSpirvBinaryValidates(result.spirv);
+
+    // A host that cannot interpolate the barycentrics at a sample (MoltenVK) reads them at the
+    // pixel center, as it does for the centroid: not as zero.
+    options.host.faults.no_per_vertex_inputs = true;
+    options.host.faults.no_centroid_barycentric = true;
+    const auto at_center = RecompileForTest(shader, options);
+    Check(DisassembleSpirvBinary(at_center.spirv).find("InterpolateAtSample") ==
+                  std::string::npos &&
+              !SpirvContainsCapability(at_center.spirv, 52u) &&
+              SpirvHasDecorationValue(at_center.spirv, 11u, 5286u) &&
+              !ShaderRecompiler::Spirv::FindMissingCapability(at_center.program, options.host)
+                   .has_value(),
+          "a host without sample barycentrics did not read them at the pixel center");
+    CheckSpirvBinaryValidates(at_center.spirv);
   }
 }
 

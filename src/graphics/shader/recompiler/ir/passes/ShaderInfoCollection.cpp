@@ -424,6 +424,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			const auto kind      = static_cast<StageInputKind>(inst.Arg(0).U32());
 			const auto component = inst.Arg(1).U32();
 			info.barycentric |= kind == StageInputKind::BaryCoordSmooth ||
+			                    kind == StageInputKind::BaryCoordSmoothSample ||
 			                    kind == StageInputKind::BaryCoordSmoothCentroid ||
 			                    kind == StageInputKind::BaryCoordNoPerspective;
 			switch (kind) {
