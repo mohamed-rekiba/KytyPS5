@@ -61,6 +61,8 @@ bool PadInput::Connect(int id) {
 void PadInput::Disconnect(int id) {
 	const auto it = std::find_if(m_sources.begin(), m_sources.end(),
 	                             [id](const Source& source) { return source.id == id; });
+	// An emergency shutdown calls DisconnectAll (controller.cpp), and the window thread can still
+	// deliver a gamepad's removal after it: the id is then already gone.
 	if (it == m_sources.end()) {
 		return;
 	}
