@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/command_processor/constRam.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -182,7 +183,7 @@ private:
 	uint32_t m_ce_count    = 0;
 	bool     m_ce_complete = false;
 
-	uint32_t m_const_ram[0x3000] = {0};
+	uint32_t m_const_ram[CONST_RAM_DWORDS] = {0};
 
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;

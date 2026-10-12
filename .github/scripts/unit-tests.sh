@@ -27,6 +27,7 @@ names=(
 	host_lowering
 	image_readback
 	overlay_queue
+	const_ram
 	ime_dialog
 	lru_cache
 	metadata_fill

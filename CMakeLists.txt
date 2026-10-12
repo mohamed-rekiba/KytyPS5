@@ -609,6 +609,11 @@ add_executable(image_readback_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(image_readback_tests PRIVATE ${inc_headers})
 
+add_executable(const_ram_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ConstRamTests.cpp"
+)
+target_include_directories(const_ram_tests PRIVATE ${inc_headers})
+
 add_executable(overlay_queue_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/OverlayQueueTests.cpp"
 )
@@ -776,6 +781,7 @@ if(BUILD_TESTING)
 	add_test(NAME pad_input COMMAND $<TARGET_FILE:pad_input_tests>)
 	add_test(NAME image_readback COMMAND $<TARGET_FILE:image_readback_tests>)
 	add_test(NAME overlay_queue COMMAND $<TARGET_FILE:overlay_queue_tests>)
+	add_test(NAME const_ram COMMAND $<TARGET_FILE:const_ram_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
@@ -875,6 +881,7 @@ if(BUILD_TESTING)
 		pad_input_tests
 		image_readback_tests
 		overlay_queue_tests
+		const_ram_tests
 		save_data_memory_tests
 		png_enc_tests
 		ces_tests
