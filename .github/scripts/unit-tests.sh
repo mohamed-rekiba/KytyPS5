@@ -26,6 +26,7 @@ names=(
 	file_lock
 	host_lowering
 	image_readback
+	overlay_queue
 	ime_dialog
 	lru_cache
 	metadata_fill

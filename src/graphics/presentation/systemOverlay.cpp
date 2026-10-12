@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/presentation/overlayQueue.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "imgui_impl_vulkan.h"
@@ -1284,17 +1285,25 @@ struct SystemOverlay::Impl {
 		const auto render    = [&] {
             ImGui_ImplVulkan_RenderDrawData(draw_data, static_cast<VkCommandBuffer>(command));
 		};
-		// The backend replaces a vertex or index buffer that is too small and destroys the old
-		// one at once. Each command buffer committed while it lived holds it (see
-		// queueCommits.h), so the queue is drained first. The backend takes its buffer sets in
-		// turn, one for each call, and grows only the set it takes: the same is tracked here.
+		// See overlayQueue.h. The backend takes its buffer sets in turn, one for each call, and
+		// grows only the set it takes: the same is tracked here.
 		set_index      = (set_index + 1u) % static_cast<uint32_t>(set_vertices.size());
 		auto& vertices = set_vertices[set_index];
 		auto& indices  = set_indices[set_index];
-		if (draw_data->TotalVtxCount > 0 &&
-		    (draw_data->TotalVtxCount > vertices || draw_data->TotalIdxCount > indices)) {
-			vertices = std::max(vertices, draw_data->TotalVtxCount);
-			indices  = std::max(indices, draw_data->TotalIdxCount);
+		// The backend destroys a retired texture during the draw (ImGui_ImplVulkan_UpdateTexture).
+		const bool destroys_texture =
+		    draw_data->Textures != nullptr &&
+		    std::ranges::any_of(*draw_data->Textures, [](const ImTextureData* texture) {
+			    return texture->Status == ImTextureStatus_WantDestroy;
+		    });
+		const OverlayDraw draw {.vertices         = draw_data->TotalVtxCount,
+		                        .indices          = draw_data->TotalIdxCount,
+		                        .destroys_texture = destroys_texture};
+		if (OverlayDrawNeedsIdleQueue(draw, {.vertices = vertices, .indices = indices})) {
+			if (draw.vertices > 0) {
+				vertices = std::max(vertices, draw.vertices);
+				indices  = std::max(indices, draw.indices);
+			}
 			graphics.WithQueueIdle(render);
 		} else {
 			Common::LockGuard queue_lock(graphics.queue_mutex);
