@@ -49,6 +49,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/shader/triangleVertexValueShader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
@@ -1873,7 +1874,7 @@ std::string StorageUint2DImageBindingName(bool atomic) {
   return "image_" + std::to_string(static_cast<uint32_t>(*binding));
 }
 
-CompiledShader CompileFragmentCase(const GraphicsCase &test) {
+CompiledShader CompileFragmentCase(const GraphicsCase &test, const HostGpu &host) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
@@ -1904,6 +1905,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
   options.dump_ir = false;
+  options.host = host;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
 
@@ -2073,13 +2075,6 @@ public:
     m_physical_device.getProperties2(&properties);
     return subgroup.subgroupSize;
   }
-  // A consumer GPU may lack the production rasterization features the fragment
-  // cases need. The compute cases still run on such a device, so the harness reports
-  // the capability instead of failing the whole binary before the first case.
-  [[nodiscard]] bool RasterizationSupported() const {
-    return m_rasterization_supported;
-  }
-  void SkipRasterizationCases(u32 count) { m_skipped_cases += count; }
   // What the device of this run offers. A case that needs more is not run on it, and is counted.
   [[nodiscard]] const HostGpu &Host() const { return m_host; }
   [[nodiscard]] u32 NotRunCaseCount() const { return m_not_run_cases; }
@@ -2122,7 +2117,6 @@ public:
                 feature);
     return true;
   }
-  [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
     return m_runtime_context;
@@ -16523,7 +16517,7 @@ public:
     test.fragment_code.push_back(packed_vertex_color ? EncodeExp1(0, 1, 2, 3)
                                                     : EncodeExp1(0, 0, 0, 0));
     AppendEnd(&test.fragment_code);
-    auto fragment = CompileFragmentCase(test);
+    auto fragment = CompileFragmentCase(test, m_host);
     const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
     ShaderProgram vertex_shader{1, CreateShaderModule(name, vertex_spirv)};
     ShaderProgram pixel_shader{2, CreateShaderModule(name, fragment.spirv)};
@@ -16742,7 +16736,7 @@ public:
                   line_pixels[interior] == 0 &&
                   std::ranges::any_of(line_pixels, [](u32 value) { return value == 0x3f800000u; }),
               "wireframe did not preserve triangle edges while leaving its interior empty");
-      if (!CannotRun("graphics", "LastProvokingVertex", m_provoking_last_supported,
+      if (!CannotRun("graphics", "LastProvokingVertex", m_host.capabilities.provoking_vertex_last,
                      "the last vertex as the provoking vertex", "provokingVertexLast")) {
         auto &last_vertex = pipeline(true, 2, 2, true);
         Require(name, "provoking vertex pipeline cache",
@@ -18808,12 +18802,6 @@ public:
   }
 
 private:
-  bool m_rasterization_supported = true;
-  // Each optional rasterization feature is enabled where the device has it, as the emulator's
-  // window does (vulkanWindow.cpp): the renderer reads these flags, not the gate above.
-  bool m_feedback_loop_supported = false;
-  bool m_provoking_last_supported = false;
-  u32   m_skipped_cases          = 0;
   u32   m_not_run_cases          = 0;
   HostGpu m_host;
 
@@ -18849,8 +18837,6 @@ private:
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
     m_runtime_context.host = m_host;
-    m_runtime_context.host.capabilities.attachment_feedback_loop = m_feedback_loop_supported;
-    m_runtime_context.host.capabilities.provoking_vertex_last = m_provoking_last_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -18973,31 +18959,9 @@ private:
     }
     m_physical_device.getMemoryProperties(&m_memory_properties);
 
-    vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT available_feedback_layout{};
-    vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT available_feedback_dynamic{};
-    available_feedback_dynamic.pNext = &available_feedback_layout;
-    vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
-    available_provoking_vertex.pNext = &available_feedback_dynamic;
-    vk::PhysicalDeviceFeatures2 available_features2{};
-    available_features2.pNext = &available_provoking_vertex;
-    m_physical_device.getFeatures2(&available_features2);
-    m_feedback_loop_supported = available_feedback_layout.attachmentFeedbackLoopLayout &&
-                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState;
-    m_provoking_last_supported = available_provoking_vertex.provokingVertexLast;
-    if (!m_feedback_loop_supported) {
-      std::printf("[host]    attachment feedback loop dynamic state is unavailable\n");
-    }
-    if (!m_provoking_last_supported) {
-      std::printf("[host]    provokingVertexLast is unavailable\n");
-    }
-    m_rasterization_supported = caps.depth_bounds && caps.depth_clip_enable &&
-                                caps.color_write_enable && m_feedback_loop_supported &&
-                                m_provoking_last_supported;
-    if (!m_rasterization_supported) {
-      std::printf(
-          "[host]    ProductionRasterization   unavailable, rasterization cases "
-          "will be skipped\n");
-    }
+    // The optional rasterization features (depth bounds, depth clip, color write, feedback
+    // loops, the last provoking vertex) are enabled where the device has them, as the emulator
+    // does. The renderer works without each; a case that needs one says so (CannotRun).
 
     float priority = 1.0f;
     vk::DeviceQueueCreateInfo queue_info{};
@@ -19080,7 +19044,7 @@ private:
       link(color_write);
       device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
     }
-    if (m_feedback_loop_supported) {
+    if (caps.attachment_feedback_loop) {
       feedback_layout.attachmentFeedbackLoopLayout = true;
       link(feedback_layout);
       feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
@@ -19089,7 +19053,7 @@ private:
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
     }
-    if (m_provoking_last_supported) {
+    if (caps.provoking_vertex_last) {
       provoking_vertex.provokingVertexLast = true;
       link(provoking_vertex);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
@@ -19788,12 +19752,29 @@ void CheckVertexPermlanePartialGroup(VulkanHarness &vulkan) {
 }
 
 void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
-  if (vulkan != nullptr && !vulkan->RasterizationSupported()) {
-    vulkan->SkipRasterizationCases(1);
+  auto compiled = CompileFragmentCase(test, vulkan->Host());
+  if (vulkan->CannotRun("graphics", test.name, compiled.program)) {
     return;
   }
-  auto compiled = CompileFragmentCase(test);
-  if (vulkan->CannotRun("graphics", test.name, compiled.program)) {
+  // The renderer draws such a shader as patches whose tessellation stages give it the values at
+  // each vertex (triangleVertexValueShader.h). The passthrough vertex shader here does not.
+  ShaderRecompiler::IR::CompiledShaderInfo pixel_program{};
+  pixel_program.info = compiled.program.info;
+  ShaderPixelInputInfo pixel_info{};
+  pixel_info.stage.program = &pixel_program;
+  if (vulkan->CannotRun("graphics", test.name,
+                        !vulkan->Host().faults.no_per_vertex_inputs ||
+                            !ShaderPixelReadsVertexValues(pixel_info),
+                        "per-vertex pixel shader inputs (the harness has no vertex-value draw)",
+                        "no_per_vertex_inputs")) {
+    return;
+  }
+  // Such a host reads the barycentrics of every sample at the pixel center (spirvEmitterFlow.cpp).
+  if (vulkan->CannotRun("graphics", test.name,
+                        !vulkan->Host().faults.no_centroid_barycentric ||
+                            test.pixel_perspective_sample_vgpr == UINT32_MAX ||
+                            test.samples == vk::SampleCountFlagBits::e1,
+                        "barycentrics at each sample", "no_centroid_barycentric")) {
     return;
   }
   const auto wrong_before = g_wrong_results.size();
@@ -43949,21 +43930,14 @@ int RunSelectedCases(int argc, char **argv) {
     return 2;
   }
   VulkanHarness vulkan;
-  // Keep compute and host checks running when rasterization features are missing.
-  const bool rasterization = vulkan.RasterizationSupported();
-  bool skipped_device_checks = false;
   CheckRenderTargetFormatContract();
   CheckSampledColorViews();
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
   CheckDepthTextureEncoding();
   vulkan.CheckSamplerBorderColors();
-  if (rasterization) {
-    vulkan.CheckComparisonDepthTexture();
-    vulkan.CheckRasterization(true);
-  } else {
-    skipped_device_checks = true;
-  }
+  vulkan.CheckComparisonDepthTexture();
+  vulkan.CheckRasterization(true);
   CheckBasicStorageTextureDescriptor();
   CheckStorageTextureLinearUploadLayout();
   CheckStorageTextureDepthTileUploadLayout();
@@ -43987,8 +43961,6 @@ int RunSelectedCases(int argc, char **argv) {
   CheckShaderRecompilerFatalContracts();
   CheckDepthFeedbackAspects();
   VulkanHarness vulkan;
-  const bool rasterization = vulkan.RasterizationSupported();
-  bool skipped_device_checks = false;
 #endif
   CheckImageSamplerSpecialization();
   CheckResourcePlanHandoff();
@@ -44050,24 +44022,20 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
-  if (rasterization) {
-    vulkan.CheckGraphicsPushConstantBank();
-    vulkan.CheckRenderExecutorColorDiscovery();
-    vulkan.CheckRenderExecutorColor1DArrayDiscovery();
-    vulkan.CheckRenderExecutorColorVolumeDiscovery();
-    vulkan.CheckRenderExecutorColorMetadataClear();
-    vulkan.CheckSampledDccClear();
-    vulkan.CheckRenderExecutorColorStandardTileDiscovery();
-    vulkan.CheckRenderExecutorColorDepthTileDiscovery();
-    vulkan.CheckRenderExecutorStencilBindingDiscovery();
-    vulkan.CheckBgra16Readback();
-    vulkan.CheckRasterization(false);
-    vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
-    vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
-    vulkan.CheckBufferCacheDirtyGarbageCollection();
-  } else {
-    skipped_device_checks = true;
-  }
+  vulkan.CheckGraphicsPushConstantBank();
+  vulkan.CheckRenderExecutorColorDiscovery();
+  vulkan.CheckRenderExecutorColor1DArrayDiscovery();
+  vulkan.CheckRenderExecutorColorVolumeDiscovery();
+  vulkan.CheckRenderExecutorColorMetadataClear();
+  vulkan.CheckSampledDccClear();
+  vulkan.CheckRenderExecutorColorStandardTileDiscovery();
+  vulkan.CheckRenderExecutorColorDepthTileDiscovery();
+  vulkan.CheckRenderExecutorStencilBindingDiscovery();
+  vulkan.CheckBgra16Readback();
+  vulkan.CheckRasterization(false);
+  vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
+  vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
+  vulkan.CheckBufferCacheDirtyGarbageCollection();
   const auto tests = MakeCases();
   const auto graphics_tests = MakeGraphicsCases();
   CheckOpcodeCoverage(tests, graphics_tests);
@@ -44079,15 +44047,6 @@ int RunSelectedCases(int argc, char **argv) {
   }
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
-  if (skipped_device_checks) {
-    std::printf(
-        "ShaderRecompilerComputeTests: device rasterization checks skipped, this "
-        "device does not support the production rasterization features\n");
-  }
-  if (vulkan.SkippedCaseCount() > 0) {
-    std::printf("ShaderRecompilerComputeTests: %u graphics cases skipped\n",
-                vulkan.SkippedCaseCount());
-  }
   if (vulkan.NotRunCaseCount() > 0) {
     std::printf("ShaderRecompilerComputeTests: %u cases not run on this device, which lacks a "
                 "capability they need\n",
