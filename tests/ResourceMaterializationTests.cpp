@@ -9,6 +9,8 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -828,6 +830,98 @@ void TestRuntimeChoicesKeepTheWalker() {
   }
 }
 
+// Every operation on scalar values that the walker evaluates, the tape builds too, with the same
+// result. Only the operations whose walk depends on runtime values keep the walker. An operation
+// added to the walker but not to the tape fails here.
+void TestTapeBuildsEveryOperationTheWalkerEvaluates() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto scalar = [](Type type) {
+    return type == Type::U1 || type == Type::U32 || type == Type::U64 || type == Type::F32;
+  };
+  const auto runtime_choice = [](ValueOpcode op) {
+    return op == ValueOpcode::SelectU1 || op == ValueOpcode::SelectU32 ||
+           op == ValueOpcode::SelectF32 || op == ValueOpcode::LogicalAnd ||
+           op == ValueOpcode::LogicalOr || op == ValueOpcode::ReadFirstLane;
+  };
+  const std::array<std::array<uint32_t, 8>, 2> inputs{{
+      {6u, 3u, 2u, 1u, 0x40000000u, 0u, 7u, 0u},
+      {0x80000001u, 31u, 0u, 5u, 0x3f800000u, 1u, 0xffffffffu, 2u},
+  }};
+  uint32_t checked = 0;
+  for (uint32_t index = 0; index < static_cast<uint32_t>(ValueOpcode::Count); ++index) {
+    const auto op = static_cast<ValueOpcode>(index);
+    const auto arg_count = NumArgsOf(op);
+    bool fits = !HasSideEffects(op) && scalar(TypeOf(op)) && arg_count <= 4u;
+    for (size_t arg = 0; fits && arg < arg_count; ++arg) {
+      fits = scalar(ArgTypeOf(op, arg));
+    }
+    if (!fits) {
+      continue;
+    }
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    auto &block = AddValueBlock(program);
+    // Argument `arg` comes from user data `arg` (and `arg + 4` for the high half of a U64).
+    const auto user_data = [&](uint32_t reg) {
+      return Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                        {Value(static_cast<ScalarReg>(reg))}));
+    };
+    std::array<Value, 4> args{};
+    for (uint32_t arg = 0; arg < arg_count; ++arg) {
+      switch (ArgTypeOf(op, arg)) {
+        case Type::U1:
+          args[arg] = Value(
+              &block.AppendNewInst(ValueOpcode::INotEqual32, {user_data(arg), Value(0u)}));
+          break;
+        case Type::F32:
+          args[arg] = Value(&block.AppendNewInst(ValueOpcode::BitCastF32U32, {user_data(arg)}));
+          break;
+        case Type::U64:
+          args[arg] = Value(&block.AppendNewInst(ValueOpcode::CompositeConstructU64,
+                                                 {user_data(arg), user_data(arg + 4u)}));
+          break;
+        default: args[arg] = user_data(arg); break;
+      }
+    }
+    auto &inst = arg_count == 0u   ? block.AppendNewInst(op)
+                 : arg_count == 1u ? block.AppendNewInst(op, {args[0]})
+                 : arg_count == 2u ? block.AppendNewInst(op, {args[0], args[1]})
+                 : arg_count == 3u ? block.AppendNewInst(op, {args[0], args[1], args[2]})
+                                   : block.AppendNewInst(op, {args[0], args[1], args[2], args[3]});
+    program.srt_reads.push_back({Value(&inst), 0});
+
+    auto tape_plan = ExtractResourcePlan(program);
+    auto walk_plan = ExtractResourcePlan(program);
+    walk_plan.srt_tape = nullptr;
+    const auto name = std::string(ValueOpcodeName(op));
+    for (const auto &user_data_words : inputs) {
+      ResourceSnapshot walk_snapshot;
+      ResourceSpecialization walk_specialization;
+      const bool walked = MaterializeResources(walk_plan, {.user_data = user_data_words},
+                                               walk_snapshot, walk_specialization);
+      if (tape_plan.srt_tape == nullptr) {
+        if (walked && !runtime_choice(op)) {
+          std::fprintf(stderr, "ResourceMaterializationTests: operation: %s\n", name.c_str());
+          Check(false, "the walker evaluates an operation that the tape does not build");
+        }
+        continue;
+      }
+      ResourceSnapshot tape_snapshot;
+      ResourceSpecialization tape_specialization;
+      const bool taped = MaterializeResources(tape_plan, {.user_data = user_data_words},
+                                              tape_snapshot, tape_specialization);
+      if (taped != walked || tape_snapshot.flattened_srt != walk_snapshot.flattened_srt) {
+        std::fprintf(stderr, "ResourceMaterializationTests: operation: %s\n", name.c_str());
+        Check(false, "the tape and the walker gave different results for an operation");
+      }
+      checked += walked ? 1u : 0u;
+    }
+  }
+  Check(checked >= 40u, "too few operations were evaluated by both the tape and the walker");
+}
+
 } // namespace
 
 namespace Common {
@@ -891,6 +985,7 @@ int main() {
   TestSpecializationFitsTheShader();
   TestTapeMatchesWalker();
   TestRuntimeChoicesKeepTheWalker();
+  TestTapeBuildsEveryOperationTheWalkerEvaluates();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }
