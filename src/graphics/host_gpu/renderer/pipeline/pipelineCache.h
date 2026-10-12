@@ -203,20 +203,20 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	// A pipeline and whether it is built yet: false while a worker thread is still building it,
 	// and the pipeline is read only once it is true.
-	struct GraphicsEntry {
+	struct PipelineEntry {
 		std::atomic<bool> ready {false};
 		Pipeline          pipeline;
 		// The frame of the last short wait for this pipeline (GraceWaitUs). GPU thread only.
 		uint64_t          grace_wait_frame = UINT64_MAX;
 	};
-	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsEntry>, GraphicsPipelineKeyHash>
+	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<PipelineEntry>, GraphicsPipelineKeyHash>
 	                                                             m_graphics_pipelines;
-	std::unordered_map<uint64_t, std::unique_ptr<GraphicsEntry>> m_compute_pipelines;
+	std::unordered_map<uint64_t, std::unique_ptr<PipelineEntry>> m_compute_pipelines;
 
 	// What a worker needs to build one pipeline, copied from the draw or dispatch. A compute
 	// job has `compute` set and no vertex stages.
 	struct PipelineJob {
-		GraphicsEntry*                       target = nullptr;
+		PipelineEntry*                       target = nullptr;
 		bool                                 listed = false; // from the game's list, built ahead
 		std::optional<ShaderComputeInputInfo> compute;
 		PipelineRenderingState               rendering;
@@ -265,9 +265,9 @@ private:
 	void                    QueueComputeBuild(uint64_t program_id, PipelineJob job);
 	void                    Enqueue(PipelineJob job);
 	// A draw or dispatch waits for this build: it goes first.
-	void                    Promote(const GraphicsEntry& entry);
+	void                    Promote(const PipelineEntry& entry);
 	void                    BuildPipelines(std::stop_token stop, uint32_t builder);
-	[[nodiscard]] Pipeline* WhenReady(GraphicsEntry& entry, const DrawEffects& effects,
+	[[nodiscard]] Pipeline* WhenReady(PipelineEntry& entry, const DrawEffects& effects,
 	                                   uint64_t frame);
 };
 

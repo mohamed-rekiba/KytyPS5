@@ -1172,7 +1172,7 @@ void PipelineCache::Enqueue(PipelineJob job) {
 }
 
 void PipelineCache::QueueBuild(GraphicsPipelineKey key, PipelineJob job) {
-	auto cached = std::make_unique<GraphicsEntry>();
+	auto cached = std::make_unique<PipelineEntry>();
 	job.target  = cached.get();
 	Enqueue(std::move(job));
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
@@ -1180,14 +1180,14 @@ void PipelineCache::QueueBuild(GraphicsPipelineKey key, PipelineJob job) {
 }
 
 void PipelineCache::QueueComputeBuild(uint64_t program_id, PipelineJob job) {
-	auto cached = std::make_unique<GraphicsEntry>();
+	auto cached = std::make_unique<PipelineEntry>();
 	job.target  = cached.get();
 	Enqueue(std::move(job));
 	auto [iter, inserted] = m_compute_pipelines.emplace(program_id, std::move(cached));
 	EXIT_IF(!inserted);
 }
 
-void PipelineCache::Promote(const GraphicsEntry& entry) {
+void PipelineCache::Promote(const PipelineEntry& entry) {
 	std::lock_guard lock(m_jobs_mutex);
 	const auto      it = std::ranges::find_if(
         m_jobs, [&entry](const PipelineJob& job) { return job.target == &entry; });
@@ -1818,7 +1818,7 @@ void PipelineCache::BuildPipelines(std::stop_token stop, uint32_t builder) {
 	}
 }
 
-PipelineCache::Pipeline* PipelineCache::WhenReady(GraphicsEntry& entry, const DrawEffects& effects,
+PipelineCache::Pipeline* PipelineCache::WhenReady(PipelineEntry& entry, const DrawEffects& effects,
                                                   uint64_t frame) {
 	const auto ready = [&entry] { return entry.ready.load(std::memory_order_acquire); };
 	const auto leave_out = [this] {
@@ -1896,7 +1896,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	// A dispatch that is left out would change the game's data: it always waits. The build runs
 	// on a worker all the same, so it is in parallel with others, and the game's list builds it
 	// ahead at the next start.
-	const auto wait = [this](GraphicsEntry& entry) -> Pipeline& {
+	const auto wait = [this](PipelineEntry& entry) -> Pipeline& {
 		return *WhenReady(entry, DrawEffects {.writes_memory = true}, 0);
 	};
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
