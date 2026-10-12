@@ -5495,6 +5495,91 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // The decode of a texture descriptor is remembered per descriptor and shader resource
+  // (RenderExecutor::DecodeTexture). The same pair gives the same binding; the same descriptor
+  // read by another resource is decoded for that resource, not taken from the other entry.
+  void CheckTextureDecodeMemo() {
+    constexpr const char *name = "TextureDecodeMemo";
+    constexpr uintptr_t base = 0x0000000208200000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "memo direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "memo fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+      RenderExecutorTestAccess::ResetBindings(executor);
+
+      ShaderTextureResource descriptor{{
+          static_cast<uint32_t>(base >> 8u),
+          (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u) |
+              (((width - 1u) & 3u) << 30u),
+          ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+          DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Prospero::TileMode::kLinear) << 20u) |
+              (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource sampled{};
+      sampled.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      sampled.numeric_class = Prospero::TextureNumericClass::Float;
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.read = true;
+      auto storage = sampled;
+      storage.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+      storage.read = false;
+      storage.written = true;
+
+      using BindingType = Libs::Graphics::TextureCache::BindingType;
+      const auto first = RenderExecutorTestAccess::ResolveTexture(executor, sampled, value);
+      const auto again = RenderExecutorTestAccess::ResolveTexture(executor, sampled, value);
+      Require(name, "same descriptor and resource",
+              first.image_id && again.image_id == first.image_id &&
+                  again.image_view == first.image_view &&
+                  first.desc.type == BindingType::Texture && again.desc.type == BindingType::Texture,
+              "a remembered decode gave another binding for the same descriptor and resource");
+      const auto written = RenderExecutorTestAccess::ResolveTexture(executor, storage, value);
+      Require(name, "same descriptor, other resource",
+              written.image_id && written.desc.type == BindingType::Storage,
+              "a storage read of a remembered descriptor got the sampled decode");
+      const auto back = RenderExecutorTestAccess::ResolveTexture(executor, sampled, value);
+      Require(name, "first resource again",
+              back.desc.type == BindingType::Texture && back.image_id == first.image_id,
+              "the sampled decode was replaced by the storage decode");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "memo direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "memo direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaPageTableUploads() {
     constexpr const char *name = "BdaPageTableUploads";
     constexpr uintptr_t base = 0x0000000207b00000ull;
@@ -43614,6 +43699,7 @@ int RunSelectedCases(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
     vulkan.CheckUploadBatchStagingWait();
+    vulkan.CheckTextureDecodeMemo();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -43822,6 +43908,7 @@ int RunSelectedCases(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckUploadBatchStagingWait();
+  vulkan.CheckTextureDecodeMemo();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
