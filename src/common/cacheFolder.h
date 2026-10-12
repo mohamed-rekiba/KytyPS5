@@ -6,10 +6,6 @@
 
 namespace Common {
 
-// Where the emulator keeps what it builds for itself and builds again when lost: the pipeline and
-// program lists of each game. Not in the working directory: an emulator started from another
-// folder, or a new copy of it, would start each game as if it had never run. The host's per-user
-// cache folder is shared by every copy, and the host may clear it.
 enum class CacheHost { Windows, MacOs, Linux };
 
 struct CacheEnvironment {
@@ -18,6 +14,11 @@ struct CacheEnvironment {
 	std::string local_app_data; // LOCALAPPDATA
 };
 
+// Where the emulator keeps what it builds for itself and builds again when lost: the pipeline and
+// program lists of each game. Not in the working directory: an emulator started from another
+// folder, or a new copy of it, would start each game as if it had never run. The host's per-user
+// cache folder is shared by every copy, and the host may clear it.
+//
 // `configured`: the folder given on the command line, if any. When the environment names no
 // per-user folder, the working directory as before.
 [[nodiscard]] inline std::filesystem::path PipelineCacheFolder(
