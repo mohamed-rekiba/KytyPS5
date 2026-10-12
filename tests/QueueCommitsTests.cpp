@@ -50,11 +50,25 @@ void TestAPresentNeedsALaterSubmission() {
 	Check(queue.AllDone(), "the queue runs in order: the present completed before it");
 }
 
+// A wait for the idle queue completes the present too: no later submission is needed.
+void TestAnIdleQueueCompletesAPresent() {
+	uint64_t     done = 0;
+	QueueCommits queue;
+	const auto   render = queue.AddTimeline([&](uint64_t tick) { return tick <= done; });
+	queue.NoteSubmit(render, 1);
+	done = 1;
+	queue.NotePresent();
+	Check(!queue.AllDone(), "a present signals nothing, so its completion is unknown");
+	queue.NoteIdle();
+	Check(queue.AllDone(), "the idle queue still held the present");
+}
+
 } // namespace
 
 int main() {
 	TestEveryTimelineMustBeDone();
 	TestAPresentNeedsALaterSubmission();
+	TestAnIdleQueueCompletesAPresent();
 	if (g_failures != 0) {
 		std::cerr << "QueueCommitsTests: " << g_failures << " check(s) failed\n";
 		return 1;
