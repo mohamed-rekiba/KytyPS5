@@ -5580,6 +5580,63 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // The texture cache enrolls a GPU-written image for a copy back to guest memory by the rule of
+  // imageReadback.h: a tiny 2D image, not a tiny array or volume, and not a large tiled image.
+  void CheckTinyImageReadbackEnrolment() {
+    constexpr const char *name = "TinyImageReadbackEnrolment";
+    constexpr uintptr_t base = 0x0000000208400000ull;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    struct Case {
+      const char *what;
+      vk::Extent3D extent;
+      uint32_t layers;
+      Prospero::ImageType type;
+      bool enrolled;
+    };
+    const Case cases[] = {
+        {"a tiled 4x4 2D image", {4, 4, 1}, 1, Prospero::ImageType::kColor2D, true},
+        {"a tiled 4x4 array of 8 layers", {4, 4, 1}, 8, Prospero::ImageType::kColor2D, false},
+        {"a tiled 4x4x8 volume", {4, 4, 8}, 1, Prospero::ImageType::kColor3D, false},
+        {"a tiled 64x64 2D image", {64, 64, 1}, 1, Prospero::ImageType::kColor2D, false},
+    };
+    uint64_t address = base;
+    for (const auto &test : cases) {
+      ImageInfo info{};
+      info.type = test.type;
+      info.data = {address, 0x10000};
+      info.extent = test.extent;
+      info.resources = {1, test.layers};
+      info.samples = 1;
+      info.tile_mode = Prospero::TileMode::kRenderTarget;
+      info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+      info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+      info.bytes_per_block = 4;
+      info.pitch = test.extent.width;
+      info.mip_layout = {ImageMipInfo{0, 0x10000, test.extent.width, test.extent.height}};
+      address += 0x10000;
+      const auto id = TextureCacheTestAccess::InsertImage(texture_cache, info);
+      texture_cache.GetImage(id).MarkGpuModified();
+      TextureCacheTestAccess::TrackDownload(texture_cache, id);
+      if (TextureCacheTestAccess::PendingDownload(texture_cache, id) != test.enrolled) {
+        std::printf("[gpu]     %s: %s\n", name, test.what);
+        Require(name, "read-back enrolment", false,
+                "an image was enrolled for read-back against imageReadback.h");
+      }
+      // No GPU work wrote it: the image is dropped without a read-back.
+      texture_cache.GetImage(id).ClearGpuModified();
+      TextureCacheTestAccess::DeleteImage(texture_cache, id);
+    }
+    scheduler.Finish();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaPageTableUploads() {
     constexpr const char *name = "BdaPageTableUploads";
     constexpr uintptr_t base = 0x0000000207b00000ull;
@@ -43700,6 +43757,7 @@ int RunSelectedCases(int argc, char **argv) {
     vulkan.CheckBdaPageTableUploads();
     vulkan.CheckUploadBatchStagingWait();
     vulkan.CheckTextureDecodeMemo();
+    vulkan.CheckTinyImageReadbackEnrolment();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -43909,6 +43967,7 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckUploadBatchStagingWait();
   vulkan.CheckTextureDecodeMemo();
+  vulkan.CheckTinyImageReadbackEnrolment();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
