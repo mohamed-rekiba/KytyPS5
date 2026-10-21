@@ -11413,8 +11413,10 @@ public:
     return result;
   }
 
-  void CheckNullTextureDescriptors() {
-    constexpr const char *name = "NullTextureDescriptors";
+  // With `placeholders`, the device's null descriptor is left unused, as on a device without
+  // one (MoltenVK), and null textures are bound as NullTextures' zero-filled placeholders.
+  void CheckNullTextureDescriptors(bool placeholders = false) {
+    const char *name = placeholders ? "NullTexturePlaceholders" : "NullTextureDescriptors";
     constexpr uintptr_t base = 0x0000000204900000ull;
     constexpr uint64_t size = 0x10000;
     std::vector<u32> reader{
@@ -11444,6 +11446,8 @@ public:
            .code_size_bytes = static_cast<u32>(code->size() * sizeof(u32))});
 
     EnsureRuntimeContext();
+    const bool null_descriptor = m_runtime_context.null_descriptor_enabled;
+    if (placeholders) m_runtime_context.null_descriptor_enabled = false;
     int64_t physical = -1;
     Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
         0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
@@ -11513,6 +11517,7 @@ public:
     });
     LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
+    m_runtime_context.null_descriptor_enabled = null_descriptor;
     Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
             "null texture output release failed");
     std::printf("[gpu]     %-32s ok\n", name);
@@ -51460,6 +51465,7 @@ int RunSelectedCases(int argc, char **argv) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
     vulkan.CheckNullTextureDescriptors();
+    vulkan.CheckNullTextureDescriptors(true);
     CheckCountedRowImageSelector(vulkan);
     CheckPointerImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
@@ -51654,6 +51660,7 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullTextureDescriptors();
+  vulkan.CheckNullTextureDescriptors(true);
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckUploadBatchStagingWait();
   vulkan.CheckTextureDecodeMemo();
