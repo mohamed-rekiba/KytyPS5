@@ -912,11 +912,43 @@ public:
 			if (!block.condition.IsEmpty() && !Ref(block.condition, ref)) return nullptr;
 			m_nodes->m_condition_refs.push_back(ref);
 		}
+		PackFlow();
 		return nodes;
 	}
 
 private:
 	using Kind = SrtNodes::Kind;
+
+	void PackFlow() {
+		const auto& program = m_program;
+		auto&       nodes   = *m_nodes;
+		const auto  sources = program.descriptor_sources.size();
+		const auto  reads   = program.srt_reads.size();
+		nodes.m_active_template.assign(sources, 1u);
+		for (const auto& block: program.control_flow) {
+			nodes.m_successor_begin.push_back(static_cast<uint32_t>(nodes.m_successors.size()));
+			nodes.m_source_begin.push_back(static_cast<uint32_t>(nodes.m_sources.size()));
+			nodes.m_block_read_begin.push_back(static_cast<uint32_t>(nodes.m_block_reads.size()));
+			for (const auto successor: block.successors) {
+				if (successor >= program.control_flow.size()) return;
+				nodes.m_successors.push_back(successor);
+			}
+			for (const auto source: block.sources) {
+				if (source >= sources) return;
+				nodes.m_sources.push_back(source);
+				nodes.m_active_template[source] = 0u;
+			}
+			for (const auto slot: block.srt_reads) {
+				if (slot >= reads) return;
+				nodes.m_block_reads.push_back(slot);
+			}
+		}
+		nodes.m_successor_begin.push_back(static_cast<uint32_t>(nodes.m_successors.size()));
+		nodes.m_source_begin.push_back(static_cast<uint32_t>(nodes.m_sources.size()));
+		nodes.m_block_read_begin.push_back(static_cast<uint32_t>(nodes.m_block_reads.size()));
+		for (const auto& read: program.srt_reads) nodes.m_read_offsets.push_back(read.flat_offset);
+		nodes.m_flow = true;
+	}
 
 	uint32_t Constant(Value value) {
 		if (const auto found = m_nodes->FindConstant(value); found != SrtNodes::NoRef) {
@@ -1081,25 +1113,23 @@ std::shared_ptr<const SrtNodes> SrtNodes::Build(const ResourcePlan& program) {
 
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      SrtWalker* clean_evaluator)
-    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
-      m_session(this),
-      m_read_policy(clean_evaluator != nullptr ? 2u : 0u), m_context(AcquireContext()) {
-	// A walker delegates to its clean evaluator by node: both use nodes, or neither does.
-	m_nodes = clean_evaluator != nullptr ? clean_evaluator->m_nodes
-	          : SrtNodes::Enabled()      ? program.srt_nodes.get()
-	                                     : nullptr;
-}
+    : m_program(program),
+      // A walker delegates to its clean evaluator by node: both use nodes, or neither does.
+      m_nodes(clean_evaluator != nullptr ? clean_evaluator->m_nodes
+              : SrtNodes::Enabled()      ? program.srt_nodes.get()
+                                         : nullptr),
+      m_runtime(runtime), m_clean_evaluator(clean_evaluator), m_session(this),
+      m_read_policy(clean_evaluator != nullptr ? 2u : 0u), m_context(AcquireContext()) {}
 
 SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean,
                      SrtWalker* clean_evaluator, uint32_t active_ref)
-    : m_program(parent.m_program), m_runtime(clean ? CleanRuntime(parent.m_runtime) : parent.m_runtime),
+    : m_program(parent.m_program), m_nodes(parent.m_nodes),
+      m_active_ref(active_ref != SrtNodes::NoRef ? active_ref : RefOf(active_mask)),
+      m_runtime(clean ? CleanRuntime(parent.m_runtime) : parent.m_runtime),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
       m_reachable_blocks(parent.m_reachable_blocks), m_session(parent.m_session),
       m_read_policy((parent.m_read_policy & 1u) | (clean ? 1u : 0u) |
-                    (clean_evaluator != nullptr ? 2u : 0u)), m_context(AcquireContext()) {
-	m_nodes      = parent.m_nodes;
-	m_active_ref = active_ref != SrtNodes::NoRef ? active_ref : RefOf(m_active_mask);
-}
+                    (clean_evaluator != nullptr ? 2u : 0u)), m_context(AcquireContext()) {}
 
 SrtWalker::~SrtWalker() {
 	if (m_session != this) return;
@@ -1121,9 +1151,22 @@ bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 
 ResourcePlan::EvaluationContext& SrtWalker::AcquireContext() {
 	auto& contexts = m_program.evaluation_contexts;
-	const auto key = m_program.evaluation_keys.try_emplace({m_active_mask, m_read_policy}, UINT32_MAX).first;
+	// Over nodes a mask has a reference: a table entry, not a hash lookup.
+	const auto count = m_program.evaluation_value_count;
+	const auto ref = m_active_ref < count ? m_active_ref
+	                 : m_active_mask.IsEmpty() && m_active_ref == SrtNodes::NoRef ? count
+	                                                                              : UINT32_MAX;
+	uint32_t* head = nullptr;
+	if (m_nodes != nullptr && ref != UINT32_MAX) {
+		auto& table = m_program.evaluation_ref_keys;
+		if (table.size() != (count + 1u) * 4u) table.assign((count + 1u) * 4u, UINT32_MAX);
+		head = &table[ref * 4u + m_read_policy];
+	} else {
+		head = &m_program.evaluation_keys.try_emplace({m_active_mask, m_read_policy}, UINT32_MAX)
+		            .first->second;
+	}
 	auto unused = UINT32_MAX;
-	for (auto index = key->second; index != UINT32_MAX; index = contexts[index].next_of_key) {
+	for (auto index = *head; index != UINT32_MAX; index = contexts[index].next_of_key) {
 		if (contexts[index].session == m_session) return contexts[index];
 		if (contexts[index].session == nullptr && unused == UINT32_MAX) unused = index;
 	}
@@ -1132,8 +1175,9 @@ ResourcePlan::EvaluationContext& SrtWalker::AcquireContext() {
 		auto& context       = contexts.emplace_back();
 		context.active_mask = m_active_mask;
 		context.read_policy = m_read_policy;
-		context.next_of_key = key->second;
-		key->second         = unused;
+		context.sparse      = !m_active_mask.IsEmpty();
+		context.next_of_key = *head;
+		*head               = unused;
 	}
 	auto& context              = contexts[unused];
 	context.session            = m_session;
@@ -1189,24 +1233,22 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 		return EvaluateWide(inst->Arg(1), result);
 	}
 	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
-	if (index >= m_context.values.size()) {
-		m_context.values.resize(m_program.evaluation_value_count);
-	}
-	if (m_context.values[index].generation == m_context.generation) {
-		result = m_context.values[index].value;
+	auto&      entry = m_context.Memo(index, m_program.evaluation_value_count);
+	if (entry.generation == m_context.generation) {
+		result = entry.value;
 		return true;
 	}
 	// Visiting and completed-unknown entries both stop repeated evaluation in this
 	// context. Only completed unknowns are retried when reachability becomes tighter.
-	if (m_context.values[index].generation == (m_context.generation | 1u) ||
-	    m_context.values[index].generation == (m_context.generation | 2u)) {
+	if (entry.generation == (m_context.generation | 1u) ||
+	    entry.generation == (m_context.generation | 2u)) {
 		return false;
 	}
-	m_context.values[index].generation = m_context.generation | 1u;
+	entry.generation = m_context.generation | 1u;
 	uint64_t out = 0;
 	const bool evaluated = EvaluateInst(*inst, out);
-	// Recursive evaluation may grow the dense memo vector.
-	auto& memo = m_context.values[index];
+	// Recursive evaluation may grow the memo.
+	auto& memo = m_context.Memo(index, m_program.evaluation_value_count);
 	if (!evaluated) {
 		memo.generation = m_context.generation | 2u;
 		m_context.unknowns.push_back(index);
@@ -1227,8 +1269,9 @@ void SrtWalker::ResetUnknowns() {
 		auto& context = m_program.evaluation_contexts[next];
 		next          = context.next_of_session;
 		for (const auto index: context.unknowns)
-			if (context.values[index].generation == (context.generation | 2u))
-				context.values[index].generation = 0;
+			if (auto& entry = context.Memo(index, m_program.evaluation_value_count);
+			    entry.generation == (context.generation | 2u))
+				entry.generation = context.generation | 3u;
 		context.unknowns.clear();
 	}
 }
@@ -1452,21 +1495,19 @@ bool SrtWalker::EvaluateRef(uint32_t ref, uint64_t& result) {
 	    node.args[0] == m_active_ref) {
 		return EvaluateRef(node.args[1], result);
 	}
-	if (ref >= m_context.values.size()) {
-		m_context.values.resize(m_program.evaluation_value_count);
-	}
-	if (m_context.values[ref].generation == m_context.generation) {
-		result = m_context.values[ref].value;
+	auto& entry = m_context.Memo(ref, m_program.evaluation_value_count);
+	if (entry.generation == m_context.generation) {
+		result = entry.value;
 		return true;
 	}
-	if (m_context.values[ref].generation == (m_context.generation | 1u) ||
-	    m_context.values[ref].generation == (m_context.generation | 2u)) {
+	if (entry.generation == (m_context.generation | 1u) ||
+	    entry.generation == (m_context.generation | 2u)) {
 		return false;
 	}
-	m_context.values[ref].generation = m_context.generation | 1u;
+	entry.generation = m_context.generation | 1u;
 	uint64_t   out       = 0;
 	const bool evaluated = EvaluateNode(ref, out);
-	auto&      memo      = m_context.values[ref];
+	auto&      memo      = m_context.Memo(ref, m_program.evaluation_value_count);
 	if (!evaluated) {
 		memo.generation = m_context.generation | 2u;
 		m_context.unknowns.push_back(ref);
@@ -1658,6 +1699,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
 		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
 	}
+	if (m_nodes != nullptr && m_nodes->m_flow &&
+	    (m_clean_evaluator == nullptr || m_clean_evaluator->m_nodes != nullptr)) {
+		return RefreshFlatBufferNodes(flat);
+	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
 		const auto& read = m_program.srt_reads[slot];
@@ -1747,6 +1792,80 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		for (const auto source: block.sources) active[source] = 1u;
 		for (const auto slot: block.srt_reads)
 			if (!refresh(slot)) return false;
+	}
+	return true;
+}
+
+bool SrtWalker::RefreshFlatBufferNodes(std::vector<uint32_t>& flat) {
+	const auto& nodes = *m_nodes;
+	const auto refresh = [&](uint32_t slot) {
+		const bool clean = nodes.m_read_clean[slot] != 0u;
+		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
+			return false;
+		auto&      evaluator = clean ? *m_clean_evaluator : *this;
+		const auto offset    = nodes.m_read_offsets[slot];
+		uint64_t   wide      = 0;
+		if (offset >= flat.size() || !evaluator.EvaluateRef(nodes.m_read_refs[slot], wide)) return false;
+		flat[offset] = static_cast<uint32_t>(wide);
+		return true;
+	};
+	auto&      active = m_program.active_sources;
+	const auto blocks = static_cast<uint32_t>(m_program.control_flow.size());
+	if (blocks == 0u) {
+		active.clear();
+		flat.resize(m_program.srt_reads.size());
+		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
+			if (!refresh(slot)) return false;
+		}
+		return true;
+	}
+	auto& visited   = m_program.visited_blocks;
+	auto& reachable = m_program.reachable_blocks;
+	auto& pending   = m_program.pending_blocks;
+	visited.assign(blocks, 1u);
+	ResetUnknowns();
+	m_reachable_blocks = &visited;
+	if (m_clean_evaluator != nullptr) {
+		m_clean_evaluator->ResetUnknowns();
+		m_clean_evaluator->m_reachable_blocks = &visited;
+	}
+	auto&      predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	const bool decide    = m_runtime.read_specialization_memory != nullptr ||
+	                    !m_program.capture_specialization_reads;
+	for (;;) {
+		reachable.assign(blocks, 0u);
+		pending.clear();
+		pending.push_back(0u);
+		while (!pending.empty()) {
+			const auto index = pending.back();
+			pending.pop_back();
+			if (reachable[index]) continue;
+			reachable[index] = 1u;
+			const auto* successors = nodes.m_successors.data() + nodes.m_successor_begin[index];
+			const auto  count      = nodes.m_successor_begin[index + 1u] - nodes.m_successor_begin[index];
+			const auto  condition  = nodes.m_condition_refs[index];
+			uint64_t    wide       = 0;
+			if (condition != SrtNodes::NoRef && decide && predicate.EvaluateRef(condition, wide)) {
+				pending.push_back(successors[static_cast<uint32_t>(wide) != 0u ? 0u : 1u]);
+			} else {
+				for (uint32_t edge = 0; edge < count; ++edge) pending.push_back(successors[edge]);
+			}
+		}
+		if (reachable == visited) break;
+		visited.swap(reachable);
+		if (m_program.control_phi_predecessors.empty()) break;
+		// As RefreshFlatBuffer: only unknown values need another evaluation.
+		ResetUnknowns();
+		if (m_clean_evaluator != nullptr) m_clean_evaluator->ResetUnknowns();
+	}
+	flat.assign(m_program.srt_reads.size(), 0u);
+	active = nodes.m_active_template;
+	for (uint32_t index = 0; index < blocks; ++index) {
+		if (!visited[index]) continue;
+		for (auto at = nodes.m_source_begin[index]; at < nodes.m_source_begin[index + 1u]; ++at)
+			active[nodes.m_sources[at]] = 1u;
+		for (auto at = nodes.m_block_read_begin[index]; at < nodes.m_block_read_begin[index + 1u]; ++at)
+			if (!refresh(nodes.m_block_reads[at])) return false;
 	}
 	return true;
 }

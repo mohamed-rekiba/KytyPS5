@@ -181,6 +181,19 @@ private:
 	std::vector<uint8_t>                 m_read_clean;
 	std::vector<std::array<uint32_t, 8>> m_descriptor_refs;
 	std::vector<uint32_t>                m_condition_refs;
+	// The control flow and the reads again, packed for RefreshFlatBuffer: block b's successors,
+	// sources and reads are [begin[b], begin[b + 1]) of each list. Empty when a block names a
+	// source outside the plan (the walker walks the plan's blocks then).
+	bool                                 m_flow = false;
+	std::vector<uint32_t>                m_successor_begin;
+	std::vector<uint32_t>                m_successors;
+	std::vector<uint32_t>                m_source_begin;
+	std::vector<uint32_t>                m_sources;
+	std::vector<uint32_t>                m_block_read_begin;
+	std::vector<uint32_t>                m_block_reads;
+	std::vector<uint32_t>                m_read_offsets;
+	// Per descriptor source: 1 unless a block decides it.
+	std::vector<uint8_t>                 m_active_template;
 };
 
 class SrtWalker {
@@ -195,6 +208,12 @@ public:
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+
+private:
+	// RefreshFlatBuffer over the packed flow of SrtNodes.
+	bool RefreshFlatBufferNodes(std::vector<uint32_t>& flat);
+
+public:
 
 private:
 	// `active_ref`: the mask's node reference, when the caller has it (SrtNodes::NoRef: found).
