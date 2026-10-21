@@ -3401,8 +3401,9 @@ public:
       });
     };
     const auto wait_for_interrupt =
-        [&](LibKernel::EventQueue::KernelEvent &event, int &count) {
-          LibKernel::KernelUseconds timeout = 0;
+        [&](LibKernel::EventQueue::KernelEvent &event, int &count,
+            LibKernel::KernelUseconds timeout = 0) {
+          // An expected interrupt may arrive after the GPU goes idle: it gets a timeout.
           return LibKernel::EventQueue::KernelWaitEqueue(
               interrupt_queue, &event, 1, &count, &timeout);
         };
@@ -3457,7 +3458,7 @@ public:
 
     interrupt_count = 0;
     const auto graphics_interrupt_wait =
-        wait_for_interrupt(interrupt_event, interrupt_count);
+        wait_for_interrupt(interrupt_event, interrupt_count, 2000000);
     Require("GpuCommandLane", "graphics interrupt routing",
             graphics_interrupt_wait == 0 && interrupt_count == 1 &&
                 interrupt_event.ident == 0 && interrupt_event.data == 0 &&
@@ -3483,7 +3484,7 @@ public:
 
     interrupt_count = 0;
     const auto compute_interrupt_wait =
-        wait_for_interrupt(interrupt_event, interrupt_count);
+        wait_for_interrupt(interrupt_event, interrupt_count, 2000000);
     const bool compute_interrupt_matches =
         compute_interrupt_wait == 0 && interrupt_count == 1 &&
         interrupt_event.ident == 0x20 && interrupt_event.data == 0x456u &&
@@ -3499,7 +3500,7 @@ public:
 
     interrupt_count = 0;
     const auto compute_clock_wait =
-        wait_for_interrupt(interrupt_event, interrupt_count);
+        wait_for_interrupt(interrupt_event, interrupt_count, 2000000);
     const bool compute_clock_matches =
         compute_clock_wait == 0 && interrupt_count == 1 &&
         interrupt_event.ident == 0x20 && interrupt_event.data == 0x567u &&
@@ -3517,7 +3518,7 @@ public:
 
     interrupt_count = 0;
     const auto compute_done_wait =
-        wait_for_interrupt(interrupt_event, interrupt_count);
+        wait_for_interrupt(interrupt_event, interrupt_count, 2000000);
     Require("GpuCommandLane", "CS_DONE write-confirm interrupt",
             compute_done_wait == 0 && interrupt_count == 1 &&
                 interrupt_event.ident == 0x20 && interrupt_event.data == 0x678u &&
