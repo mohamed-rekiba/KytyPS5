@@ -868,6 +868,12 @@ void WindowContext::Run() {
 	// KYTY_BENCH_LIVE=<file>: key names appended to the file, one per line, are tapped as they
 	// arrive, to steer a run from what its screenshots show.
 	const char*   live_path = std::getenv("KYTY_BENCH_LIVE");
+	// KYTY_BENCH_LIVE_HOLD_MS: how long a tap holds the key (default 150): a game that draws a
+	// frame in half a second sees nothing of a shorter one.
+	const uint64_t live_hold_ms = [] {
+		const char* value = std::getenv("KYTY_BENCH_LIVE_HOLD_MS");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {150};
+	}();
 	std::ifstream live_file;
 	std::string   live_partial;
 	std::vector<std::pair<uint64_t, std::string>> live_releases; // key ups due at a time
@@ -957,8 +963,8 @@ void WindowContext::Run() {
 						continue;
 					}
 					HostInputKey(SDL_GetKeyFromName(key.c_str()), true);
-					live_releases.emplace_back(live_now + 150, key);
-					live_next_ms = live_now + 400; // one tap at a time, as a player would
+					live_releases.emplace_back(live_now + live_hold_ms, key);
+					live_next_ms = live_now + live_hold_ms + 250; // one tap at a time, as a player would
 					break;
 				}
 			}
