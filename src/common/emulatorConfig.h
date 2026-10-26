@@ -149,6 +149,8 @@ bool     HideCursorEnabled();
 bool     VrEnabled();
 bool     AmdCpuEnabled();
 bool     IsNetworkConnected();
+// For a title whose servers the emulator answers itself (libs/fakeEa): its network is reachable.
+void     SetNetworkConnected();
 uint32_t GetVblankFrequency();
 inline constexpr uint32_t MAX_GPU_FRAMES_IN_FLIGHT = 3;
 uint32_t                  GetGpuFramesInFlight();

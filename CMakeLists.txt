@@ -209,6 +209,8 @@ add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/libs/*.cpp"
 	"${KYTY_SOURCE_DIR}/libs/*.h"
+	"${KYTY_SOURCE_DIR}/libs/fakeEa/*.cpp"
+	"${KYTY_SOURCE_DIR}/libs/fakeEa/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/*.cpp"
@@ -342,7 +344,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader MbedTLS::mbedtls MbedTLS::mbedx509 MbedTLS::mbedcrypto)
 
 # Linux system libraries.
 if(LINUX)
@@ -444,6 +446,20 @@ target_include_directories(frame_pacer_tests PRIVATE ${inc_headers})
 if(LINUX)
 	target_link_libraries(frame_pacer_tests Threads::Threads)
 endif()
+
+add_executable(fake_ea_tdf_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FakeEaTdfTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/fakeEa/fakeEaTdf.cpp"
+)
+target_include_directories(fake_ea_tdf_tests PRIVATE ${inc_headers})
+target_link_libraries(fake_ea_tdf_tests fmt::fmt)
+
+add_executable(fake_ea_patch_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FakeEaPatchPlanTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/fakeEa/fakeEaPatchPlan.cpp"
+)
+target_include_directories(fake_ea_patch_plan_tests PRIVATE ${inc_headers})
+target_link_libraries(fake_ea_patch_plan_tests fmt::fmt nlohmann_json::nlohmann_json)
 
 add_executable(pending_labels_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PendingLabelsTests.cpp"
@@ -813,6 +829,8 @@ if(BUILD_TESTING)
 	add_test(NAME guest_write_log COMMAND $<TARGET_FILE:guest_write_log_tests>)
 	add_test(NAME copy_workers COMMAND $<TARGET_FILE:copy_workers_tests>)
 	add_test(NAME frame_pacer COMMAND $<TARGET_FILE:frame_pacer_tests>)
+	add_test(NAME fake_ea_tdf COMMAND $<TARGET_FILE:fake_ea_tdf_tests>)
+	add_test(NAME fake_ea_patch_plan COMMAND $<TARGET_FILE:fake_ea_patch_plan_tests>)
 	add_test(NAME pending_labels COMMAND $<TARGET_FILE:pending_labels_tests>)
 	add_test(NAME guest_memory_window COMMAND $<TARGET_FILE:guest_memory_window_tests>)
 	add_test(NAME gpu_write_ticks COMMAND $<TARGET_FILE:gpu_write_ticks_tests>)
@@ -928,6 +946,8 @@ if(BUILD_TESTING)
 		guest_write_log_tests
 		copy_workers_tests
 		frame_pacer_tests
+		fake_ea_tdf_tests
+		fake_ea_patch_plan_tests
 		pending_labels_tests
 		guest_memory_window_tests
 		gpu_write_ticks_tests

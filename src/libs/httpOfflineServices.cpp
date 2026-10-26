@@ -1,7 +1,10 @@
 #include "libs/httpOfflineServices.h"
+#include "libs/fakeEa/fakeEaServer.h"
 
 #include "common/logging/log.h"
 
+#include <cstdlib>
+#include <string>
 #include <string_view>
 
 namespace Libs::Network::OfflineServices {
@@ -20,7 +23,35 @@ static void Json(Response& response, int status, std::string_view body) {
 	response.body = std::string(body);
 }
 
+// The Blaze server picker answers with the server of libs/fakeEa, on this machine.
+static bool FakeBlazeRedirector(const Request& request, Response& response) {
+	const auto port_number = FakeEa::Port();
+	if (port_number == 0 || request.method != "POST" ||
+	    request.host.find("blazeredirector.ea.com") == std::string::npos ||
+	    !StartsWith(request.path, "/redirector/getServerInstance")) {
+		return false;
+	}
+	const auto port = std::to_string(port_number);
+	// 127.0.0.1 with its bytes swapped: the game connects to the bytes of this integer as stored.
+	// (A real server address in this field connected to the reversed address too.)
+	response.status = 200;
+	response.headers.push_back({"Content-Type", "application/xml"});
+	response.body = std::string("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<serverinstanceinfo>\n"
+	                            "  <address member=\"0\">\n    <valu>\n"
+	                            "      <hostname>fake.blaze.ea.com</hostname>\n      <ip>16777343</ip>\n"
+	                            "      <port>") +
+	                port +
+	                "</port>\n    </valu>\n  </address>\n  <secure>1</secure>\n"
+	                "  <trialservicename></trialservicename>\n  <defaultdnsaddress>0</defaultdnsaddress>\n"
+	                "</serverinstanceinfo>\n";
+	return true;
+}
+
 bool Handle(const Request& request, Response& response) {
+	if (FakeBlazeRedirector(request, response)) {
+		return true;
+	}
+
 	if (request.host == "gcs.ea.com" && request.method == "POST" &&
 	    StartsWith(request.path, "/application_id/")) {
 		Json(response, 200, EA_DIRECTORY);

@@ -21,6 +21,9 @@
 #include "kernel/pthread.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
+#include "loader/systemContent.h"
+#include "libs/fakeEa/fakeEaPatchPlan.h"
+#include "libs/fakeEa/fakeEaServer.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/symbolDatabase.h"
@@ -1315,6 +1318,17 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
 		                      m_programs)) {
 			EXIT("Failed to apply game cheat\n");
+		}
+	} else if (GamePatch::ContainsBytes(m_programs, Libs::FakeEa::AuthorityModulus())) {
+		// A game of EA: it holds EA's authority key, and needs the built-in server (libs/fakeEa) and
+		// a patch that makes it trust that server's authority.
+		std::string title_id;
+		std::string version;
+		if (SystemContentParamSfoGetString("TITLE_ID", &title_id) &&
+		    SystemContentParamSfoGetString("APP_VER", &version) && !m_programs.empty() &&
+		    Libs::FakeEa::StartForGame(title_id)) {
+			const auto process = m_programs.front()->file_name.filename().string();
+			GamePatch::ApplyBuiltIn(Libs::FakeEa::PatchPlanJson(version, process), m_programs.front(), m_programs);
 		}
 	}
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {

@@ -145,6 +145,10 @@ bool IsNetworkConnected() {
 	return g_config->network_connected;
 }
 
+void SetNetworkConnected() {
+	g_config->network_connected = true;
+}
+
 bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
 }

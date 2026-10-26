@@ -35,6 +35,7 @@
 #include "libs/httpOfflineServices.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/fakeEa/fakeEaServer.h"
 
 #include <algorithm>
 #include <array>
@@ -1654,6 +1655,20 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 		return NET_ERROR_ENETDOWN;
 	}
 
+	// The game's own server (libs/fakeEa) runs on this machine.
+	const std::string_view blaze_suffix = ".blaze.ea.com";
+	const std::string_view host_view(hostname);
+	if (FakeEa::Port() != 0 && host_view.size() > blaze_suffix.size() &&
+	    host_view.substr(host_view.size() - blaze_suffix.size()) == blaze_suffix) {
+		const uint8_t loopback[4] = {127, 0, 0, 1};
+		std::memcpy(addr, loopback, sizeof(loopback));
+		if ((flags & resolver_flag_async) != 0) {
+			std::swap(static_cast<uint8_t*>(addr)[0], static_cast<uint8_t*>(addr)[3]);
+			std::swap(static_cast<uint8_t*>(addr)[1], static_cast<uint8_t*>(addr)[2]);
+		}
+		return OK;
+	}
+
 	addrinfo hints {};
 	hints.ai_family   = AF_INET;
 	hints.ai_socktype = SOCK_STREAM;
@@ -1678,6 +1693,12 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 		    ai->ai_addrlen >= sizeof(sockaddr_in)) {
 			const auto* in = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
 			std::memcpy(addr, &in->sin_addr, sizeof(in->sin_addr));
+			if ((flags & resolver_flag_async) != 0) {
+				// Observed with FC 27: for an asynchronous lookup the game connects to the bytes of the
+				// answer in the reverse order. Not confirmed against a console.
+				std::swap(static_cast<uint8_t*>(addr)[0], static_cast<uint8_t*>(addr)[3]);
+				std::swap(static_cast<uint8_t*>(addr)[1], static_cast<uint8_t*>(addr)[2]);
+			}
 			LOGF("\t resolved = %u.%u.%u.%u\n", static_cast<unsigned>(static_cast<const uint8_t*>(addr)[0]),
 			     static_cast<unsigned>(static_cast<const uint8_t*>(addr)[1]),
 			     static_cast<unsigned>(static_cast<const uint8_t*>(addr)[2]),
@@ -2194,6 +2215,26 @@ int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
 		LOGF("\t guest sockaddr = %02x %02x %02x %02x %02x %02x %02x %02x\n", raw[0], raw[1], raw[2],
 		     raw[3], raw[4], raw[5], raw[6], raw[7]);
 	}
+
+#if !defined(_WIN32)
+	// The server of libs/fakeEa has no port: the game's socket becomes one end of a pair of
+	// connected sockets, and the server has the other end. dup2 keeps the number of the socket, so
+	// every later call (select, epoll, send, recv, close) works as for any other socket.
+	if (host_addr.ss_family == AF_INET && FakeEa::Port() != 0) {
+		const auto* in = reinterpret_cast<const sockaddr_in*>(&host_addr);
+		if (ntohs(in->sin_port) == FakeEa::Port() && ntohl(in->sin_addr.s_addr) == INADDR_LOOPBACK) {
+			const int pair_end = FakeEa::OpenConnection();
+			if (pair_end >= 0) {
+				if ((fcntl(socket, F_GETFL) & O_NONBLOCK) != 0) fcntl(pair_end, F_SETFL, fcntl(pair_end, F_GETFL) | O_NONBLOCK);
+				const int replaced = dup2(pair_end, socket);
+				::close(pair_end);
+				if (replaced < 0) return SetHostSocketError();
+				LOGF("\t connected to the server of libs/fakeEa without a port\n");
+				return 0;
+			}
+		}
+	}
+#endif
 
 	if (::connect(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) != 0) {
 		const int result = SetHostSocketError();
@@ -4248,7 +4289,7 @@ constexpr uint32_t np_state_signed_in                   = 2;
 
 // EXPERIMENT: KYTY_PSN_SIGNED_IN=1 makes the local user look signed in to the network.
 static bool NpFakeSignedIn() {
-	static const bool enabled = std::getenv("KYTY_PSN_SIGNED_IN") != nullptr;
+	static const bool enabled = std::getenv("KYTY_PSN_SIGNED_IN") != nullptr || FakeEa::SignedInForTitle();
 	return enabled;
 }
 
