@@ -600,6 +600,26 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto vk_buffer = buffer.Handle();
 	vk::Buffer indirect_buffer = args_buffer->Handle();
 	uint64_t   indirect_offset = args_offset;
+	if (!use_thread_dimensions) {
+		// The host GPU reads the group counts when the dispatch runs; they can be other data then
+		// (FC 27: billions of groups hung the GPU and the desktop). A dispatch of more groups
+		// than any game asks for is dropped, on the GPU.
+		constexpr float MaxIndirectGroups = 16777216.0f;
+		auto&           stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+		const auto      align  = m_context.GetGraphics().StorageMinAlignment();
+		const std::array<uint32_t, 3> zero {};
+		const ThreadDimensionDispatch::Target safe {
+		    stream.Handle(), stream.Copy(zero.data(), sizeof(zero), align), sizeof(zero)};
+		const ThreadDimensionDispatch::Target spare {
+		    stream.Handle(), stream.Copy(zero.data(), sizeof(zero), align), sizeof(zero)};
+		if (m_thread_dimensions == nullptr) {
+			m_thread_dimensions = std::make_unique<ThreadDimensionDispatch>(m_context.GetGraphics());
+		}
+		m_thread_dimensions->RecordLimited(vk_buffer, indirect_buffer, indirect_offset, safe, spare,
+		                                   MaxIndirectGroups);
+		indirect_buffer = safe.buffer;
+		indirect_offset = safe.offset;
+	}
 	if (use_thread_dimensions) {
 		const auto& layout = program.bindings;
 		EXIT_IF(layout.UsesPushData() ||
