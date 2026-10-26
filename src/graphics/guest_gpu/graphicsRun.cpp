@@ -962,12 +962,20 @@ static bool KeepsWorkPending(const uint32_t* packet) {
 		// Queued behind the pending work (CommandProcessor::DmaData).
 		case Pm4::IT_DMA_DATA:
 		case Pm4::IT_DISPATCH_DIRECT:
-		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return true;
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE:
+		// Cache actions: the handler does nothing (CpOpAcquireMem).
+		case Pm4::IT_ACQUIRE_MEM: return true;
 		// Flushes and cache writebacks order nothing the renderer does not (TriggerEvent); an
 		// occlusion counter dump writes memory.
 		case Pm4::IT_EVENT_WRITE: return (packet[1] & 0x3fu) != 0x39u;
 		case Pm4::IT_NOP: {
 			// Padding and the user data markers; other markers flip or write memory.
+			// Debug markers only log (CpOpPushMarker, CpOpPopMarker); a context state operation
+			// changes the registers the queued work already copied.
+			if (const auto r = KYTY_PM4_R(header);
+			    r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER || r == Pm4::R_CONTEXT_STATE) {
+				return true;
+			}
 			if (KYTY_PM4_R(header) != Pm4::R_ZERO) return false;
 			const auto word = packet[1];
 			return (word & 0xffff0000u) != 0x68750000u || word == 0x68750004u ||

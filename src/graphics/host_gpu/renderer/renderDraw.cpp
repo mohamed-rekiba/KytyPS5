@@ -465,6 +465,19 @@ struct DrawRenderState {
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
 	PipelineCache::StageResources*  resources = nullptr; // where the lookups put the resources
+
+	// The state of a new draw, in the same object. The color targets are left as they are (more
+	// than half of the object): each is reset when it is resolved, and only the first
+	// `color_count` are read.
+	void Reset() {
+		depth_info   = {};
+		color_count  = 0;
+		ps_active    = true;
+		vertex_info  = {};
+		ps_input_info = {};
+		programs     = {};
+		resources    = nullptr;
+	}
 };
 
 struct DrawCallInfo {
@@ -484,7 +497,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 	feedback_aspects = {};
 	auto&       cache = m_context.GetTextureCache();
-	RenderState state {};
+	// One lock for the target lookups: each call below finds it held.
+	std::scoped_lock hold {cache.m_lock};
+	RenderState      state {};
 	state.width                 = std::numeric_limits<uint32_t>::max();
 	state.height                = std::numeric_limits<uint32_t>::max();
 	state.num_layers            = std::numeric_limits<uint32_t>::max();
@@ -2017,7 +2032,7 @@ void RenderExecutor::PipelineDrawIndex(uint64_t submit_id, CommandBuffer& buffer
 	next.topology          = topology;
 	next.index_source      = index_source;
 	next.primitive_restart = primitive_restart;
-	next.state             = {};
+	next.state.Reset();
 	next.state.resources   = &next.resources;
 	next.color_output_mask = PrepareDrawShaderState(next.registers, next.shaders, next.state);
 	QueuePendingWork(buffer, next);
@@ -2031,7 +2046,7 @@ void RenderExecutor::PipelineDrawAuto(uint64_t submit_id, CommandBuffer& buffer,
 	next.auto_args         = args;
 	next.draw              = draw;
 	next.topology          = topology;
-	next.state             = {};
+	next.state.Reset();
 	next.state.resources   = &next.resources;
 	next.color_output_mask = PrepareDrawShaderState(next.registers, next.shaders, next.state);
 	QueuePendingWork(buffer, next);
