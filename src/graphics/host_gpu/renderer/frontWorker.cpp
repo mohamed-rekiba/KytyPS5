@@ -2,7 +2,10 @@
 
 #include "common/assert.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <pthread.h>
@@ -49,11 +52,22 @@ void NoteFrontRead(uint64_t vaddr, uint64_t size) {
 	t_reads->push_back({vaddr, size});
 }
 
-FrontWorker::FrontWorker()
-    : m_thread([this](const std::stop_token& stop) { Run(stop); }) {}
+FrontWorker::FrontWorker() {
+	static const uint32_t count = [] {
+		const char* value  = std::getenv("KYTY_FRONT_WORKERS");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 2ul;
+		return static_cast<uint32_t>(std::clamp<unsigned long>(parsed, 1ul, 4ul));
+	}();
+	m_count = count;
+	for (uint32_t i = 0; i < m_count; i++) {
+		m_threads.emplace_back([this, i](const std::stop_token& stop) { Run(stop, i); });
+	}
+}
 
 FrontWorker::~FrontWorker() {
-	m_thread.request_stop();
+	for (auto& thread: m_threads) {
+		thread.request_stop();
+	}
 	{
 		std::lock_guard lock(m_mutex);
 		m_wake.notify_all();
@@ -62,54 +76,60 @@ FrontWorker::~FrontWorker() {
 
 uint64_t FrontWorker::Start(std::function<void()> job) {
 	const auto ticket = m_started.load(std::memory_order_relaxed);
-	EXIT_IF(ticket - m_done.load(std::memory_order_acquire) >= Capacity);
-	m_slots[ticket % Capacity].job = std::move(job);
+	auto&      slot   = m_slots[ticket % Capacity];
+	// The job Capacity tickets before has finished: its worker is done with the slot.
+	EXIT_IF(ticket >= Capacity && slot.finished.load(std::memory_order_acquire) != ticket - Capacity + 1);
+	slot.job = std::move(job);
 	m_started.store(ticket + 1, std::memory_order_seq_cst);
-	if (m_sleeping.load(std::memory_order_seq_cst)) {
+	if (m_sleeping.load(std::memory_order_seq_cst) != 0) {
 		std::lock_guard lock(m_mutex);
-		m_wake.notify_one();
+		m_wake.notify_all();
 	}
 	return ticket;
 }
 
 bool FrontWorker::Wait(uint64_t ticket, const std::function<void()>& service) {
 	EXIT_IF(ticket >= m_started.load(std::memory_order_relaxed));
-	if (m_done.load(std::memory_order_acquire) <= ticket) {
+	auto& slot = m_slots[ticket % Capacity];
+	if (slot.finished.load(std::memory_order_acquire) != ticket + 1) {
 		const auto start = std::chrono::steady_clock::now();
-		for (uint32_t spins = 0; m_done.load(std::memory_order_acquire) <= ticket; spins++) {
+		for (uint32_t spins = 0; slot.finished.load(std::memory_order_acquire) != ticket + 1; spins++) {
 			Pause();
 			if ((spins & 255u) == 255u && std::chrono::steady_clock::now() - start > ServiceAfter) {
 				service();
 			}
 		}
 	}
-	return m_slots[ticket % Capacity].aborted;
+	return slot.aborted;
 }
 
 void FrontWorker::WaitIdle(const std::function<void()>& service) {
 	const auto started = m_started.load(std::memory_order_relaxed);
-	if (started != 0) {
-		(void)Wait(started - 1, service);
+	// The last jobs of every thread.
+	for (uint64_t ticket = started > m_count ? started - m_count : 0; ticket < started; ticket++) {
+		(void)Wait(ticket, service);
 	}
 }
 
-void FrontWorker::Run(const std::stop_token& stop) {
+void FrontWorker::Run(const std::stop_token& stop, uint32_t index) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	pthread_setname_np(pthread_self(), "GpuFront");
+	char name[16];
+	std::snprintf(name, sizeof(name), index == 0 ? "GpuFront" : "GpuFront%u", index);
+	pthread_setname_np(pthread_self(), name);
 #endif
-	uint64_t next = 0;
+	uint64_t next = index;
 	while (!stop.stop_requested()) {
 		const auto spin_start = std::chrono::steady_clock::now();
-		for (uint32_t spins = 0; m_started.load(std::memory_order_acquire) == next; spins++) {
+		for (uint32_t spins = 0; m_started.load(std::memory_order_acquire) <= next; spins++) {
 			Pause();
 			if ((spins & 1023u) == 1023u &&
 			    std::chrono::steady_clock::now() - spin_start > WorkerSpin) {
 				std::unique_lock lock(m_mutex);
-				m_sleeping.store(true, std::memory_order_seq_cst);
+				m_sleeping.fetch_add(1, std::memory_order_seq_cst);
 				m_wake.wait(lock, stop, [this, next] {
-					return m_started.load(std::memory_order_seq_cst) != next;
+					return m_started.load(std::memory_order_seq_cst) > next;
 				});
-				m_sleeping.store(false, std::memory_order_relaxed);
+				m_sleeping.fetch_sub(1, std::memory_order_relaxed);
 				break;
 			}
 		}
@@ -126,7 +146,9 @@ void FrontWorker::Run(const std::stop_token& stop) {
 		t_reads      = nullptr;
 		t_in_job     = false;
 		slot.aborted = t_aborted;
-		m_done.store(++next, std::memory_order_release);
+		slot.finished.store(next + 1, std::memory_order_release);
+		m_done_count.fetch_add(1, std::memory_order_release);
+		next += m_count;
 	}
 }
 

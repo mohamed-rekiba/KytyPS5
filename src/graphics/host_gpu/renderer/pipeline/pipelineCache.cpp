@@ -271,6 +271,36 @@ struct PipelineCache::ProgramCache {
 		uint64_t identity = 0;
 	};
 
+	// A spin lock for microseconds; a copy is a new, free lock (a map entry is built in place).
+	struct PlanLock {
+		PlanLock() = default;
+		PlanLock(const PlanLock&) noexcept {}
+		PlanLock& operator=(const PlanLock&) noexcept { return *this; }
+		void lock() noexcept {
+			while (m_flag.test_and_set(std::memory_order_acquire)) {
+				while (m_flag.test(std::memory_order_relaxed)) {
+#if defined(__x86_64__)
+					__builtin_ia32_pause();
+#endif
+				}
+			}
+		}
+		void unlock() noexcept { m_flag.clear(std::memory_order_release); }
+
+	private:
+		std::atomic_flag m_flag;
+	};
+
+	// The key of a lookup on a front worker thread.
+	static ProgramKey& FrontKey() {
+		thread_local ProgramKey key = [] {
+			ProgramKey made;
+			made.static_state.reserve(MaxStaticKeyWords);
+			return made;
+		}();
+		return key;
+	}
+
 	struct SourceEntry {
 		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
 		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
@@ -286,6 +316,9 @@ struct PipelineCache::ProgramCache {
 			return table ? std::span<const uint32_t>(linked.observed_function)
 			           : std::span<const uint32_t>(linked.code).subspan(call_source->code.size());
 		}
+
+		// Held while a lookup writes `specialization`, the plan's walk state or `resources`.
+		mutable PlanLock lock;
 
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
 			const auto revision = call_source->revision;
@@ -483,6 +516,8 @@ struct PipelineCache::ProgramCache {
 		}
 
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
+		// A front worker thread builds its own key.
+		ProgramKey& lookup_key = InFrontJob() ? FrontKey() : this->lookup_key;
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -510,6 +545,9 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
 			if (cached.skip_dispatch) return {};
+			// Front worker threads look up the same program at once: a lookup writes the program's
+			// specialization and walk state.
+			std::lock_guard plan_lock(cached.lock);
 			auto&        snapshot    = storage != nullptr ? *storage : cached.resources;
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
@@ -570,11 +608,13 @@ struct PipelineCache::ProgramCache {
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			auto& snapshot = storage != nullptr ? *storage : entry->second.resources;
+			std::unique_lock plan_lock(entry->second.lock);
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor, snapshot)) {
 				input_info.stage = {.program = &permutation->program, .resources = &snapshot};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
+			plan_lock.unlock();
 		}
 		auto compiled = CompileChecked(stage_name, options, std::move(translated),
 		                               entry->second.specialization, push_data_cursor);

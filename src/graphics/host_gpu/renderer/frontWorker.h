@@ -35,6 +35,7 @@ public:
 	// Jobs started and not yet claimed by the GPU thread (Wait) at once, at most.
 	static constexpr uint32_t Capacity = 8;
 
+	// KYTY_FRONT_WORKERS threads (default 2) run the jobs: job N goes to thread N % count.
 	FrontWorker();
 	~FrontWorker();
 	KYTY_CLASS_NO_COPY(FrontWorker);
@@ -48,7 +49,8 @@ public:
 	// GPU thread. Waits for every job started.
 	void WaitIdle(const std::function<void()>& service);
 	[[nodiscard]] bool Idle() const noexcept {
-		return m_done.load(std::memory_order_acquire) == m_started.load(std::memory_order_relaxed);
+		return m_done_count.load(std::memory_order_acquire) ==
+		       m_started.load(std::memory_order_relaxed);
 	}
 	// GPU thread, after Wait and before the ticket Capacity later starts: what the job read where
 	// the GPU may write.
@@ -60,19 +62,22 @@ private:
 	struct Slot {
 		std::function<void()>  job;
 		bool                   aborted = false;
+		// The ticket plus one of the last job that finished here.
+		std::atomic<uint64_t>  finished {0};
 		std::vector<FrontRead> reads;
 	};
 
-	void Run(const std::stop_token& stop);
+	void Run(const std::stop_token& stop, uint32_t index);
 
 	std::array<Slot, Capacity>  m_slots;
-	// Tickets: m_started written by the GPU thread, m_done by the worker.
+	// Tickets: m_started written by the GPU thread; m_done_count counts the jobs finished.
 	std::atomic<uint64_t>       m_started {0};
-	std::atomic<uint64_t>       m_done {0};
-	std::atomic<bool>           m_sleeping {false};
+	std::atomic<uint64_t>       m_done_count {0};
+	std::atomic<uint32_t>       m_sleeping {0};
 	std::mutex                  m_mutex;
 	std::condition_variable_any m_wake;
-	std::jthread                m_thread;
+	uint32_t                    m_count = 1;
+	std::vector<std::jthread>   m_threads;
 };
 
 // On the front worker thread, inside a job.
