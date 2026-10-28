@@ -30,6 +30,8 @@ names=(
 	depth_snapshot_plan
 	device_suitability
 	event_queue_lifetime
+	fake_ea_patch_plan
+	fake_ea_tdf
 	fence_retirement
 	file_lock
 	frame_pacer

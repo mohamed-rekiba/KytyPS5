@@ -255,7 +255,7 @@ struct TextureCacheTestAccess {
            fill->second.consumed.empty();
   }
 
-  static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
+  static std::unique_lock<RecursiveTrackingLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
   }
 
