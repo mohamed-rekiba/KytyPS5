@@ -37,9 +37,17 @@
 #include <winsock2.h>
 #else
 #include <cerrno>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
+
+#if defined(__APPLE__)
+// macOS has no MSG_NOSIGNAL (SO_NOSIGPIPE is set on the socket instead) and no SOCK_CLOEXEC.
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 #endif
 
 #include "libs/fakeEa/fakeEaPreAuth.inc"
@@ -537,7 +545,16 @@ int OpenConnection() {
 #else
 	if (g_state == nullptr) return -1;
 	int ends[2] = {-1, -1};
+#if defined(__APPLE__)
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, ends) != 0) return -1;
+	for (const int fd: ends) {
+		const int on = 1;
+		fcntl(fd, F_SETFD, FD_CLOEXEC);
+		setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+	}
+#else
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ends) != 0) return -1;
+#endif
 	mbedtls_net_context client;
 	mbedtls_net_init(&client);
 	client.fd = ends[1];
