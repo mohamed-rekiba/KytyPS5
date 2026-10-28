@@ -115,7 +115,11 @@ void FrontWorker::Run(const std::stop_token& stop, uint32_t index) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	char name[16];
 	std::snprintf(name, sizeof(name), index == 0 ? "GpuFront" : "GpuFront%u", index);
+#if defined(__APPLE__)
+	pthread_setname_np(name);
+#else
 	pthread_setname_np(pthread_self(), name);
+#endif
 #endif
 	uint64_t next = index;
 	while (!stop.stop_requested()) {
