@@ -8,6 +8,7 @@
 namespace {
 
 using Libs::Graphics::PublishedPages;
+using Libs::Graphics::ReadsBackStorageWrite;
 using Libs::Graphics::ReadsBackToGuest;
 
 void Check(bool condition, const char *text) {
@@ -80,11 +81,23 @@ void TestTrackedEndPagesArePublished() {
         "an image of whole pages lost a page");
 }
 
+// A linear storage image the CPU wrote is copied back after the GPU writes it,
+// with or without the setting; a tiled one only with it.
+void TestLinearStorageWritesAreReadBack() {
+  Check(ReadsBackStorageWrite(false, false),
+        "a linear storage write was not read back by default");
+  Check(!ReadsBackStorageWrite(true, false),
+        "a tiled storage write was read back without the setting");
+  Check(ReadsBackStorageWrite(true, true),
+        "a tiled storage write was not read back with the setting");
+}
+
 int main() {
   TestTinyImagesAreReadBack();
   TestTinyArraysAndVolumesAreNotReadBack();
   TestLargerImagesFollowTheSetting();
   TestTrackedEndPagesArePublished();
+  TestLinearStorageWritesAreReadBack();
   std::puts("ImageReadbackTests: passed");
   return 0;
 }

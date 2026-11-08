@@ -36,6 +36,16 @@ struct ReadbackImage {
 	return tiny || (readback_linear_images && !image.tiled);
 }
 
+// Whether a compute shader's write to a storage image is copied back when the CPU wrote the image
+// since the GPU last did: a game can write a sentinel into a result and poll until the GPU
+// replaces it. A linear image always is: the CPU reads linear results, and a tiled storage image
+// is written back so often in some games that it costs frames, so it waits for
+// --readback-storage-images.
+[[nodiscard]] constexpr bool ReadsBackStorageWrite(bool tiled,
+                                                   bool readback_storage_images) noexcept {
+	return readback_storage_images || !tiled;
+}
+
 // The bytes of a downloaded image [begin, end) that are written to guest memory. Pages the image
 // fills are always written. A page at either end that the image shares with other data is written
 // only while the image still tracks it, [tracked_begin, tracked_end): the image stops tracking an

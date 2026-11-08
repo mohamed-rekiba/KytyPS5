@@ -1896,7 +1896,8 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageInfo& info,
 	// in the buffer cache over the whole image is not a CPU write. Read before RefreshImage
 	// uploads the CPU write.
 	const bool first_write =
-	    m_readback_storage_images && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
+	    ReadsBackStorageWrite(image.info.IsTiled(), m_readback_storage_images) &&
+	    (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
 	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
 	if (type == BindingType::Storage) {
 		image.NoteContentWrite();
