@@ -23,6 +23,11 @@ public:
 	KYTY_CLASS_NO_COPY(BlitHelper);
 
 	void ReinterpretColorAsMsDepth(Image& source, Image& destination);
+	// Copies sample `sample` of layer `source_layer` of a multisampled depth image into `rect` of
+	// a single-sample R32 float color image, at `destination_level` and `destination_layer`.
+	void CopyDepthSampleToColor(Image& source, uint32_t source_layer, Image& destination,
+	                            uint32_t destination_level, uint32_t destination_layer,
+	                            uint32_t sample, const vk::Rect2D& rect);
 
 private:
 	struct PipelineKey {
@@ -38,6 +43,7 @@ private:
 	};
 
 	[[nodiscard]] vk::Pipeline GetPipeline(PipelineKey key);
+	[[nodiscard]] vk::Pipeline GetDepthSamplePipeline();
 
 	GraphicContext&         m_graphics;
 	CommandScheduler&       m_scheduler;
@@ -46,6 +52,9 @@ private:
 	vk::ShaderModule        m_vertex_shader     = nullptr;
 	vk::ShaderModule        m_fragment_shader   = nullptr;
 	std::vector<Pipeline>   m_pipelines;
+	vk::PipelineLayout      m_depth_sample_layout   = nullptr;
+	vk::ShaderModule        m_depth_sample_shader   = nullptr;
+	vk::Pipeline            m_depth_sample_pipeline = nullptr;
 };
 
 } // namespace Libs::Graphics
