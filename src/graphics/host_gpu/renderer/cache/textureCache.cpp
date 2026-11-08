@@ -644,7 +644,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
 	}
 	if (source.IsGpuModified()) {
-		destination.MarkGpuModified();
+		destination.MarkGpuModifiedFrom(source);
 	}
 	destination.ClearBufferModified();
 }
@@ -663,7 +663,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 	destination.CopyMip(source, mip, layer);
 	if (source.IsGpuModified()) {
-		destination.MarkGpuModified();
+		destination.MarkGpuModifiedFrom(source);
 	}
 }
 
@@ -869,8 +869,16 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
-		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
-		CopyImage(merged_id, cached_id);
+		auto& merged = m_slot_images[merged_id];
+		merged.binding.is_target |= cached.binding.is_target;
+		// Dynamic resolution can step down and back within a frame: the GPU then renders into
+		// the merged image after the cached one was made. Only a later GPU write in the cached
+		// image is worth the copy. Without one, the copy put guest memory or older contents over
+		// what the GPU had just rendered (a washed-out frame when the image is depth).
+		if (cached.SafeToDownload() &&
+		    (!merged.IsGpuModified() || cached.GpuWriteOrder() > merged.GpuWriteOrder())) {
+			CopyImage(merged_id, cached_id);
+		}
 		FreeImage(cached_id);
 		return {merged_id};
 	}

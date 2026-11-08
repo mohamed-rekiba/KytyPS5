@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <algorithm>
 #include <atomic>
 #include <compare>
 #include <limits>
@@ -99,7 +100,18 @@ public:
 	[[nodiscard]] uint64_t ContentGeneration() const noexcept { return m_content_generation; }
 	void                   NoteContentWrite() noexcept { m_content_generation++; }
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
+	void                   MarkGpuModified() noexcept {
+		m_gpu_modified    = true;
+		m_gpu_write_order = NextGpuWriteOrder();
+	}
+	// A copy from source holds no write later than source's last one.
+	void MarkGpuModifiedFrom(const Image& source) noexcept {
+		m_gpu_modified    = true;
+		m_gpu_write_order = std::max(m_gpu_write_order, source.m_gpu_write_order);
+	}
+	// The place of the image's last GPU write in the order of the GPU writes to all images.
+	// Of two images that hold the same memory, the larger value holds the later contents.
+	[[nodiscard]] uint64_t GpuWriteOrder() const noexcept { return m_gpu_write_order; }
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
@@ -166,6 +178,10 @@ public:
 	std::atomic<uint32_t> heap_refs {0};
 
 private:
+	static inline std::atomic<uint64_t> gpu_writes {0};
+	[[nodiscard]] static uint64_t       NextGpuWriteOrder() noexcept {
+		return gpu_writes.fetch_add(1, std::memory_order_relaxed) + 1;
+	}
 	friend struct ImageTestAccess;
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
@@ -180,6 +196,7 @@ private:
 	bool              m_cpu_dirty       = false;
 	bool              m_maybe_cpu_dirty = false;
 	bool              m_gpu_modified    = false;
+	uint64_t          m_gpu_write_order    = 0;
 	uint64_t          m_content_generation = 0;
 	bool              m_buffer_modified = false;
 };

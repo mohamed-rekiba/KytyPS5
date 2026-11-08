@@ -8616,6 +8616,106 @@ public:
       }
 
       {
+        // Dynamic resolution steps down and back in one frame. The step down
+        // gets a depth image of its own. The GPU then renders depth at the
+        // first extent, and a lookup there finds both images. When the narrower
+        // one holds only guest memory, it must not replace what the GPU
+        // rendered (a washed-out frame: the passes that test against this depth
+        // drew nothing). When the GPU wrote it later, its depth is the one to
+        // keep.
+        constexpr float guest_depth = 0.75f, rendered = 0.25f, later = 0.5f;
+        const auto step_down_and_back = [&](uint64_t offset, bool later_write) {
+          constexpr uint32_t pitch = 256, rows = 228;
+          std::fill_n(reinterpret_cast<float *>(memory + offset),
+                      uint64_t{pitch} * rows, guest_depth);
+          // Each extent has a guest size of its own, as a tiled target does.
+          const auto make = [&](uint32_t width, uint32_t height) {
+            const uint64_t size = uint64_t{pitch} * height * sizeof(float);
+            auto desc = MakeLinearDesc(
+                base + offset, size, vk::Format::eD32Sfloat,
+                Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+                {width, height, 1}, 1, sizeof(float), 1);
+            desc.type = BindingType::DepthTarget;
+            desc.info.pitch = pitch;
+            desc.info.linear_slice_stride = size;
+            desc.info.mip_layout[0].pitch = pitch;
+            desc.info.mip_layout[0].height = height;
+            desc.info.mip_layout[0].linear_pitch = pitch;
+            desc.info.mip_layout[0].linear_size = size;
+            desc.view_info.format = vk::Format::eD32Sfloat;
+            desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+            desc.view_info.usage =
+                vk::ImageUsageFlagBits::eDepthStencilAttachment;
+            return desc;
+          };
+          const auto clear_depth = [&](ImageId id, ImageDesc &desc,
+                                       float value) {
+            (void)texture_cache.FindDepthTarget(id, desc);
+            vk::ClearValue clear{};
+            clear.depthStencil.depth = value;
+            TextureCacheTestAccess::ClearImage(
+                texture_cache, scheduler.Current(), id,
+                {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, clear);
+          };
+          // The first image is bound only after the step down: an image the
+          // GPU wrote is resized to the new extent instead.
+          auto first = make(204, 228);
+          const auto first_id = texture_cache.FindImage(first);
+          auto stepped = make(200, 226);
+          const auto stepped_id = texture_cache.FindImage(stepped);
+          Require(
+              name, "stepped-down depth owner",
+              stepped_id && stepped_id != first_id &&
+                  texture_cache.GetImage(first_id).info.extent ==
+                      vk::Extent3D{204, 228, 1},
+              "fixture: the step down did not get a depth image of its own");
+          clear_depth(first_id, first, rendered);
+          if (later_write) {
+            clear_depth(stepped_id, stepped, later);
+          }
+          // A request whose guest span is not the first image's (as with a
+          // target that also holds its stencil or metadata) looks through
+          // every image at the address instead of taking the first one.
+          auto back = make(204, 228);
+          back.info.data.size += 0x10000;
+          const auto back_id = texture_cache.FindImage(back);
+          (void)texture_cache.FindDepthTarget(back_id, back);
+          Require(name, "stepped-back depth owner",
+                  back_id && texture_cache.GetImage(back_id).info.extent ==
+                                 vk::Extent3D{204, 228, 1},
+                  "a depth target back at its first extent did not get an "
+                  "image of that extent");
+          auto readback = CreateHostBuffer(
+              name, sizeof(float), vk::BufferUsageFlagBits::eTransferDst,
+              std::vector<u32>(1));
+          vk::BufferImageCopy probe{};
+          probe.imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1};
+          probe.imageOffset = vk::Offset3D{0, 0, 0};
+          probe.imageExtent = {1, 1, 1};
+          texture_cache.GetImage(back_id).Download(
+              std::span(&probe, 1), readback.buffer, 0, readback.size);
+          HostReadBarrier(readback.buffer, readback.size,
+                          vk::PipelineStageFlagBits::eTransfer,
+                          vk::AccessFlagBits::eTransferWrite);
+          scheduler.Finish();
+          const u32 bits = ReadBuffer(name, readback, 1)[0];
+          float depth = 0.0f;
+          std::memcpy(&depth, &bits, sizeof(depth));
+          Require(name, "stepped-back depth contents",
+                  depth == (later_write ? later : rendered),
+                  std::string(later_write
+                                  ? "a later GPU write at the narrower extent "
+                                    "was not kept"
+                                  : "a depth target back at its first extent "
+                                    "lost what the GPU rendered") +
+                      " (depth " + std::to_string(depth) + ")");
+          DestroyBuffer(&readback);
+        };
+        step_down_and_back(0x2b00000, false);
+        step_down_and_back(0x2b60000, true);
+      }
+
+      {
         constexpr uint64_t tiled_array_offset = 0x2c00000;
         constexpr uint32_t tiled_levels = 5, tiled_layers = 6;
         TileSurfaceLayout surface{};
