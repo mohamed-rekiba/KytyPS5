@@ -726,6 +726,55 @@ struct PipelineCacheTestAccess {
     cache.StoreLayout(key, layout);
   }
 
+  // A program whose GPU-selected callees switch between two sets of code takes
+  // back the resource plan made for each set, instead of translating again.
+  static void CheckCallPlansAreKept() {
+    const auto fail = [](const char *text) {
+      std::fprintf(stderr, "CheckCallPlansAreKept: %s\n", text);
+      std::abort();
+    };
+    PipelineCache::Program program;
+    program.call_source = std::make_unique<ShaderRecompiler::ShaderSource>();
+    auto &source = *program.call_source;
+    source.code = {1, 2};
+    source.linked = ShaderRecompiler::ShaderSource::Linked{};
+    source.linked->code = {1, 2, 10, 11};
+    source.reads = {{0x1000, 8}};
+    program.plan_code = {10, 11};
+    program.resource_plan.shader_hash = 0xA;
+
+    source.linked->code = {1, 2, 20, 21};
+    if (program.TakeCallPlan())
+      fail("new callee code found a plan");
+    if (program.call_plans.size() != 1 ||
+        program.call_plans[0].plan.shader_hash != 0xA)
+      fail("the plan of the earlier callees was not kept");
+    // A translation makes the plan for the new callees.
+    program.resource_plan.shader_hash = 0xB;
+    program.plan_code = {20, 21};
+
+    source.linked->code = {1, 2, 10, 11};
+    source.reads = {{0x2000, 8}};
+    if (!program.TakeCallPlan())
+      fail("earlier callee code found no plan");
+    if (program.resource_plan.shader_hash != 0xA ||
+        program.plan_code != std::vector<uint32_t>{10, 11})
+      fail("the wrong plan was taken back");
+    if (program.resource_plan.source_reads != source.reads)
+      fail("a taken plan kept stale source reads");
+    if (program.call_plans.size() != 1 ||
+        program.call_plans[0].plan.shader_hash != 0xB)
+      fail("the plan of the callees left was not kept");
+
+    for (uint32_t i = 0; i < 2 * PipelineCache::Program::MaxCallPlans; i++) {
+      source.linked->code = {1, 2, 100 + i};
+      (void)program.TakeCallPlan();
+      program.plan_code = {100 + i};
+    }
+    if (program.call_plans.size() > PipelineCache::Program::MaxCallPlans)
+      fail("call plans grew without bound");
+  }
+
   // Holds the store thread until Save(), which destroying the cache also calls.
   static void HoldStoreUntilExit(PipelineCache &cache) {
     cache.m_store.Post([stop = cache.m_store.m_thread.get_stop_token()] {
@@ -57881,6 +57930,7 @@ int RunSelectedCases(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  PipelineCacheTestAccess::CheckCallPlansAreKept();
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMulHi24(32));

@@ -225,9 +225,22 @@ private:
 		bool                                         skip_dispatch = false;
 		// Translated in this boot (not only loaded from the shader store).
 		bool translated = false;
+		// A program with GPU-selected calls: the callee code `resource_plan` was made for, and
+		// the plans of the callee code it had before. A game can switch between a few sets of
+		// callees, and a translation to remake the plan takes many milliseconds.
+		struct CallPlan {
+			std::vector<uint32_t>              code;
+			ShaderRecompiler::IR::ResourcePlan plan;
+		};
+		static constexpr size_t MaxCallPlans = 8;
+		std::vector<uint32_t>   plan_code;
+		std::vector<CallPlan>   call_plans;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
+		// After the callee code changed: keeps the current plan for its code, and takes back the
+		// plan made earlier for the new code. False when there is none: a translation makes it.
+		bool TakeCallPlan();
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                         uint32_t                                push_data_cursor);
