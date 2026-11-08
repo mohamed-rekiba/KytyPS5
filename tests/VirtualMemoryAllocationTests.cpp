@@ -2536,6 +2536,49 @@ void TestDirectMapValidationBeforeOwnerMutation() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// A direct map into a reservation or into free space maps its range for the GPU
+// and unmaps nothing: such a span holds no GPU state, and each unmap waits for
+// the GPU thread.
+void TestFreshDirectMapsUnmapNothing() {
+  using namespace Libs::LibKernel::Memory;
+  const char *test = "FreshDirectMapsUnmapNothing";
+  constexpr uint64_t page = SceKernelPageSize;
+  int64_t physical = -1;
+  CheckOk(test,
+          KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), 2 * page,
+                                     page, SceKernelMtypeC, &physical),
+          "KernelAllocateDirectMemory");
+  void *reserve = nullptr;
+  CheckOk(test, KernelReserveVirtualRange(&reserve, page, 0, page),
+          "KernelReserveVirtualRange");
+  const auto base = reinterpret_cast<uint64_t>(reserve);
+  g_gpu_range_events.clear();
+  TestSetGpuRangeCallback(ObserveGpuRange);
+  void *fixed = reserve;
+  CheckOk(test,
+          KernelMapDirectMemory(&fixed, page, SceKernelProtCpuRw,
+                                SceKernelMapFixed, physical, page),
+          "map into a reservation");
+  void *anywhere = nullptr;
+  CheckOk(test,
+          KernelMapDirectMemory(&anywhere, page, SceKernelProtCpuRw, 0,
+                                physical + page, page),
+          "map into free space");
+  TestSetGpuRangeCallback(nullptr);
+  const auto free_base = reinterpret_cast<uint64_t>(anywhere);
+  Check(test,
+        g_gpu_range_events ==
+            std::vector<GpuRangeEvent>{{true, base, page},
+                                       {true, free_base, page}},
+        "a direct map into a reservation or free space unmapped its range from "
+        "the GPU");
+  CheckOk(test, KernelMunmap(base, page), "KernelMunmap(fixed)");
+  CheckOk(test, KernelMunmap(free_base, page), "KernelMunmap(anywhere)");
+  CheckOk(test, KernelReleaseDirectMemory(physical, 2 * page),
+          "KernelReleaseDirectMemory");
+  std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestDirectReleaseUnmapsGpuRuns() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test     = "DirectReleaseUnmapsGpuRuns";
@@ -2803,15 +2846,18 @@ void TestFixedReplacementGpuUnmaps() {
 		        "map into a reservation, then over a mapping and a reservation");
 	}
 	TestSetGpuRangeCallback(nullptr);
-	Check(test,
-	      g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base, page},
-	                                                        {true, base, page},
-	                                                        {false, base, page},
-	                                                        {false, base, 2 * page},
-	                                                        {true, base, 2 * page}},
-	      "fixed flexible maps did not unmap their whole target from the GPU");
-	CheckOk(test, KernelMunmap(base, 4 * page), "KernelMunmap");
-	std::printf("[host]    %-48s ok\n", test);
+        // Only the mapped page is unmapped from the GPU. A reserved span holds
+        // no GPU state, and an unmap waits for the GPU thread, so the reserved
+        // part of a target is not unmapped again.
+        Check(test,
+              g_gpu_range_events ==
+                  std::vector<GpuRangeEvent>{{true, base, page},
+                                             {false, base, page},
+                                             {true, base, 2 * page}},
+              "a fixed flexible map did not unmap from the GPU exactly what "
+              "was mapped");
+        CheckOk(test, KernelMunmap(base, 4 * page), "KernelMunmap");
+        std::printf("[host]    %-48s ok\n", test);
 }
 
 void TestFixedReserveValidatesBeforeUnmapping() {
@@ -5901,8 +5947,9 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectMappingNamesTypesAndValidation);
 	RunTest(TestBatchMappingOperationsAndPartialFailure);
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
-	RunTest(TestDirectReleaseUnmapsGpuRuns);
-	RunTest(TestDirectReleaseContracts);
+        RunTest(TestFreshDirectMapsUnmapNothing);
+        RunTest(TestDirectReleaseUnmapsGpuRuns);
+        RunTest(TestDirectReleaseContracts);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
 	RunTest(TestDirectMapAcrossContiguousAllocations);
 	RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);
