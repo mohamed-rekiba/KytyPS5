@@ -73,6 +73,8 @@ static void PrintUsage() {
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --pipeline-cache-folder <path>       Pipeline and program lists of each game.\n"
 	         "                                       Default: the user's cache folder.\n");
+	::printf("  --data-folder <path>                 Saves, downloads and temporary files.\n"
+	         "                                       Default: the user's data folder.\n");
 	::printf(
 	    "  --bench-script <path>                Replay key presses at given frames and log the\n"
 	    "                                       frame rate each second, for measured runs.\n");
@@ -409,6 +411,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--pipeline-cache-folder") {
 			options.config.pipeline_cache_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--data-folder") {
+			options.config.data_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--bench-script") {
 			options.config.bench_script = Common::PathFromUtf8(value);
 		} else if (arg == "--trace-dir") {

@@ -2,6 +2,7 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/dataFolder.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -78,15 +79,59 @@ static void MountOrCreateDir(const std::filesystem::path& dir, const std::string
 	LOGF("Mounted %s -> %s\n", point.c_str(), dir_text.c_str());
 }
 
+static void MoveToDataFolder(const std::filesystem::path& data_folder,
+                             const std::filesystem::path& entry) {
+	std::string error;
+	const auto  result     = Common::MoveToDataFolder(data_folder, entry, &error);
+	const auto  entry_text = Common::PathToString(entry);
+	const auto  data_text  = Common::PathToString(data_folder);
+	switch (result) {
+		case Common::DataMove::NotNeeded: break;
+		case Common::DataMove::Moved:
+			LOGF("Moved %s from the working directory to %s\n", entry_text.c_str(),
+			     data_text.c_str());
+			break;
+		case Common::DataMove::Kept:
+			LOGF("Kept %s in the working directory: %s has its own\n", entry_text.c_str(),
+			     data_text.c_str());
+			break;
+		case Common::DataMove::Failed:
+			LOGF("Could not move %s to %s: %s\n", entry_text.c_str(), data_text.c_str(),
+			     error.c_str());
+			break;
+	}
+}
+
+// Moves the saves, downloads and temporary files of the game that older builds kept in the
+// working directory.
+static void MoveGameToDataFolder(const std::filesystem::path& data_folder,
+                                 const std::string&           title_id) {
+	if (data_folder.empty()) {
+		return;
+	}
+	const std::filesystem::path saves = "_SaveData";
+	MoveToDataFolder(data_folder, saves / title_id);
+	std::error_code ec;
+	for (std::filesystem::directory_iterator user(saves / "[users]", ec), end; !ec && user != end;
+	     user.increment(ec)) {
+		MoveToDataFolder(data_folder, saves / "[users]" / user->path().filename() / title_id);
+	}
+	MoveToDataFolder(data_folder, std::filesystem::path("_DownloadData") / title_id);
+	MoveToDataFolder(data_folder, std::filesystem::path("_TempData") / title_id);
+}
+
 static void MountSandboxDirs() {
 	std::string title_id;
 	if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) {
 		title_id = "UNKNOWN";
 	}
 
-	MountOrCreateDir("_DownloadData/" + title_id, "/download0");
-	MountOrCreateDir("_TempData/" + title_id, "/temp0");
-	MountOrCreateDir("_TempData/" + title_id, "/temp");
+	const auto data_folder = Config::GetDataFolder();
+	MoveGameToDataFolder(data_folder, title_id);
+
+	MountOrCreateDir(data_folder / "_DownloadData" / title_id, "/download0");
+	MountOrCreateDir(data_folder / "_TempData" / title_id, "/temp0");
+	MountOrCreateDir(data_folder / "_TempData" / title_id, "/temp");
 }
 
 static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& param_json,

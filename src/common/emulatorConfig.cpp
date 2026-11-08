@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/cacheFolder.h"
+#include "common/dataFolder.h"
 #include "common/debugCounters.h"
 #include "common/perfCounters.h"
 
@@ -197,22 +198,31 @@ uint32_t GetTraceHangSeconds() {
 	return std::max(g_config->trace_hang_seconds, 5u);
 }
 
-std::filesystem::path GetPipelineCacheFolder() {
-	const auto variable = [](const char* name) {
-		const char* value = std::getenv(name);
-		return value != nullptr ? std::string(value) : std::string();
-	};
+static std::string EnvironmentVariable(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr ? std::string(value) : std::string();
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	constexpr auto host = Common::CacheHost::Windows;
+static constexpr auto HOST = Common::CacheHost::Windows;
 #elif defined(__APPLE__)
-	constexpr auto host = Common::CacheHost::MacOs;
+static constexpr auto HOST = Common::CacheHost::MacOs;
 #else
-	constexpr auto host = Common::CacheHost::Linux;
+static constexpr auto HOST = Common::CacheHost::Linux;
 #endif
-	return Common::PipelineCacheFolder(g_config->pipeline_cache_folder, host,
-	                                   {.home           = variable("HOME"),
-	                                    .xdg_cache_home = variable("XDG_CACHE_HOME"),
-	                                    .local_app_data = variable("LOCALAPPDATA")});
+
+std::filesystem::path GetPipelineCacheFolder() {
+	return Common::PipelineCacheFolder(g_config->pipeline_cache_folder, HOST,
+	                                   {.home           = EnvironmentVariable("HOME"),
+	                                    .xdg_cache_home = EnvironmentVariable("XDG_CACHE_HOME"),
+	                                    .local_app_data = EnvironmentVariable("LOCALAPPDATA")});
+}
+
+std::filesystem::path GetDataFolder() {
+	return Common::DataFolder(g_config->data_folder, HOST,
+	                          {.home          = EnvironmentVariable("HOME"),
+	                           .xdg_data_home = EnvironmentVariable("XDG_DATA_HOME"),
+	                           .app_data      = EnvironmentVariable("APPDATA")});
 }
 
 std::filesystem::path GetShaderLogFolder() {
