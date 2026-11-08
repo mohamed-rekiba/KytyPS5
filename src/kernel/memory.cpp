@@ -98,9 +98,6 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 	GetGpuResources().MapMemory(vaddr, size);
 }
 
-// A reserved or free span holds no GPU state: every path that unmaps mapped memory, or reserves or
-// releases over it, unmaps it from the GPU first. So a new mapping into such a span unmaps nothing.
-// An unmap goes to the GPU thread and waits for it, up to a frame, with the memory lock held.
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(false, vaddr, size);
@@ -997,6 +994,24 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	return false;
 }
 
+static bool OverlapsPrtAperture(uint64_t address, uint64_t size) {
+	Common::LockGuard lock(g_prt_aperture_mutex);
+	return std::any_of(g_prt_apertures.begin(), g_prt_apertures.end(), [&](const auto& aperture) {
+		return aperture.size != 0 && address < aperture.address + aperture.size &&
+		       aperture.address < address + size;
+	});
+}
+
+// A new mapping goes into a reserved or free span. Such a span holds no GPU state (see
+// UnmapGpuRanges), except where a PRT aperture maps it for the GPU: pages mapped into an aperture
+// replace what the GPU cached from it. An unmap waits for the GPU thread, up to a frame, with the
+// memory lock held, so it is done only there.
+static void UnmapGpuRangeBeforeMap(uint64_t vaddr, uint64_t size) {
+	if (OverlapsPrtAperture(vaddr, size)) {
+		UnmapGpuRange(vaddr, size);
+	}
+}
+
 uint64_t BackedPrefix(uint64_t vaddr, uint64_t size) {
 	constexpr uint64_t Page = 0x4000;
 	uint64_t           done = 0;
@@ -1722,11 +1737,15 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 				return result;
 			}
 		}
+		UnmapGpuRangeBeforeMap(in_addr, len);
 		reserved_target = true;
 		out_addr        = in_addr;
 	} else {
 		const auto search_addr = (in_addr != 0 ? in_addr : DEFAULT_PS5_BASE);
 		out_addr               = FindGuestFreeRange(search_addr, len, map_alignment);
+		if (out_addr != 0) {
+			UnmapGpuRangeBeforeMap(out_addr, len);
+		}
 	}
 
 	*addr_in_out = reinterpret_cast<void*>(out_addr);
@@ -1957,7 +1976,8 @@ static void UnmapMemoryOwner(const VirtualRanges::Range& range, bool keep_pool_r
 	}
 }
 
-// Reserved fragments and holes hold nothing the GPU can cache, so each run of adjacent committed
+// Reserved fragments and holes hold nothing the GPU can cache: every path that unmaps, reserves
+// or releases over mapped memory unmaps it from the GPU. So each run of adjacent committed
 // fragments is unmapped from the GPU with one call.
 static void UnmapGpuRanges(const std::vector<VirtualRanges::Range>& ranges) {
 	for (size_t i = 0; i < ranges.size(); i++) {
@@ -2399,6 +2419,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 					return result;
 				}
 			}
+			UnmapGpuRangeBeforeMap(in_addr, len);
 			replace_target = true;
 			if (map_shared_fixed(in_addr)) {
 				out_addr = in_addr;
@@ -2408,6 +2429,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		constexpr size_t DEFAULT_ALIGNMENT = 0x4000;
 		alignment                          = (alignment != 0 ? alignment : DEFAULT_ALIGNMENT);
 		if (in_addr != 0 && IsReservedSpan(in_addr, len)) {
+			UnmapGpuRangeBeforeMap(in_addr, len);
 			replace_target = true;
 			if (map_shared_fixed(in_addr)) {
 				out_addr = in_addr;
@@ -2416,6 +2438,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		if (!replace_target) {
 			out_addr = FindGuestFreeRange(in_addr, len, alignment);
 			if (out_addr != 0) {
+				UnmapGpuRangeBeforeMap(out_addr, len);
 				if (!map_shared_fixed(out_addr)) {
 					out_addr = 0;
 				}
@@ -2632,6 +2655,9 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	} else {
 		alignment = (alignment != 0 ? alignment : PAGE_SIZE);
 		out_addr  = FindGuestFreeRange(in_addr, len, alignment);
+		if (out_addr != 0) {
+			UnmapGpuRangeBeforeMap(out_addr, len);
+		}
 	}
 
 	if (out_addr == 0) {
@@ -2897,6 +2923,7 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 	if (vaddr == 0 || g_virtual_ranges->HasOverlap(vaddr, mapped_size)) {
 		return 0;
 	}
+	UnmapGpuRangeBeforeMap(vaddr, mapped_size);
 	if (!g_guest_address_space->Commit(vaddr, mapped_size, mode)) {
 		return 0;
 	}
