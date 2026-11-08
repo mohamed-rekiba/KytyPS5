@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -153,7 +154,7 @@ public:
 	explicit BenchScript(std::vector<BenchStep> steps): m_steps(std::move(steps)) {}
 
 	// Runs `fire` for each due step, in order. A delay counts from the time the step before it
-	// fired; the first delayed step counts from the first call.
+	// was due (a frame step: when it fired); the first delayed step counts from the first call.
 	template <typename Fire>
 	void Advance(uint64_t frame, uint64_t now_ms, Fire&& fire) {
 		if (!m_started) {
@@ -167,7 +168,9 @@ public:
 			if (!due) {
 				return;
 			}
-			m_last_ms = now_ms;
+			// A delay counts from when the step before it was due, so a late step does not push the
+			// steps after it: a recorded log replays at its own times.
+			m_last_ms = step.when == BenchStep::When::Frame ? now_ms : m_last_ms + step.value;
 			m_next++;
 			fire(step);
 		}
@@ -201,6 +204,58 @@ private:
 	size_t                 m_next    = 0;
 	uint64_t               m_last_ms = 0;
 	bool                   m_started = false;
+};
+
+// The lines that KYTY_INPUT_LOG writes: a player's input as bench script steps, so a log replays
+// as it is. Each step's delay counts from the step before it; the first from `start_ms`. The
+// presented frame and the gamepad are in a comment.
+class InputLogFormat {
+public:
+	// A stick sends an event for each small move. A move smaller than this is not written, and a
+	// value this close to rest is rest (0): a stick at rest seldom reads exactly 0.
+	static constexpr int AxisStep = 2048;
+
+	explicit InputLogFormat(uint64_t start_ms): m_last_ms(start_ms) {}
+
+	// Each returns the line to write, or an empty string when there is nothing to write.
+	std::string Key(std::string_view name, bool down, uint64_t now_ms, uint64_t frame) {
+		if (name.empty() || name.find('#') != std::string_view::npos) {
+			// '#' starts a comment in a script, so the step cannot be written.
+			return "# key \"" + std::string(name) + "\" cannot be a step\n";
+		}
+		return Line(std::string(name) + (down ? " down" : " up"), now_ms, frame, -1);
+	}
+
+	std::string Button(std::string_view name, bool down, uint64_t now_ms, uint64_t frame,
+	                   int gamepad) {
+		return Line("pad " + std::string(name) + (down ? " down" : " up"), now_ms, frame, gamepad);
+	}
+
+	std::string Axis(std::string_view name, int value, uint64_t now_ms, uint64_t frame,
+	                 int gamepad) {
+		const int at   = (value > -AxisStep && value < AxisStep) ? 0 : value;
+		auto      last = m_axes.find(name);
+		const int was  = last == m_axes.end() ? 0 : last->second;
+		if (at == was || (at != 0 && at - was < AxisStep && was - at < AxisStep)) {
+			return {};
+		}
+		m_axes[std::string(name)] = at;
+		return Line("axis " + std::string(name) + " " + std::to_string(at), now_ms, frame, gamepad);
+	}
+
+private:
+	std::string Line(const std::string& step, uint64_t now_ms, uint64_t frame, int gamepad) {
+		std::string line = "+" + std::to_string(now_ms >= m_last_ms ? now_ms - m_last_ms : 0) +
+		                   " " + step + " # frame " + std::to_string(frame);
+		if (gamepad >= 0) {
+			line += ", gamepad " + std::to_string(gamepad);
+		}
+		m_last_ms = now_ms;
+		return line + "\n";
+	}
+
+	uint64_t                                m_last_ms;
+	std::map<std::string, int, std::less<>> m_axes;
 };
 
 } // namespace Libs::Graphics

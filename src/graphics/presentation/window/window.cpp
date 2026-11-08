@@ -338,13 +338,16 @@ static void LogGamepad(SDL_Gamepad* pad, int id) {
 	     driver, path != nullptr ? path : "none");
 }
 
-// The virtual gamepad of a bench script, or 0. While it is attached, the presses and moves of
-// the other pads are dropped: a touch on a pad on the host took player 1 from the replay, or
-// closed the run with the quit hold.
+// A bench script runs, and its virtual gamepad, or 0 (see BenchDropsPadInput).
+static bool           g_bench_running = false;
 static SDL_JoystickID g_bench_gamepad = 0;
 
+static bool BenchDrops(SDL_JoystickID from) {
+	return BenchDropsPadInput(g_bench_running, g_bench_gamepad, from);
+}
+
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	if (g_bench_gamepad != 0 && f.id != g_bench_gamepad && !f.added && !f.removed && !f.remapped) {
+	if (BenchDrops(f.id) && !f.added && !f.removed && !f.remapped) {
 		return;
 	}
 #ifdef KYTY_DBG_INPUT
@@ -529,9 +532,8 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 static uint64_t g_input_log_start_ms = 0;
 
 // KYTY_INPUT_LOG=<file>: the player's key presses, gamepad button presses and stick and trigger
-// moves, written as bench script steps (benchScript.h), so --bench-script replays the route.
-// The presented frame and the gamepad are in a comment. The pads of all players go to the one
-// virtual pad of a replay.
+// moves, written as bench script steps (InputLogFormat), so --bench-script replays the route. The
+// pads of all players go to the one virtual pad of a replay.
 static void LogInput(const SDL_Event& event, uint64_t frame) {
 	static std::FILE* const file = [] {
 		const char* path = std::getenv("KYTY_INPUT_LOG");
@@ -540,50 +542,32 @@ static void LogInput(const SDL_Event& event, uint64_t frame) {
 	if (file == nullptr) {
 		return;
 	}
-	// A stick sends an event for each small move. A move smaller than this is not written, but
-	// a return to rest is.
-	constexpr int                                  axis_step = 2048;
-	static std::array<int, SDL_GAMEPAD_AXIS_COUNT> axis_logged {};
-	static uint64_t                                last_ms = g_input_log_start_ms;
-
-	std::string step;
-	int         gamepad = -1;
+	static InputLogFormat format(g_input_log_start_ms);
+	const uint64_t        now = SDL_GetTicks();
+	std::string           line;
 	if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
 	    event.key.repeat == 0) {
-		step = std::string(SDL_GetKeyName(event.key.key)) + (event.key.down ? " down" : " up");
+		line = format.Key(SDL_GetKeyName(event.key.key), event.key.down, now, frame);
 	} else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
 	           event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
-		const char* name =
-		    SDL_GetGamepadStringForButton(static_cast<SDL_GamepadButton>(event.gbutton.button));
-		if (name == nullptr) {
-			return;
+		if (const char* name =
+		        SDL_GetGamepadStringForButton(static_cast<SDL_GamepadButton>(event.gbutton.button));
+		    name != nullptr) {
+			line = format.Button(name, event.gbutton.down, now, frame,
+			                     static_cast<int>(event.gbutton.which));
 		}
-		step    = std::string("pad ") + name + (event.gbutton.down ? " down" : " up");
-		gamepad = static_cast<int>(event.gbutton.which);
-	} else if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
-	           event.gaxis.axis < SDL_GAMEPAD_AXIS_COUNT) {
-		const auto  axis  = static_cast<SDL_GamepadAxis>(event.gaxis.axis);
-		const int   value = event.gaxis.value;
-		const char* name  = SDL_GetGamepadStringForAxis(axis);
-		int&        last  = axis_logged[axis];
-		if (name == nullptr || (std::abs(value - last) < axis_step && (value != 0 || last == 0))) {
-			return;
+	} else if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
+		if (const char* name =
+		        SDL_GetGamepadStringForAxis(static_cast<SDL_GamepadAxis>(event.gaxis.axis));
+		    name != nullptr) {
+			line = format.Axis(name, event.gaxis.value, now, frame,
+			                   static_cast<int>(event.gaxis.which));
 		}
-		last    = value;
-		step    = std::string("axis ") + name + " " + std::to_string(value);
-		gamepad = static_cast<int>(event.gaxis.which);
-	} else {
-		return;
 	}
-	const uint64_t now = SDL_GetTicks();
-	std::fprintf(file, "+%llu %s # frame %llu", static_cast<unsigned long long>(now - last_ms),
-	             step.c_str(), static_cast<unsigned long long>(frame));
-	if (gamepad >= 0) {
-		std::fprintf(file, ", gamepad %d", gamepad);
+	if (!line.empty()) {
+		std::fputs(line.c_str(), file);
+		std::fflush(file);
 	}
-	std::fputc('\n', file);
-	std::fflush(file);
-	last_ms = now;
 }
 
 void WindowContext::ProcessEvent(double time_s) {
@@ -812,7 +796,7 @@ void WindowContext::ProcessEvent(double time_s) {
 		case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
 		case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
 		case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
-			if (event->gtouchpad.touchpad == 0) {
+			if (event->gtouchpad.touchpad == 0 && !BenchDrops(event->gtouchpad.which)) {
 				Controller::SetTouchPad(event->gtouchpad.which, event->gtouchpad.finger,
 				                        event->gtouchpad.type != SDL_EVENT_GAMEPAD_TOUCHPAD_UP,
 				                        event->gtouchpad.x, event->gtouchpad.y);
@@ -821,7 +805,8 @@ void WindowContext::ProcessEvent(double time_s) {
 
 		case SDL_EVENT_GAMEPAD_SENSOR_UPDATE: {
 			const auto& sensor = event->gsensor;
-			if (sensor.sensor == SDL_SENSOR_ACCEL || sensor.sensor == SDL_SENSOR_GYRO) {
+			if ((sensor.sensor == SDL_SENSOR_ACCEL || sensor.sensor == SDL_SENSOR_GYRO) &&
+			    !BenchDrops(sensor.which)) {
 				Controller::SetSensor(sensor.which,
 				                      sensor.sensor == SDL_SENSOR_ACCEL ? Controller::Sensor::Accel
 				                                                        : Controller::Sensor::Gyro,
@@ -906,6 +891,7 @@ void WindowContext::Run() {
 	if (bench && bench->UsesGamepad() && !bench_gamepad.Attach()) {
 		EXIT("--bench-script: the virtual gamepad cannot be attached: %s\n", SDL_GetError());
 	}
+	g_bench_running = bench.has_value();
 	g_bench_gamepad = bench_gamepad.Id();
 	// A step that waits for a frame is checked this often.
 	constexpr int bench_frame_poll_ms = 4;
@@ -1031,6 +1017,7 @@ void WindowContext::Run() {
 			loop.need_exit = true;
 		}
 	}
+	g_bench_running = false;
 	g_bench_gamepad = 0;
 }
 

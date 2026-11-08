@@ -13,9 +13,11 @@
 
 namespace {
 
+using Libs::Graphics::BenchDropsPadInput;
 using Libs::Graphics::BenchGamepad;
 using Libs::Graphics::BenchScript;
 using Libs::Graphics::BenchStep;
+using Libs::Graphics::InputLogFormat;
 using Libs::Graphics::ParseBenchScript;
 
 int g_failures = 0;
@@ -138,6 +140,73 @@ void TestStepsDueTogetherFireInOrder() {
         "steps due at one call fire in script order");
 }
 
+// A late step does not push the steps after it: a recorded log keeps its own
+// times.
+void TestDelaysKeepTheirSchedule() {
+  BenchScript script(Parse("+100 J down\n+100 J up\n"));
+  std::vector<std::string> fired;
+  const auto fire = [&](const BenchStep &step) {
+    fired.push_back(step.key + (step.down ? " down" : " up"));
+  };
+  script.Advance(0, 1000, fire);
+  script.Advance(0, 1130, fire); // 30 ms late
+  Check(fired.size() == 1, "fixture: the first step fires late");
+  script.Advance(0, 1199, fire);
+  Check(fired.size() == 1, "a step fires before its recorded time");
+  script.Advance(0, 1200, fire);
+  Check(fired.size() == 2,
+        "a late step pushed the step after it past its recorded time");
+}
+
+// What the input log writes parses as the steps the player made: keys,
+// buttons, sticks and triggers.
+void TestInputLogRoundTrip() {
+  InputLogFormat log(1000);
+  std::string text;
+  text += log.Key("J", true, 1500, 10);
+  text += log.Button("a", true, 1600, 12, 3);
+  Check(log.Axis("leftx", 1500, 1650, 13, 3).empty(),
+        "a stick move inside the rest band was written");
+  text += log.Axis("leftx", 20000, 1700, 14, 3);
+  Check(log.Axis("leftx", 21000, 1710, 15, 3).empty(),
+        "a stick move smaller than the step was written");
+  text += log.Axis("leftx", 900, 1800, 16, 3);
+  const auto skipped = log.Key("#", true, 1850, 17);
+  Check(skipped.starts_with("#"), "a key named '#' was written as a step");
+  text += skipped;
+  text += log.Axis("righttrigger", 32767, 1900, 18, 3);
+  const auto steps = Parse(text.c_str());
+  Check(steps.size() == 5, "the log parses as one step per input");
+  if (steps.size() != 5) {
+    return;
+  }
+  Check(steps[0].input == BenchStep::Input::Key && steps[0].key == "J" &&
+            steps[0].down && steps[0].value == 500,
+        "a key step counts from the start of the loop");
+  Check(steps[1].input == BenchStep::Input::PadButton && steps[1].key == "a" &&
+            steps[1].down && steps[1].value == 100,
+        "a button step counts from the step before it");
+  Check(steps[2].input == BenchStep::Input::PadAxis &&
+            steps[2].key == "leftx" && steps[2].axis_value == 20000 &&
+            steps[2].value == 100,
+        "a stick step holds its value");
+  Check(steps[3].axis_value == 0 && steps[3].value == 100,
+        "a stick back near rest is written as rest");
+  Check(steps[4].key == "righttrigger" && steps[4].axis_value == 32767 &&
+            steps[4].value == 100,
+        "a skipped key adds no delay to the step after it");
+}
+
+void TestBenchDropsPadInput() {
+  Check(!BenchDropsPadInput(false, 0, 5),
+        "a pad was dropped without a bench run");
+  Check(BenchDropsPadInput(true, 0, 5),
+        "a host pad was not dropped in a bench run without a virtual pad");
+  Check(BenchDropsPadInput(true, 7, 5),
+        "a host pad was not dropped in a bench run with a virtual pad");
+  Check(!BenchDropsPadInput(true, 7, 7), "the virtual pad was dropped");
+}
+
 // The virtual pad reports what a step sets through the SDL gamepad API, as
 // a pad on the host would: every button, both sticks and both triggers.
 void TestVirtualGamepad() {
@@ -201,6 +270,9 @@ int main() {
   TestParse();
   TestParseGamepad();
   TestParseErrors();
+  TestDelaysKeepTheirSchedule();
+  TestInputLogRoundTrip();
+  TestBenchDropsPadInput();
   TestVirtualGamepad();
   TestFramesAndDelays();
   TestStepsDueTogetherFireInOrder();

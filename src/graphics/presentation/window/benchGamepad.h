@@ -87,6 +87,15 @@ private:
 	SDL_Joystick*  m_joystick = nullptr;
 };
 
+// While a bench script runs, the presses, moves, touches and motion of the pads on the host are
+// dropped: a touch took player 1 from a replay, or closed the run with the quit hold. The script's
+// virtual pad (`bench_pad`, 0 when it has none) is not dropped. The caller lets pads arrive and
+// leave.
+[[nodiscard]] inline bool BenchDropsPadInput(bool bench_running, SDL_JoystickID bench_pad,
+                                             SDL_JoystickID from) {
+	return bench_running && from != bench_pad;
+}
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_PRESENTATION_WINDOW_BENCHGAMEPAD_H_ */
