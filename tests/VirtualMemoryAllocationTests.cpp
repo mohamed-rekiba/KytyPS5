@@ -2536,6 +2536,87 @@ void TestDirectMapValidationBeforeOwnerMutation() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// A direct map into a reservation or into free space maps its range for the GPU
+// and unmaps nothing: such a span holds no GPU state, and each unmap waits for
+// the GPU thread.
+void TestFreshDirectMapsUnmapNothing() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "FreshDirectMapsUnmapNothing";
+	constexpr uint64_t page     = SceKernelPageSize;
+	int64_t            physical = -1;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), 2 * page, page,
+	                                   SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	void* reserve = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserve, page, 0, page), "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	void* fixed = reserve;
+	CheckOk(
+	    test,
+	    KernelMapDirectMemory(&fixed, page, SceKernelProtCpuRw, SceKernelMapFixed, physical, page),
+	    "map into a reservation");
+	void* anywhere = nullptr;
+	CheckOk(test,
+	        KernelMapDirectMemory(&anywhere, page, SceKernelProtCpuRw, 0, physical + page, page),
+	        "map into free space");
+	TestSetGpuRangeCallback(nullptr);
+	const auto free_base = reinterpret_cast<uint64_t>(anywhere);
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {{true, base, page}, {true, free_base, page}},
+	      "a direct map into a reservation or free space unmapped its range from "
+	      "the GPU");
+	CheckOk(test, KernelMunmap(base, page), "KernelMunmap(fixed)");
+	CheckOk(test, KernelMunmap(free_base, page), "KernelMunmap(anywhere)");
+	CheckOk(test, KernelReleaseDirectMemory(physical, 2 * page), "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// A PRT aperture maps its span for the GPU whatever the kernel's ranges are, so a map into a
+// reservation inside it unmaps that range from the GPU first: the new pages replace what the GPU
+// cached there. Outside the aperture the map unmaps nothing.
+void TestMapIntoPrtApertureUnmapsGpu() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "MapIntoPrtApertureUnmapsGpu";
+	constexpr uint64_t page     = SceKernelPageSize;
+	constexpr uint64_t base     = 0x0f80000000ull;
+	int64_t            physical = -1;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), 2 * page, page,
+	                                   SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	void* reserve = reinterpret_cast<void*>(base);
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, SceKernelMapFixed, page),
+	        "KernelReserveVirtualRange(fixed)");
+	CheckOk(test, KernelSetPrtAperture(0, reinterpret_cast<void*>(base), 2 * page),
+	        "KernelSetPrtAperture");
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	void* inside = reinterpret_cast<void*>(base);
+	CheckOk(
+	    test,
+	    KernelMapDirectMemory(&inside, page, SceKernelProtCpuRw, SceKernelMapFixed, physical, page),
+	    "map into the aperture");
+	void* outside = reinterpret_cast<void*>(base + 3 * page);
+	CheckOk(test,
+	        KernelMapDirectMemory(&outside, page, SceKernelProtCpuRw, SceKernelMapFixed,
+	                              physical + static_cast<int64_t>(page), page),
+	        "map outside the aperture");
+	TestSetGpuRangeCallback(nullptr);
+	Check(test,
+	      g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base, page},
+	                                                        {true, base, page},
+	                                                        {true, base + 3 * page, page}},
+	      "a map into a PRT aperture kept what the GPU cached there, or a map outside unmapped");
+	CheckOk(test, KernelSetPrtAperture(0, nullptr, 0), "clear the aperture");
+	CheckOk(test, KernelMunmap(base, 4 * page), "KernelMunmap");
+	CheckOk(test, KernelReleaseDirectMemory(physical, 2 * page), "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestDirectReleaseUnmapsGpuRuns() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test     = "DirectReleaseUnmapsGpuRuns";
@@ -2691,6 +2772,51 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// A clamp answer is cached per committed span. A new mapping elsewhere must keep the answer, and
+// an unmap inside the span must end it, both for a plain mapping and for one in a reservation.
+void TestClampRangeSizeSeesUnmapInsideCachedSpan() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "ClampRangeSizeSeesUnmapInsideCachedSpan";
+	constexpr uint64_t page     = SceKernelPageSize;
+	const auto         baseline = AvailableFlexibleMemory(test);
+
+	for (const bool in_reservation: {false, true}) {
+		void* mapped = nullptr;
+		int   flags  = 0;
+		if (in_reservation) {
+			CheckOk(test, KernelReserveVirtualRange(&mapped, page * 4, 0, page),
+			        "KernelReserveVirtualRange");
+			flags = SceKernelMapFixed;
+		}
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&mapped, page * 4, SceKernelProtCpuRw, flags,
+		                                     "clamp_cache"),
+		        "KernelMapNamedFlexibleMemory(span)");
+		const auto base = reinterpret_cast<uint64_t>(mapped);
+
+		Check(test, ClampRangeSize(base + 0x100, page * 3) == page * 3,
+		      "clamp inside a committed span changed the size");
+		void* other = nullptr;
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&other, page, SceKernelProtCpuRw, 0, "clamp_other"),
+		        "KernelMapNamedFlexibleMemory(other)");
+		Check(test, ClampRangeSize(base + 0x100, page * 3) == page * 3,
+		      "clamp changed after a mapping elsewhere");
+
+		CheckOk(test, KernelMunmap(base + page * 2, page), "KernelMunmap(hole in span)");
+		Check(test, ClampRangeSize(base + 0x100, page * 3) == page * 2 - 0x100,
+		      "clamp crossed a hole made inside a cached span");
+
+		CheckOk(test, KernelMunmap(base, page * 2), "KernelMunmap(left)");
+		CheckOk(test, KernelMunmap(base + page * 3, page), "KernelMunmap(right)");
+		CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(other), page),
+		        "KernelMunmap(other)");
+	}
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "clamp cache test leaked flexible-memory budget");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMunmapGpuRuns() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test     = "MunmapGpuRuns";
@@ -2803,13 +2929,15 @@ void TestFixedReplacementGpuUnmaps() {
 		        "map into a reservation, then over a mapping and a reservation");
 	}
 	TestSetGpuRangeCallback(nullptr);
+	// Only the mapped page is unmapped from the GPU. A reserved span holds
+	// no GPU state, and an unmap waits for the GPU thread, so the reserved
+	// part of a target is not unmapped again.
 	Check(test,
-	      g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base, page},
-	                                                        {true, base, page},
+	      g_gpu_range_events == std::vector<GpuRangeEvent> {{true, base, page},
 	                                                        {false, base, page},
-	                                                        {false, base, 2 * page},
 	                                                        {true, base, 2 * page}},
-	      "fixed flexible maps did not unmap their whole target from the GPU");
+	      "a fixed flexible map did not unmap from the GPU exactly what "
+	      "was mapped");
 	CheckOk(test, KernelMunmap(base, 4 * page), "KernelMunmap");
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -5882,6 +6010,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
+	RunTest(TestClampRangeSizeSeesUnmapInsideCachedSpan);
 	RunTest(TestMunmapGpuRuns);
 	RunTest(TestMunmapRoundsToPages);
 	RunTest(TestRangeNamesCoverWholePages);
@@ -5901,6 +6030,8 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectMappingNamesTypesAndValidation);
 	RunTest(TestBatchMappingOperationsAndPartialFailure);
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
+	RunTest(TestFreshDirectMapsUnmapNothing);
+	RunTest(TestMapIntoPrtApertureUnmapsGpu);
 	RunTest(TestDirectReleaseUnmapsGpuRuns);
 	RunTest(TestDirectReleaseContracts);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
