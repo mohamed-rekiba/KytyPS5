@@ -2358,13 +2358,16 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	// write can happen.
 	m_buffer_cache.WriteWatches().NotifyWrite(range.address, range.size);
 	image.download_tick = m_scheduler.CurrentTick();
-	// The two end pages of an image that it shares with other data are left out on purpose, whether
-	// or not they are write-watched now: this write lands later, and by then the CPU may own those
-	// pages (see UntrackImageHead and UntrackImageTail) and write them without a fault. The GPU's
-	// stale bytes must not land on that data. Only whole pages are published, unless the image has
-	// none.
-	auto publish_begin = Common::AlignUp(range.address, TRACKER_PAGE_SIZE);
-	auto publish_end   = Common::AlignDown(range.address + range.size, TRACKER_PAGE_SIZE);
+	// An end page the image shares with other data is left out once the CPU owns it (see
+	// UntrackImageHead and UntrackImageTail): the CPU may then have written the image's bytes in it
+	// without a fault, and the GPU's stale bytes must not land on them. While the image still
+	// tracks the page, a CPU write to its bytes there faults and makes the image CPU-dirty, which
+	// stops the download, so the page is published like a whole one. A game can poll a result the
+	// GPU writes in the last bytes of an image.
+	const auto published     = PublishedPages(range.address, range.End(), image.track_addr,
+	                                          image.track_addr_end, TRACKER_PAGE_SIZE);
+	auto       publish_begin = published.begin;
+	auto       publish_end   = published.end;
 	if (publish_end <= publish_begin) {
 		publish_begin = range.address;
 		publish_end   = range.address + range.size;

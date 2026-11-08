@@ -1,11 +1,13 @@
 // Which GPU-written images are copied back to guest memory for the CPU.
 #include "graphics/host_gpu/imageReadback.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
 namespace {
 
+using Libs::Graphics::PublishedPages;
 using Libs::Graphics::ReadsBackToGuest;
 
 void Check(bool condition, const char *text) {
@@ -55,10 +57,34 @@ void TestLargerImagesFollowTheSetting() {
 
 } // namespace
 
+// A game polls a result the GPU writes in the last bytes of an image that ends
+// inside a page: that page is written back while the image still tracks it.
+void TestTrackedEndPagesArePublished() {
+  constexpr uint64_t page = 0x1000;
+  constexpr uint64_t begin = 0x10d00;
+  constexpr uint64_t end = 0x61d00;
+  const auto tracked = PublishedPages(begin, end, begin, end, page);
+  Check(tracked.begin == begin && tracked.end == end,
+        "a tracked image did not publish its end pages");
+  const auto head_owned = PublishedPages(begin, end, 0x11000, end, page);
+  Check(head_owned.begin == 0x11000 && head_owned.end == end,
+        "a head page the CPU owns was published");
+  const auto tail_owned = PublishedPages(begin, end, begin, 0x61000, page);
+  Check(tail_owned.begin == begin && tail_owned.end == 0x61000,
+        "a tail page the CPU owns was published");
+  const auto untracked = PublishedPages(begin, end, 0, 0, page);
+  Check(untracked.begin == 0x11000 && untracked.end == 0x61000,
+        "an untracked image published a shared end page");
+  const auto aligned = PublishedPages(0x10000, 0x62000, 0, 0, page);
+  Check(aligned.begin == 0x10000 && aligned.end == 0x62000,
+        "an image of whole pages lost a page");
+}
+
 int main() {
   TestTinyImagesAreReadBack();
   TestTinyArraysAndVolumesAreNotReadBack();
   TestLargerImagesFollowTheSetting();
+  TestTrackedEndPagesArePublished();
   std::puts("ImageReadbackTests: passed");
   return 0;
 }

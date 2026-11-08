@@ -36,6 +36,29 @@ struct ReadbackImage {
 	return tiny || (readback_linear_images && !image.tiled);
 }
 
+// The bytes of a downloaded image [begin, end) that are written to guest memory. Pages the image
+// fills are always written. A page at either end that the image shares with other data is written
+// only while the image still tracks it, [tracked_begin, tracked_end): the image stops tracking an
+// end page when the CPU writes the other data in it, and from then on a CPU write to the image's
+// bytes there goes unseen. `page` is a power of two.
+struct PublishSpan {
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+};
+
+[[nodiscard]] constexpr PublishSpan PublishedPages(uint64_t begin, uint64_t end,
+                                                   uint64_t tracked_begin, uint64_t tracked_end,
+                                                   uint64_t page) noexcept {
+	PublishSpan span {(begin + page - 1) & ~(page - 1), end & ~(page - 1)};
+	if (tracked_begin <= begin && begin < tracked_end) {
+		span.begin = begin;
+	}
+	if (tracked_begin < end && end <= tracked_end) {
+		span.end = end;
+	}
+	return span;
+}
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_SRC_GRAPHICS_HOST_GPU_IMAGEREADBACK_H_ */
