@@ -1,10 +1,14 @@
 // Exercise the guest ABI without linking unrelated emulator subsystems.
 #include "libs/libSaveData.cpp"
 
+#include "common/dataFolder.h"
+
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 
 #ifdef _WIN32
@@ -729,6 +733,92 @@ void TestSearchSortKeys() {
 	CHECK(search(SaveDataSortKey::Blocks, SaveDataSortOrder::Ascent) == "alpha bravo charlie");
 }
 
+void UseDataFolder(const fs::path& folder) {
+	Config::ConfigOptions cfg;
+	cfg.data_folder = folder;
+	Config::Load(cfg);
+}
+
+std::string ReadText(const fs::path& path) {
+	std::ifstream file(path);
+	return std::string(std::istreambuf_iterator<char>(file), {});
+}
+
+void WriteText(const fs::path& path, const char* text) {
+	fs::create_directories(path.parent_path());
+	std::ofstream(path) << text;
+}
+
+void TestDataFolderChoice() {
+	using Common::CacheHost;
+	using Common::DataFolder;
+	const Common::DataEnvironment env {.home          = "/Users/me",
+	                                   .xdg_data_home = "/var/data/me",
+	                                   .app_data      = "C:/Users/me/AppData/Roaming"};
+	CHECK(DataFolder({}, CacheHost::Linux, env) == fs::path("/var/data/me/KytyPS5"));
+	CHECK(DataFolder({}, CacheHost::Linux, {.home = "/home/me"}) ==
+	      fs::path("/home/me/.local/share/KytyPS5"));
+	CHECK(DataFolder({}, CacheHost::MacOs, env) ==
+	      fs::path("/Users/me/Library/Application Support/KytyPS5"));
+	CHECK(DataFolder({}, CacheHost::Windows, env) ==
+	      fs::path("C:/Users/me/AppData/Roaming/KytyPS5"));
+	for (const auto host: {CacheHost::Windows, CacheHost::MacOs, CacheHost::Linux}) {
+		// No per-user folder: the working directory, as before.
+		CHECK(DataFolder({}, host, {}).empty());
+		CHECK(DataFolder("/data/kyty", host, env) == fs::path("/data/kyty"));
+	}
+	CHECK(DataFolder({}, CacheHost::MacOs, {.xdg_data_home = "/x"}).empty());
+	CHECK(DataFolder({}, CacheHost::Windows, {.home = "/x", .xdg_data_home = "/x"}).empty());
+}
+
+void TestSavesGoToTheDataFolder() {
+	const auto data = fs::absolute("data-folder");
+	UseDataFolder(data);
+	Reset("INFOLDER");
+	CHECK(Setup() == 0);
+	uint8_t byte = 77;
+	CHECK(Set(&byte, 1) == OK);
+	CHECK(SaveDataTerminate() == OK);
+	CHECK(fs::exists(data / "_SaveData/INFOLDER/sce_sdmemory/1/memory.dat"));
+	CHECK(!fs::exists("_SaveData/INFOLDER"));
+	CHECK(Setup() == 16);
+	CHECK(Get()[0] == 77);
+	CHECK(SaveDataTerminate() == OK);
+	UseDataFolder({});
+	CHECK(Config::GetDataFolder().empty());
+}
+
+void TestOldSavesMoveToTheDataFolder() {
+	using Common::DataMove;
+	using Common::MoveToDataFolder;
+	const auto data = fs::absolute("moved-data");
+	const fs::path entry = "_SaveData/OLDSAVE";
+	WriteText(entry / "slot/data.bin", "old");
+	CHECK(MoveToDataFolder(data, entry) == DataMove::Moved);
+	CHECK(ReadText(data / entry / "slot/data.bin") == "old");
+	CHECK(!fs::exists(entry));
+	CHECK(MoveToDataFolder(data, entry) == DataMove::NotNeeded);
+
+	// The data folder is the working directory: nothing to move.
+	WriteText(entry / "slot/data.bin", "here");
+	CHECK(MoveToDataFolder(fs::current_path(), entry) == DataMove::NotNeeded);
+	CHECK(MoveToDataFolder({}, entry) == DataMove::NotNeeded);
+	CHECK(ReadText(entry / "slot/data.bin") == "here");
+
+	// Both have the entry: never overwrite either one.
+	CHECK(MoveToDataFolder(data, entry) == DataMove::Kept);
+	CHECK(ReadText(entry / "slot/data.bin") == "here");
+	CHECK(ReadText(data / entry / "slot/data.bin") == "old");
+	fs::remove_all("_SaveData/OLDSAVE");
+
+	WriteText("outside/file", "x");
+	std::string error;
+	CHECK(MoveToDataFolder(data, "_SaveData/../outside", &error) == DataMove::Failed);
+	CHECK(!error.empty() && fs::exists("outside/file"));
+	fs::remove_all(data);
+	fs::remove_all("outside");
+}
+
 void RunChild(const fs::path& executable, const char* mode) {
 #ifdef _WIN32
 	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
@@ -748,6 +838,14 @@ void RunChild(const fs::path& executable, const char* mode) {
 } // namespace
 
 int main(int argc, char** argv) {
+	// No per-user folder: saves stay in the working directory, a temporary folder, and never
+	// reach the data folder of the user who runs the tests. The children inherit it.
+#ifdef _WIN32
+	_putenv_s("APPDATA", "");
+#else
+	unsetenv("HOME");
+	unsetenv("XDG_DATA_HOME");
+#endif
 	Config::Initialize();
 	if (argc == 2) {
 		if (std::string_view(argv[1]) == "write") {
@@ -777,6 +875,9 @@ int main(int argc, char** argv) {
 	TestSaveAllocations();
 	TestClassicSaveParams();
 	TestSearchSortKeys();
+	TestDataFolderChoice();
+	TestSavesGoToTheDataFolder();
+	TestOldSavesMoveToTheDataFolder();
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
 	fs::remove_all(temp);

@@ -89,6 +89,8 @@ struct ConfigOptions {
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	// Empty: the host's per-user cache folder (cacheFolder.h).
 	std::filesystem::path pipeline_cache_folder;
+	// Empty: the host's per-user data folder (dataFolder.h).
+	std::filesystem::path data_folder;
 	// Empty: no benchmark script (benchScript.h).
 	std::filesystem::path  bench_script;
 	bool                   command_buffer_dump_enabled = false;
@@ -176,6 +178,8 @@ bool                   ShaderCacheEnabled();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
 std::filesystem::path  GetPipelineCacheFolder();
+// Saves, downloads and temporary files. Empty: the working directory.
+std::filesystem::path  GetDataFolder();
 std::filesystem::path  GetBenchScript();
 std::filesystem::path  GetTraceDir();
 uint32_t               GetTraceScreenshotSeconds();
