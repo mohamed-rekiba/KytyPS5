@@ -8489,6 +8489,29 @@ public:
                 "the array over a reused mip-chain allocation did not hold its "
                 "guest layers");
         DestroyBuffer(&readback);
+
+        // The same reuse, with the array read through another format of the
+        // same class. The chain has more levels and fewer layers than the
+        // array, so it cannot hold the array in either order of comparison.
+        constexpr uint64_t reformat_offset = 0x2f60000;
+        std::memcpy(memory + reformat_offset, guest.data(), guest.size());
+        auto unorm_chain = make(chain_surface, chain_levels, 1);
+        unorm_chain.info.data.address = base + reformat_offset;
+        const auto unorm_chain_id = texture_cache.FindImage(unorm_chain);
+        (void)texture_cache.FindTexture(unorm_chain_id, unorm_chain);
+        auto uint_array = make(array_surface, 1, array_layers);
+        uint_array.info.data.address = base + reformat_offset;
+        uint_array.info.pixel_format = vk::Format::eR8Uint;
+        uint_array.info.guest_format = Prospero::BufferFormat::k8UInt;
+        uint_array.view_info.format = vk::Format::eR8Uint;
+        const auto uint_array_id = texture_cache.FindImage(uint_array);
+        Require(name, "reused allocation owner, other format",
+                uint_array_id && uint_array_id != unorm_chain_id &&
+                    texture_cache.GetImage(uint_array_id).info.resources ==
+                        ImageSubresources{1, array_layers},
+                "an array read through another format kept the one-layer mip "
+                "chain at its address");
+        (void)texture_cache.FindTexture(uint_array_id, uint_array);
       }
 
       {
