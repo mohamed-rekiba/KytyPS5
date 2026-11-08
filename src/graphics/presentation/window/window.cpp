@@ -17,6 +17,7 @@
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/window/benchGamepad.h"
 #include "graphics/presentation/window/benchScript.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -26,6 +27,7 @@
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -336,9 +338,15 @@ static void LogGamepad(SDL_Gamepad* pad, int id) {
 	     driver, path != nullptr ? path : "none");
 }
 
-static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+// The virtual gamepad of a bench script, or 0. While it is attached, the presses and moves of
+// the other pads are dropped: a touch on a pad on the host took player 1 from the replay, or
+// closed the run with the quit hold.
+static SDL_JoystickID g_bench_gamepad = 0;
 
+static void GameEventController([[maybe_unused]] const EventController& f) {
+	if (g_bench_gamepad != 0 && f.id != g_bench_gamepad && !f.added && !f.removed && !f.remapped) {
+		return;
+	}
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
 		LOGF("Controller %s: %d, time = %.04f\n", (f.added ? "added" : "removed"), f.id,
@@ -517,8 +525,13 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 	}
 }
 
-// KYTY_INPUT_LOG=<file>: the player's key and gamepad button presses, one per line with the time
-// and the presented frame, to learn a route through a game from someone playing it.
+// The time the window loop started, which the first delay of a bench script counts from.
+static uint64_t g_input_log_start_ms = 0;
+
+// KYTY_INPUT_LOG=<file>: the player's key presses, gamepad button presses and stick and trigger
+// moves, written as bench script steps (benchScript.h), so --bench-script replays the route.
+// The presented frame and the gamepad are in a comment. The pads of all players go to the one
+// virtual pad of a replay.
 static void LogInput(const SDL_Event& event, uint64_t frame) {
 	static std::FILE* const file = [] {
 		const char* path = std::getenv("KYTY_INPUT_LOG");
@@ -527,24 +540,50 @@ static void LogInput(const SDL_Event& event, uint64_t frame) {
 	if (file == nullptr) {
 		return;
 	}
-	const char* name = nullptr;
-	bool        down = false;
+	// A stick sends an event for each small move. A move smaller than this is not written, but
+	// a return to rest is.
+	constexpr int                                  axis_step = 2048;
+	static std::array<int, SDL_GAMEPAD_AXIS_COUNT> axis_logged {};
+	static uint64_t                                last_ms = g_input_log_start_ms;
+
+	std::string step;
+	int         gamepad = -1;
 	if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
 	    event.key.repeat == 0) {
-		name = SDL_GetKeyName(event.key.key);
-		down = event.key.down;
+		step = std::string(SDL_GetKeyName(event.key.key)) + (event.key.down ? " down" : " up");
 	} else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
 	           event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
-		name = SDL_GetGamepadStringForButton(static_cast<SDL_GamepadButton>(event.gbutton.button));
-		down = event.gbutton.down;
-	}
-	if (name == nullptr) {
+		const char* name =
+		    SDL_GetGamepadStringForButton(static_cast<SDL_GamepadButton>(event.gbutton.button));
+		if (name == nullptr) {
+			return;
+		}
+		step    = std::string("pad ") + name + (event.gbutton.down ? " down" : " up");
+		gamepad = static_cast<int>(event.gbutton.which);
+	} else if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
+	           event.gaxis.axis < SDL_GAMEPAD_AXIS_COUNT) {
+		const auto  axis  = static_cast<SDL_GamepadAxis>(event.gaxis.axis);
+		const int   value = event.gaxis.value;
+		const char* name  = SDL_GetGamepadStringForAxis(axis);
+		int&        last  = axis_logged[axis];
+		if (name == nullptr || (std::abs(value - last) < axis_step && (value != 0 || last == 0))) {
+			return;
+		}
+		last    = value;
+		step    = std::string("axis ") + name + " " + std::to_string(value);
+		gamepad = static_cast<int>(event.gaxis.which);
+	} else {
 		return;
 	}
-	std::fprintf(file, "%llu ms frame %llu %s %s\n",
-	             static_cast<unsigned long long>(SDL_GetTicks()),
-	             static_cast<unsigned long long>(frame), name, down ? "down" : "up");
+	const uint64_t now = SDL_GetTicks();
+	std::fprintf(file, "+%llu %s # frame %llu", static_cast<unsigned long long>(now - last_ms),
+	             step.c_str(), static_cast<unsigned long long>(frame));
+	if (gamepad >= 0) {
+		std::fprintf(file, ", gamepad %d", gamepad);
+	}
+	std::fputc('\n', file);
 	std::fflush(file);
+	last_ms = now;
 }
 
 void WindowContext::ProcessEvent(double time_s) {
@@ -839,9 +878,18 @@ static std::optional<BenchScript> LoadBenchScript() {
 		EXIT("--bench-script %s: %s\n", Common::PathToString(path).c_str(), error.c_str());
 	}
 	for (const auto& step: *steps) {
-		if (!step.quit && SDL_GetKeyFromName(step.key.c_str()) == SDLK_UNKNOWN) {
-			EXIT("--bench-script %s: unknown key \"%s\"\n", Common::PathToString(path).c_str(),
-			     step.key.c_str());
+		if (step.quit) {
+			continue;
+		}
+		const bool known =
+		    step.input == BenchStep::Input::Key
+		        ? SDL_GetKeyFromName(step.key.c_str()) != SDLK_UNKNOWN
+		    : step.input == BenchStep::Input::PadButton
+		        ? SDL_GetGamepadButtonFromString(step.key.c_str()) != SDL_GAMEPAD_BUTTON_INVALID
+		        : SDL_GetGamepadAxisFromString(step.key.c_str()) != SDL_GAMEPAD_AXIS_INVALID;
+		if (!known) {
+			EXIT("--bench-script %s: unknown key, button or axis \"%s\"\n",
+			     Common::PathToString(path).c_str(), step.key.c_str());
 		}
 	}
 	std::printf("Bench: %zu step(s) from %s\n", steps->size(), Common::PathToString(path).c_str());
@@ -851,7 +899,14 @@ static std::optional<BenchScript> LoadBenchScript() {
 void WindowContext::Run() {
 	Common::Timer timer;
 
-	auto bench = LoadBenchScript();
+	g_input_log_start_ms = SDL_GetTicks();
+	auto bench           = LoadBenchScript();
+	// Attached before the first step, so the game has seen the pad arrive when a step presses it.
+	BenchGamepad bench_gamepad;
+	if (bench && bench->UsesGamepad() && !bench_gamepad.Attach()) {
+		EXIT("--bench-script: the virtual gamepad cannot be attached: %s\n", SDL_GetError());
+	}
+	g_bench_gamepad = bench_gamepad.Id();
 	// A step that waits for a frame is checked this often.
 	constexpr int bench_frame_poll_ms = 4;
 	// KYTY_BENCH_LIVE=<file>: key names appended to the file, one per line, are tapped as they
@@ -897,20 +952,30 @@ void WindowContext::Run() {
 		}
 		auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
 		if (bench) {
-			bench->Advance(loop.presented_frames.load(std::memory_order_relaxed), now,
-			               [&](const BenchStep& step) {
-				               std::printf("Bench: %llu ms, step %s %s\n",
-				                           static_cast<unsigned long long>(now),
-				                           step.quit ? "quit" : step.key.c_str(),
-				                           step.quit ? "" : (step.down ? "down" : "up"));
-				               std::fflush(stdout);
-				               if (step.quit) {
-					               LOGF("Event: quit (bench script)\n");
-					               loop.need_exit = true;
-				               } else {
-					               HostInputKey(SDL_GetKeyFromName(step.key.c_str()), step.down);
-				               }
-			               });
+			bench->Advance(
+			    loop.presented_frames.load(std::memory_order_relaxed), now,
+			    [&](const BenchStep& step) {
+				    const auto action = step.quit ? std::string()
+				                        : step.input == BenchStep::Input::PadAxis
+				                            ? std::to_string(step.axis_value)
+				                            : std::string(step.down ? "down" : "up");
+				    std::printf("Bench: %llu ms, step %s %s\n",
+				                static_cast<unsigned long long>(now),
+				                step.quit ? "quit" : step.key.c_str(), action.c_str());
+				    std::fflush(stdout);
+				    if (step.quit) {
+					    LOGF("Event: quit (bench script)\n");
+					    loop.need_exit = true;
+				    } else if (step.input == BenchStep::Input::PadButton) {
+					    bench_gamepad.SetButton(SDL_GetGamepadButtonFromString(step.key.c_str()),
+					                            step.down);
+				    } else if (step.input == BenchStep::Input::PadAxis) {
+					    bench_gamepad.SetAxis(SDL_GetGamepadAxisFromString(step.key.c_str()),
+					                          step.axis_value);
+				    } else {
+					    HostInputKey(SDL_GetKeyFromName(step.key.c_str()), step.down);
+				    }
+			    });
 			wait_ms = bench->WaitMs(SDL_GetTicks(), bench_frame_poll_ms, wait_ms);
 		}
 		if (live_path != nullptr) {
@@ -966,6 +1031,7 @@ void WindowContext::Run() {
 			loop.need_exit = true;
 		}
 	}
+	g_bench_gamepad = 0;
 }
 
 static void WindowCreate(WindowContext& context) {

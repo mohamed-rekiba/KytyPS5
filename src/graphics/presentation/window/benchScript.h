@@ -12,21 +12,30 @@
 
 namespace Libs::Graphics {
 
-// A benchmark script (--bench-script): key presses replayed without a window in front, so a
-// measured run takes the same route every time, also while the screen is locked.
+// A benchmark script (--bench-script): key and gamepad presses replayed without a window in
+// front, so a measured run takes the same route every time, also while the screen is locked.
 //
-// One step per line; '#' starts a comment:
-//   f<frame> <key> down|up   at the first presented frame >= <frame>
-//   +<ms> <key> down|up      <ms> milliseconds after the step before it
-//   f<frame> quit / +<ms> quit   close the emulator
-// <key> is an SDL key name ("J", "W", "Left Shift"), so the keyboard mapping applies.
+// One step per line; '#' starts a comment. A step starts with when it is due:
+//   f<frame>   at the first presented frame >= <frame>
+//   +<ms>      <ms> milliseconds after the step before it
+// and then names the input:
+//   <key> down|up           an SDL key name ("J", "W", "Left Shift"): the keyboard mapping applies
+//   pad <button> down|up    an SDL gamepad button name ("a", "start", "dpup")
+//   axis <axis> <value>     an SDL gamepad axis name ("leftx", "righttrigger") and its value,
+//                           -32768 to 32767 (a trigger 0 to 32767)
+//   quit                    close the emulator
+// Pad and axis steps drive a virtual gamepad (benchGamepad.h). KYTY_INPUT_LOG writes a player's
+// input in this form.
 struct BenchStep {
 	enum class When { Frame, AfterMs };
+	enum class Input { Key, PadButton, PadAxis };
 	When        when  = When::Frame;
 	uint64_t    value = 0;
-	std::string key;
-	bool        down = false;
-	bool        quit = false;
+	Input       input = Input::Key;
+	std::string key; // the key, button or axis name
+	bool        down       = false;
+	int         axis_value = 0;
+	bool        quit       = false;
 };
 
 namespace BenchScriptDetail {
@@ -41,10 +50,21 @@ inline std::string_view Trim(std::string_view s) {
 	return s;
 }
 
-inline bool ParseNumber(std::string_view s, uint64_t& value) {
+template <typename T>
+inline bool ParseNumber(std::string_view s, T& value) {
 	const auto* end    = s.data() + s.size();
 	const auto  result = std::from_chars(s.data(), end, value);
 	return !s.empty() && result.ec == std::errc {} && result.ptr == end;
+}
+
+// Removes `word` and the blanks after it from the start of s, when s starts with it.
+inline bool TakeWord(std::string_view& s, std::string_view word) {
+	if (!s.starts_with(word) || s.size() == word.size() ||
+	    (s[word.size()] != ' ' && s[word.size()] != '\t')) {
+		return false;
+	}
+	s = Trim(s.substr(word.size()));
+	return true;
 }
 
 } // namespace BenchScriptDetail
@@ -53,6 +73,7 @@ inline bool ParseNumber(std::string_view s, uint64_t& value) {
 inline std::optional<std::vector<BenchStep>> ParseBenchScript(std::string_view text,
                                                               std::string&     error) {
 	using BenchScriptDetail::ParseNumber;
+	using BenchScriptDetail::TakeWord;
 	using BenchScriptDetail::Trim;
 	std::vector<BenchStep> steps;
 	uint32_t               line_number = 0;
@@ -91,6 +112,23 @@ inline std::optional<std::vector<BenchStep>> ParseBenchScript(std::string_view t
 			step.quit = true;
 			steps.push_back(std::move(step));
 			continue;
+		}
+		if (TakeWord(rest, "axis")) {
+			step.input             = BenchStep::Input::PadAxis;
+			const auto value_start = rest.find_last_of(" \t");
+			if (value_start == std::string_view::npos) {
+				return fail("an axis step names an axis and a value");
+			}
+			if (!ParseNumber(rest.substr(value_start + 1), step.axis_value) ||
+			    step.axis_value < -32768 || step.axis_value > 32767) {
+				return fail("the axis value is not a number from -32768 to 32767");
+			}
+			step.key = std::string(Trim(rest.substr(0, value_start)));
+			steps.push_back(std::move(step));
+			continue;
+		}
+		if (TakeWord(rest, "pad")) {
+			step.input = BenchStep::Input::PadButton;
 		}
 		const auto action_start = rest.find_last_of(" \t");
 		if (action_start == std::string_view::npos) {
@@ -136,6 +174,13 @@ public:
 	}
 
 	[[nodiscard]] bool Done() const { return m_next >= m_steps.size(); }
+
+	// True when a step presses a gamepad button or moves an axis.
+	[[nodiscard]] bool UsesGamepad() const {
+		return std::any_of(m_steps.begin(), m_steps.end(), [](const BenchStep& step) {
+			return !step.quit && step.input != BenchStep::Input::Key;
+		});
+	}
 
 	// How long the loop may wait before the next step can be due: the delay left for a delayed
 	// step, `frame_poll_ms` for a step that waits for a frame, `max_ms` when the script is done.

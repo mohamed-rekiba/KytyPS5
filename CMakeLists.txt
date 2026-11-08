@@ -454,6 +454,7 @@ add_executable(bench_script_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BenchScriptTests.cpp"
 )
 target_include_directories(bench_script_tests PRIVATE ${inc_headers})
+target_link_libraries(bench_script_tests SDL3::SDL3-static)
 
 add_executable(cache_folder_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/CacheFolderTests.cpp"
