@@ -141,10 +141,15 @@ void TestStepsDueTogetherFireInOrder() {
 // The virtual pad reports what a step sets through the SDL gamepad API, as
 // a pad on the host would: every button, both sticks and both triggers.
 void TestVirtualGamepad() {
-  if (!SDL_Init(SDL_INIT_GAMEPAD)) {
-    Check(false, "SDL starts its gamepad subsystem");
+  // A window without keyboard focus, as the game window is during a replay.
+  SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
+  if (!SDL_Init(SDL_INIT_GAMEPAD | SDL_INIT_VIDEO)) {
+    Check(false, "SDL starts its gamepad and video subsystems");
     return;
   }
+  SDL_Window *window = SDL_CreateWindow("bench", 64, 64, SDL_WINDOW_HIDDEN);
+  Check(window != nullptr && SDL_GetKeyboardFocus() == nullptr,
+        "fixture: a window without keyboard focus");
   {
     BenchGamepad bench;
     Check(bench.Attach(), "the virtual gamepad attaches");
@@ -186,6 +191,7 @@ void TestVirtualGamepad() {
       SDL_CloseGamepad(pad);
     }
   }
+  SDL_DestroyWindow(window);
   SDL_Quit();
 }
 

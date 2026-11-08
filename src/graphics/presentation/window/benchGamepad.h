@@ -22,6 +22,9 @@ public:
 		if (m_joystick != nullptr) {
 			return true;
 		}
+		// SDL drops gamepad input while no window of the app has keyboard focus, and a replay
+		// runs with the game window in the background, as key steps do.
+		SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 		SDL_VirtualJoystickDesc desc;
 		SDL_INIT_INTERFACE(&desc);
 		desc.type     = SDL_JOYSTICK_TYPE_GAMEPAD;
