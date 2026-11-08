@@ -27,6 +27,7 @@
 #include <set>
 #include <span>
 #include <utility>
+#include <xxhash.h>
 
 namespace Libs::Graphics::ShaderRecompiler {
 
@@ -913,17 +914,22 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 		for (const auto& [address, count]: linked.observed_ranges)
 			reads.emplace_back(address, uint64_t {count} * 4u);
 	};
-	if (source.linked && holds(*source.linked)) {
-		read_linked(*source.linked);
-		return source.linked->decoded;
-	}
-	for (auto& parked: source.parked_links) {
-		if (!holds(parked)) continue;
-		std::swap(*source.linked, parked);
-		++source.revision;
-		read_linked(*source.linked);
-		return source.linked->decoded;
-	}
+	// The current linking if it matches, else a parked one that does.
+	const auto reuse = [&](auto&& matches) -> const Decoder::Program* {
+		if (source.linked && matches(*source.linked)) {
+			read_linked(*source.linked);
+			return &source.linked->decoded;
+		}
+		for (auto& parked: source.parked_links) {
+			if (!matches(parked)) continue;
+			std::swap(*source.linked, parked);
+			++source.revision;
+			read_linked(*source.linked);
+			return &source.linked->decoded;
+		}
+		return nullptr;
+	};
+	if (const auto* program = reuse(holds)) return *program;
 
 	// Read every function first: the chain before them needs their count.
 	std::vector<uint32_t> observed;
@@ -951,12 +957,58 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 		observed.insert(observed.end(), function.words.begin(), function.words.end());
 		functions.push_back(std::move(function));
 	}
-	size_t cases = 0;
+	// The cases, in the order of their functions' code: a load order that puts the same functions
+	// at other addresses links the same program, with other constants.
+	struct Case {
+		std::pair<uint64_t, uint32_t> key;
+		std::pair<uint32_t, uint32_t> target;
+		size_t                        function = 0; // Index in functions.
+	};
+	std::vector<Case> ordered;
 	for (const auto& target: targets) {
 		const auto address = ((uint64_t {target.second} << 32u) | target.first) & ~uint64_t {3};
-		cases +=
-		    std::ranges::find(functions, address, &Function::address) != functions.end() ? 1u : 0u;
+		const auto found   = std::ranges::find(functions, address, &Function::address);
+		if (found == functions.end()) continue;
+		ordered.push_back(
+		    {{XXH3_64bits(found->words.data(), found->words.size() * 4u), target.first & 3u},
+		     target,
+		     static_cast<size_t>(found - functions.begin())});
 	}
+	std::ranges::stable_sort(ordered, {}, &Case::key);
+	std::vector<std::pair<uint64_t, uint32_t>> case_keys;
+	std::vector<uint32_t>                      case_code;
+	std::vector<uint32_t>                      constants;
+	for (const auto& entry: ordered) {
+		const auto& words = functions[entry.function].words;
+		case_keys.push_back(entry.key);
+		case_code.insert(case_code.end(), words.begin(), words.end());
+		constants.insert(constants.end(), {entry.target.first, entry.target.second});
+	}
+	// Only the functions moved: the linked program holds, with the new constants.
+	const auto moved = [&](ShaderSource::Linked& linked) {
+		if (linked.case_keys != case_keys || linked.case_code != case_code) return false;
+		linked.constants         = constants;
+		linked.table_targets     = targets;
+		linked.observed_function = observed;
+		linked.observed_ranges   = ranges;
+		return true;
+	};
+	if (const auto* program = reuse(moved)) return *program;
+	// The functions are laid out in the order their first cases have.
+	{
+		std::vector<Function> laid_out;
+		std::vector<size_t>   position(functions.size(), SIZE_MAX);
+		for (auto& entry: ordered) {
+			auto& at = position[entry.function];
+			if (at == SIZE_MAX) {
+				at = laid_out.size();
+				laid_out.push_back(std::move(functions[entry.function]));
+			}
+			entry.function = at;
+		}
+		functions = std::move(laid_out);
+	}
+	const size_t cases = ordered.size();
 	// The linked code goes right after the call, so that the program keeps its shape: the chain
 	// and the functions only branch forward to the code after the call. The code after the call
 	// moves; a program that reads its own PC cannot move, and gets the linked code at its end.
@@ -997,24 +1049,26 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 		inst.branch_target = target_pc;
 		add(std::move(inst));
 	};
-	// The chain: per entry, compare both halves of the target and call its function.
-	for (const auto& target: targets) {
-		const auto address = ((uint64_t {target.second} << 32u) | target.first) & ~uint64_t {3};
-		const auto found   = std::ranges::find(functions, address, &Function::address);
-		if (found == functions.end()) continue;
-		const auto skip = next_pc + CaseBytes;
+	// The chain: per case, compare both halves of the target with the case's constants and call
+	// its function.
+	for (uint32_t index = 0; index < ordered.size(); ++index) {
+		const auto& function = functions[ordered[index].function];
+		const auto  skip     = next_pc + CaseBytes;
 		for (uint32_t half = 0; half < 2u; ++half) {
-			// s_cmp_eq_u32 sN, literal; s_cbranch_scc0 to the next entry.
-			add(EncodeLinked(
-			    {0xbf06ff00u | (call.src0.reg + half), half == 0u ? target.first : target.second},
-			    next_pc));
+			// s_cmp_eq_u32 sN, linked constant; s_cbranch_scc0 to the next case. The code holds
+			// the constant's slot, not its value.
+			const auto slot   = index * 2u + half;
+			auto compare      = EncodeLinked({0xbf06ff00u | (call.src0.reg + half), slot}, next_pc);
+			compare.src1.kind = Decoder::OperandKind::LinkedConstant;
+			compare.src1.value = slot;
+			add(std::move(compare));
 			const auto offset =
 			    static_cast<uint16_t>((static_cast<int64_t>(skip) - (next_pc + 4)) / 4);
 			auto branch          = EncodeLinked({0xbf840000u | offset}, next_pc);
 			branch.branch_target = skip;
 			add(std::move(branch));
 		}
-		call_to(found->pc);
+		call_to(function.pc);
 	}
 	call_to(continuation);
 	for (const auto& function: functions) {
@@ -1063,6 +1117,9 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 	linked.observed_function = std::move(observed);
 	linked.observed_ranges   = ranges;
 	linked.table_targets     = targets;
+	linked.constants         = std::move(constants);
+	linked.case_keys         = std::move(case_keys);
+	linked.case_code         = std::move(case_code);
 	read_table();
 	for (const auto& [address, count]: ranges)
 		reads.emplace_back(address, uint64_t {count} * 4u);

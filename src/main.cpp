@@ -5,6 +5,7 @@
 #include "common/threads.h"
 #include "emulator.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kytyGitVersion.h"
 
 #include <algorithm>
@@ -491,6 +492,9 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 static int Main(int argc, char* argv[]) {
 	Libs::Graphics::PrepareVulkanDriverEnvironment();
+	// A game keeps running with a null texture where the shader translator cannot follow a
+	// descriptor; the tests leave this off, so their rejection checks still fail.
+	Libs::Graphics::ShaderRecompiler::IR::SetNullUnplannedDescriptors(true);
 	InitializeThreads();
 
 	RunOptions options;

@@ -340,6 +340,24 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 	return revision != call_source->revision;
 }
 
+bool PipelineCache::Program::TakeCallPlan() {
+	const auto code    = FunctionCode();
+	auto       earlier = std::ranges::find_if(
+	    call_plans, [&](const CallPlan& plan) { return std::ranges::equal(plan.code, code); });
+	if (earlier == call_plans.end()) {
+		if (call_plans.size() == MaxCallPlans) {
+			call_plans.erase(call_plans.begin());
+		}
+		call_plans.push_back({std::move(plan_code), std::move(resource_plan)});
+		plan_code.clear();
+		return false;
+	}
+	std::swap(earlier->plan, resource_plan);
+	std::swap(earlier->code, plan_code);
+	resource_plan.source_reads = call_source->reads;
+	return true;
+}
+
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor) {
@@ -655,8 +673,14 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
 	auto entry = m_program_cache.find(m_lookup_key);
-	const auto bind = [&](const ShaderModule& module) {
-		input_info.stage = {.module = &module, .resources = &entry->second.resources};
+	const auto bind  = [&](const ShaderModule& module) {
+		const auto& source = entry->second.call_source;
+		input_info.stage   = {.module    = &module,
+		                      .resources = &entry->second.resources,
+		                      .linked_constants =
+		                          source && source->linked
+		                              ? std::span<const uint32_t>(source->linked->constants)
+		                              : std::span<const uint32_t> {}};
 		module.info.bindings.AdvancePushData(push_data_cursor);
 		return &module;
 	};
@@ -666,7 +690,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (cached.skip_dispatch) return nullptr;
 		ShaderModule* module = nullptr;
 		if (cached.call_source) {
-			source_changed = cached.RefreshCallSource(runtime);
+			source_changed = cached.RefreshCallSource(runtime) && !cached.TakeCallPlan();
 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor);
 		} else {
 			module = cached.FindModule<false>(runtime, push_data_cursor);
@@ -741,10 +765,16 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
 		}).first;
 		auto& program = entry->second;
+		if (program.call_source) {
+			const auto code = program.FunctionCode();
+			program.plan_code.assign(code.begin(), code.end());
+		}
 		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 		    program.resource_plan, runtime, program.resources, program.specialization));
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		const auto code             = entry->second.FunctionCode();
+		entry->second.plan_code.assign(code.begin(), code.end());
 		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
 			return bind(*module);
 		}

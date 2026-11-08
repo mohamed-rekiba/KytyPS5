@@ -76,6 +76,13 @@ struct ShaderSource {
 		// the data each function gets, change nothing. observed_ranges are the functions' code.
 		std::vector<std::pair<uint32_t, uint32_t>> table_targets;
 		std::vector<std::pair<uint64_t, uint32_t>> observed_ranges;
+		// A table call's chain compares the target with linked constants, not with the addresses
+		// of its functions: per case, the target's two words. The cases are in the order of
+		// case_keys, the hash of the function's code and the target's low two bits, so the same
+		// functions link to the same code wherever they are loaded.
+		std::vector<uint32_t>                      constants;
+		std::vector<std::pair<uint64_t, uint32_t>> case_keys;
+		std::vector<uint32_t>                      case_code; // The functions' code, by case.
 		// Names this linking for as long as it lives, parked or not.
 		uint64_t id = 0;
 	};

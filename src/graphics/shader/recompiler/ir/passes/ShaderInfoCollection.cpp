@@ -516,6 +516,12 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			inputs.user_data[index] = true;
 			break;
 		}
+		case ValueOpcode::GetLinkedConstant:
+			if (!inst.Arg(0).IsImmediate()) return Fail("a linked constant has no fixed slot");
+			if (inst.HasUses()) {
+				info.linked_constants = std::max(info.linked_constants, inst.Arg(0).U32() + 1u);
+			}
+			break;
 		case ValueOpcode::GetDispatchThreadExtent:
 			info.uses_dispatch_threads |= inst.HasUses();
 			break;
@@ -592,6 +598,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.inputs.clear();
 	info.outputs.clear();
 	info.user_data_registers.clear();
+	info.linked_constants = 0;
 	for (auto& buffer: info.buffers) buffer.live = false;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;

@@ -866,6 +866,15 @@ uint32_t EmitGetDispatchThreadExtent(ValueEmitContext& ctx, const IR::Inst& inst
 	return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
 }
 
+uint32_t EmitGetLinkedConstant(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto start = ctx.state.program.bindings.linked_constant_dword;
+	if (start == IR::PushData::NoStart || !inst.Arg(0).IsImmediate() ||
+	    inst.Arg(0).U32() >= ctx.state.program.info.linked_constants) {
+		ctx.Fail(inst, "invalid linked constant");
+	}
+	return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
+}
+
 uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpUndef, TypeId(state, inst.GetType()), result);

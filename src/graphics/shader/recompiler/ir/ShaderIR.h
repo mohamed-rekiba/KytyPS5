@@ -90,12 +90,9 @@ struct MemoryInfo {
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
 		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
 		return data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
-		                  : opcode == ValueOpcode::ReadConstBuffer ||
-		                        opcode == ValueOpcode::LoadBufferU32 ||
-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4);
+		       ((!formatted && opcode == ValueOpcode::ReadConstBuffer) ||
+		        opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+		        opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -508,6 +505,8 @@ struct Bindings {
 	uint64_t descriptor_mask = 0;
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
+	// The values a linked call table compares its targets with, one dword each.
+	uint32_t linked_constant_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
@@ -556,6 +555,8 @@ struct ShaderInfo {
 	bool                            uses_flattened_srt            = false;
 	bool                            uses_image_heap               = false;
 	bool                            uses_dispatch_threads         = false;
+	// The slots GetLinkedConstant reads.
+	uint32_t                        linked_constants              = 0;
 	bool                            bvh                           = false;
 	bool                            bvh8                          = false;
 	bool                            bvh_stack                     = false;
@@ -623,11 +624,26 @@ struct DescriptorSource {
 
 			bool operator==(const SelectorRead& other) const = default;
 		};
+		// A per-row index the materializer reads itself: a bit field of the dword at `dword_offset`
+		// in the buffer of the V# at `vsharp_offset` from the row's pointer.
+		struct SlotRead {
+			uint32_t vsharp_offset = 0;
+			uint32_t dword_offset  = 0;
+			uint32_t bit_offset    = 0;
+			uint32_t bit_count     = 32;
+
+			bool operator==(const SlotRead& other) const = default;
+		};
 		struct PointerTable {
 			uint32_t offset = 0;
 			uint32_t stride = 0;
 			uint32_t count = 1;
 			bool indexed = false; // Parent pointers use raw MUBUF record addressing.
+			// When set, the pointer leads to a V# at this offset, and `offset` is the descriptor's
+			// offset in that V#'s buffer.
+			std::optional<uint32_t> vsharp_offset;
+			// The descriptor is at `slot * stride + offset` in that V#'s buffer.
+			std::optional<SlotRead> slot;
 
 			bool operator==(const PointerTable& other) const = default;
 		};

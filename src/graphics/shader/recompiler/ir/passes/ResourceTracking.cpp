@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
@@ -3076,6 +3077,99 @@ private:
 		return true;
 	}
 
+	// A V# that a memory pointer leads to: `address` holds the pointer, `load` reads the V#'s first
+	// word, `offset` is where the V# is from the pointer.
+	struct PointedVsharp {
+		const Inst* address = nullptr;
+		const Inst* load    = nullptr;
+		uint32_t    offset  = 0;
+	};
+
+	// The V# that is the buffer `read` reads, when it is four words a memory pointer leads to.
+	std::optional<PointedVsharp> VsharpPointer(const Inst& read, const Inst& handle) const {
+		const auto* buffer = read.Arg(0).Resolve().TryInstruction();
+		if (buffer == nullptr || buffer->GetOpcode() != ValueOpcode::GetBufferResource) return {};
+		PointedVsharp result;
+		for (uint32_t word = 0; word < 4u; ++word) {
+			const auto* load = buffer->Arg(word).Resolve().TryInstruction();
+			if (load == nullptr || load->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+			    load->Arg(1).Resolve() != Value(0u) || load->Arg(2).Resolve() != Value(0u) ||
+			    !AvailableBefore(*load, handle)) return {};
+			const auto& memory = m_program.memory_info[load->Flags<MemoryFlags>().index];
+			const auto* address = load->Arg(0).Resolve().TryInstruction();
+			if (memory.kind != ResourceKind::ScalarAddress || memory.offset > INT32_MAX ||
+			    (memory.offset & 3u) != 0u || address == nullptr ||
+			    address->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    (word != 0u && !EquivalentValue(m_program, result.load->Arg(0), load->Arg(0))))
+				return {};
+			if (word == 0u) {
+				result = {address, load, memory.offset};
+			} else if (memory.offset != result.offset + word * 4u) return {};
+		}
+		return result;
+	}
+
+	// A word of the pointer `address` holds, where `load` reads through it. A pointer register that
+	// another called function overwrote reaches the load only through a merge of the calls; the
+	// native source of the register at the load is the pointer itself.
+	Value PointerWord(const Inst& load, const Inst& address, uint32_t word) const {
+		const auto base = ScalarReadBase(load);
+		return (base == UINT32_MAX ? address.Arg(word)
+		                           : NativeDescriptorSource(address.Arg(word), base + word,
+		                                                    load.Flags<MemoryFlags>().pc))
+		    .Resolve();
+	}
+
+	bool SamePointer(const PointedVsharp& left, const Inst& right_load, const Inst& right_address) const {
+		return EquivalentValue(m_program, PointerWord(*left.load, *left.address, 0u),
+		                       PointerWord(right_load, right_address, 0u)) &&
+		       EquivalentValue(m_program, PointerWord(*left.load, *left.address, 1u),
+		                       PointerWord(right_load, right_address, 1u));
+	}
+
+	// A descriptor index read from memory behind the same pointer as the descriptor array: a bit
+	// field of a dword in the buffer of another V# the pointer leads to.
+	std::optional<DescriptorSource::IndirectDescriptor::SlotRead> MatchSlot(
+	    Value key, const Inst& pointer_load, const Inst& pointer, const Inst& handle) const {
+		DescriptorSource::IndirectDescriptor::SlotRead slot;
+		auto value = key.Resolve();
+		uint32_t mask = UINT32_MAX, shift = 0, first = 0, count = 0;
+		if (const auto* field = value.TryInstruction(); field != nullptr &&
+		    field->GetOpcode() == ValueOpcode::BitFieldUExtract &&
+		    ImmediateU32(field->Arg(1), first) && ImmediateU32(field->Arg(2), count) &&
+		    count != 0u && first + count <= 32u) {
+			slot.bit_offset = first;
+			slot.bit_count  = count;
+			value           = field->Arg(0).Resolve();
+		} else {
+			if (const auto* masked = value.TryInstruction(); masked != nullptr &&
+			    masked->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+				for (uint32_t arg = 0; arg < 2u && mask == UINT32_MAX; ++arg)
+					if (ImmediateU32(masked->Arg(arg), mask)) value = masked->Arg(arg ^ 1u).Resolve();
+				if (mask == UINT32_MAX || mask == 0u || !std::has_single_bit(mask + 1u)) return {};
+			}
+			if (const auto* shifted = value.TryInstruction(); shifted != nullptr &&
+			    shifted->GetOpcode() == ValueOpcode::ShiftRightLogical32) {
+				if (!ImmediateU32(shifted->Arg(1), shift) || shift >= 32u) return {};
+				value = shifted->Arg(0).Resolve();
+			}
+			slot.bit_offset = shift;
+			slot.bit_count  = std::min(32u - shift, static_cast<uint32_t>(std::popcount(mask)));
+		}
+		const auto* read = value.TryInstruction();
+		uint32_t index = 0;
+		const auto* memory = read != nullptr ? ScalarReadMemory(*read, index) : nullptr;
+		if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+		    read->GetOpcode() != ValueOpcode::ReadConstBuffer || read->Arg(1).Resolve() != Value(0u) ||
+		    memory->offset > INT32_MAX || (memory->offset & 3u) != 0u || !AvailableBefore(*read, handle))
+			return {};
+		const auto vsharp = VsharpPointer(*read, handle);
+		if (!vsharp || !SamePointer(*vsharp, pointer_load, pointer)) return {};
+		slot.vsharp_offset = vsharp->offset;
+		slot.dword_offset  = memory->offset;
+		return slot;
+	}
+
 	bool TryMakeNestedDescriptor(Inst& handle, const DescriptorSource& descriptor,
 	                             IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource &&
@@ -3084,20 +3178,44 @@ private:
 		Value child_key;
 		uint32_t offset = 0, stride = 0, immediate = 0;
 		if (!MatchDescriptorReads(handle, descriptor, reads, child_key, offset, stride, immediate, true) ||
-		    m_program.memory_info[reads.memory[0]].kind != ResourceKind::ScalarAddress ||
 		    uint64_t {offset & ~3u} + (immediate & ~3u) > UINT32_MAX) return false;
-		const auto* pointer = reads.reads[0]->Arg(0).ResolveInstruction();
+		const auto read_kind = m_program.memory_info[reads.memory[0]].kind;
+		const Inst* pointer = nullptr;
+		const Inst* pointer_load = nullptr;
+		std::optional<uint32_t> vsharp_offset;
+		std::optional<DescriptorSource::IndirectDescriptor::SlotRead> slot;
+		if (read_kind == ResourceKind::ScalarAddress) {
+			pointer = reads.reads[0]->Arg(0).ResolveInstruction();
+			pointer_load = reads.reads[0];
+		} else if (read_kind == ResourceKind::ScalarBuffer) {
+			if (const auto vsharp = VsharpPointer(*reads.reads[0], handle)) {
+				pointer = vsharp->address;
+				pointer_load = vsharp->load;
+				vsharp_offset = vsharp->offset;
+				if (!child_key.IsEmpty()) {
+					slot = MatchSlot(child_key, *pointer_load, *pointer, handle);
+					if (!slot || stride < plan.read_dwords * 4u || (stride & 3u) != 0u) return false;
+				}
+			}
+		}
+		if (pointer == nullptr) return false;
 		DescriptorSource::IndirectDescriptor indirect;
 		DescriptorSource::IndirectDescriptor::PointerTable child {
-		    .offset = (offset & ~3u) + (immediate & ~3u), .stride = stride};
+		    .offset = (offset & ~3u) + (immediate & ~3u), .stride = stride, .vsharp_offset = vsharp_offset,
+		    .slot = slot};
 		DescriptorSource table_source;
 		Value key;
-		if (child_key.IsEmpty()) {
+		if (child_key.IsEmpty() || slot) {
 			// Missing scalar-buffer pointer words are zero-filled. Only the existing
-			// unmapped first page permits omitted rows to map directly to a null image.
-			if (uint64_t {child.offset} + plan.read_dwords * 4u > 0x4000u) return false;
-			const auto* low = pointer->Arg(0).Resolve().TryInstruction();
-			const auto* high = pointer->Arg(1).Resolve().TryInstruction();
+			// unmapped first page permits omitted rows to map directly to a null image. Through a
+			// V#, that read is the V#: a zero V# has no bytes, so the descriptor in it is zero too.
+			if (vsharp_offset ? uint64_t {*vsharp_offset} + 16u > 0x4000u
+			                  : uint64_t {child.offset} + plan.read_dwords * 4u > 0x4000u) return false;
+			if (slot && uint64_t {slot->vsharp_offset} + 16u > 0x4000u) return false;
+			// TODO: a pointer word that is a Phi of a register copy (S_MOV_B32 of a table read before
+			// called functions that reuse the register) is not resolved yet.
+			const auto* low = PointerWord(*pointer_load, *pointer, 0u).TryInstruction();
+			const auto* high = PointerWord(*pointer_load, *pointer, 1u).TryInstruction();
 			uint32_t low_index, high_index;
 			const auto* low_memory = low != nullptr ? ScalarReadMemory(*low, low_index) : nullptr;
 			const auto* high_memory = high != nullptr ? ScalarReadMemory(*high, high_index) : nullptr;
@@ -3111,9 +3229,27 @@ private:
 			    !AvailableBefore(*low, *pointer) || !AvailableBefore(*high, *pointer) ||
 			    !MatchTableOffset(low->Arg(1), key, indirect.table_offset, indirect.table_stride) ||
 			    indirect.table_stride < 8u || (indirect.table_stride & 3u) != 0u ||
-			    !SetExactTableMaximum(key, indirect) ||
 			    (key.TryInstruction() != nullptr && !AvailableBefore(*key.Instruction(), handle)) ||
 			    !MakeRuntimeTableSource(*low, table_source)) return false;
+			if (!SetExactTableMaximum(key, indirect)) {
+				// A key with no static bound, such as a value the shader read from memory: the
+				// table's size bounds the rows instead, as a row past it reads a zero pointer. With a
+				// power-of-two stride, every multiple of it is a row, also for a key that wraps, so
+				// the key becomes the row offset in units of 4 bytes. Another stride would make
+				// steps inside a row, whose words are not pointers.
+				const auto step = indirect.table_stride;
+				if (!std::has_single_bit(step) || indirect.table_offset % step != 0u ||
+				    (low->Arg(1).TryInstruction() != nullptr &&
+				     !AvailableBefore(*low->Arg(1).Instruction(), handle))) return false;
+				key = low->Arg(1);
+				if (const auto shift = std::countr_zero(step) - 2u; shift != 0u) {
+					auto* block = handle.Parent();
+					const auto where = std::ranges::find_if(block->Instructions(),
+					    [&](const Inst& inst) { return &inst == &handle; });
+					key = Value(&*block->PrependNewInst(where, ValueOpcode::ShiftRightLogical32,
+					                                    {key, Value(static_cast<uint32_t>(shift))}));
+				}
+			}
 			indirect.table_immediate = low_memory->offset & ~3u;
 		} else {
 			if (handle.GetOpcode() != ValueOpcode::GetImageResource ||
@@ -3179,7 +3315,7 @@ private:
 		source.dwords.fill(Value(0u));
 		std::copy_n(table_source.dwords.begin(), 4u, source.dwords.begin());
 		source.indirect_descriptor = indirect;
-		if (!child_key.IsEmpty()) {
+		if (!child_key.IsEmpty() && !slot) {
 			auto* block = handle.Parent();
 			const auto where = std::ranges::find_if(block->Instructions(),
 			    [&](const Inst& inst) { return &inst == &handle; });
@@ -4050,8 +4186,22 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			const auto reason = fmt::format("{} dword {} is not a valid runtime value",
+			                                ValueOpcodeName(expected), bad_dword);
+			// A run-ahead guess (a recovery point is set) still fails: a wrong guess is discarded.
+			if ((expected != ValueOpcode::GetImageResource &&
+			     expected != ValueOpcode::GetSamplerResource) ||
+			    !NullUnplannedDescriptorsAllowed() || t_recovery != nullptr) {
+				Fail(pc, reason);
+			}
+			LogNullDescriptorOnce(m_program.shader_hash, fmt::format("stage={} pc=0x{:08x}", StageName(m_program.stage), pc),
+			                      reason + "; the shader translator cannot follow it");
+			descriptor = {};
+			descriptor.dword_count = width;
+			descriptor.dwords.fill(Value(0u));
+			for (size_t word = 0; word < handle->NumArgs(); ++word) handle->SetArg(word, Value(0u));
+			for (auto& resolved: m_resolved_handles)
+				if (resolved.handle == handle && resolved.pc == pc) resolved.source = descriptor;
 		}
 		source = InternSource(descriptor);
 		return true;
@@ -4259,7 +4409,7 @@ private:
 				    !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");
+					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted 32-bit x1/x2/x3/x4 load");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;

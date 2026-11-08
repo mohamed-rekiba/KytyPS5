@@ -951,6 +951,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
 	}
 	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+	if (program.bindings.linked_constant_dword != ShaderRecompiler::IR::PushData::NoStart) {
+		EXIT_IF(runtime.linked_constants.size() < program.info.linked_constants);
+		std::copy_n(runtime.linked_constants.begin(), program.info.linked_constants,
+		            prepared.shader_data.begin() + program.bindings.linked_constant_dword);
+	}
 	if (program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::Gds)] != 0) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}

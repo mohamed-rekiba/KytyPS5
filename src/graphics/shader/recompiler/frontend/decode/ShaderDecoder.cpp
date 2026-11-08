@@ -447,6 +447,7 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::PrivateBase: text = "private_base"; break;
 		case OperandKind::PrivateLimit: text = "private_limit"; break;
 		case OperandKind::Null: text = "null"; break;
+		case OperandKind::LinkedConstant: text = fmt::format("linked[{}]", operand.value); break;
 		default: text = "unknown"; break;
 	}
 	if (operand.sdwa_sel != 6 || operand.sdwa_sext) {
