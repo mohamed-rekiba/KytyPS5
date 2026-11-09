@@ -3076,6 +3076,33 @@ private:
 		return true;
 	}
 
+	// The pointer whose V#, four words at `vsharp_offset` from it, is the buffer `read` reads.
+	const Inst* PointedBuffer(const Inst& read, const Inst& handle, uint32_t& vsharp_offset) const {
+		const auto* buffer = read.Arg(0).Resolve().TryInstruction();
+		if (buffer == nullptr || buffer->GetOpcode() != ValueOpcode::GetBufferResource) return nullptr;
+		const Inst* pointer = nullptr;
+		Value first_address;
+		for (uint32_t word = 0; word < 4u; ++word) {
+			const auto* load = buffer->Arg(word).Resolve().TryInstruction();
+			if (load == nullptr || load->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+			    load->Arg(1).Resolve() != Value(0u) || load->Arg(2).Resolve() != Value(0u) ||
+			    !AvailableBefore(*load, handle)) return nullptr;
+			const auto& memory = m_program.memory_info[load->Flags<MemoryFlags>().index];
+			const auto* address = load->Arg(0).Resolve().TryInstruction();
+			if (memory.kind != ResourceKind::ScalarAddress || memory.offset > INT32_MAX ||
+			    (memory.offset & 3u) != 0u || address == nullptr ||
+			    address->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    (word != 0u && !EquivalentValue(m_program, first_address, load->Arg(0))))
+				return nullptr;
+			if (word == 0u) {
+				vsharp_offset = memory.offset;
+				first_address = load->Arg(0);
+			} else if (memory.offset != vsharp_offset + word * 4u) return nullptr;
+			pointer = address;
+		}
+		return pointer;
+	}
+
 	bool TryMakeNestedDescriptor(Inst& handle, const DescriptorSource& descriptor,
 	                             IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource &&
@@ -3084,18 +3111,30 @@ private:
 		Value child_key;
 		uint32_t offset = 0, stride = 0, immediate = 0;
 		if (!MatchDescriptorReads(handle, descriptor, reads, child_key, offset, stride, immediate, true) ||
-		    m_program.memory_info[reads.memory[0]].kind != ResourceKind::ScalarAddress ||
 		    uint64_t {offset & ~3u} + (immediate & ~3u) > UINT32_MAX) return false;
-		const auto* pointer = reads.reads[0]->Arg(0).ResolveInstruction();
+		const auto read_kind = m_program.memory_info[reads.memory[0]].kind;
+		const Inst* pointer = nullptr;
+		// The descriptor sits in the buffer of a V# that the pointer leads to.
+		std::optional<uint32_t> buffer_offset;
+		if (read_kind == ResourceKind::ScalarAddress) {
+			pointer = reads.reads[0]->Arg(0).ResolveInstruction();
+		} else if (read_kind == ResourceKind::ScalarBuffer && child_key.IsEmpty()) {
+			uint32_t vsharp_offset = 0;
+			pointer = PointedBuffer(*reads.reads[0], handle, vsharp_offset);
+			buffer_offset = vsharp_offset;
+		}
+		if (pointer == nullptr) return false;
 		DescriptorSource::IndirectDescriptor indirect;
 		DescriptorSource::IndirectDescriptor::PointerTable child {
-		    .offset = (offset & ~3u) + (immediate & ~3u), .stride = stride};
+		    .offset = (offset & ~3u) + (immediate & ~3u), .stride = stride, .buffer_offset = buffer_offset};
 		DescriptorSource table_source;
 		Value key;
 		if (child_key.IsEmpty()) {
 			// Missing scalar-buffer pointer words are zero-filled. Only the existing
-			// unmapped first page permits omitted rows to map directly to a null image.
-			if (uint64_t {child.offset} + plan.read_dwords * 4u > 0x4000u) return false;
+			// unmapped first page permits omitted rows to map directly to a null image. Through a
+			// V#, that read is the V#: a zero V# has no bytes, so the descriptor in it is zero too.
+			if (buffer_offset ? uint64_t {*buffer_offset} + 16u > 0x4000u
+			                  : uint64_t {child.offset} + plan.read_dwords * 4u > 0x4000u) return false;
 			const auto* low = pointer->Arg(0).Resolve().TryInstruction();
 			const auto* high = pointer->Arg(1).Resolve().TryInstruction();
 			uint32_t low_index, high_index;
@@ -3111,9 +3150,26 @@ private:
 			    !AvailableBefore(*low, *pointer) || !AvailableBefore(*high, *pointer) ||
 			    !MatchTableOffset(low->Arg(1), key, indirect.table_offset, indirect.table_stride) ||
 			    indirect.table_stride < 8u || (indirect.table_stride & 3u) != 0u ||
-			    !SetExactTableMaximum(key, indirect) ||
 			    (key.TryInstruction() != nullptr && !AvailableBefore(*key.Instruction(), handle)) ||
 			    !MakeRuntimeTableSource(*low, table_source)) return false;
+			if (!SetExactTableMaximum(key, indirect)) {
+				// A key with no static bound, such as a value the shader read from memory: the
+				// table's size bounds the rows instead, as a row past it reads a zero pointer. The
+				// rows are every multiple of the stride's power-of-two step, which also holds the
+				// offsets a key wraps to, so the key becomes the row offset in units of 4 bytes.
+				const auto step = 1u << std::countr_zero(indirect.table_stride);
+				if (indirect.table_offset % step != 0u ||
+				    (low->Arg(1).TryInstruction() != nullptr &&
+				     !AvailableBefore(*low->Arg(1).Instruction(), handle))) return false;
+				key = low->Arg(1);
+				if (const auto shift = std::countr_zero(step) - 2u; shift != 0u) {
+					auto* block = handle.Parent();
+					const auto where = std::ranges::find_if(block->Instructions(),
+					    [&](const Inst& inst) { return &inst == &handle; });
+					key = Value(&*block->PrependNewInst(where, ValueOpcode::ShiftRightLogical32,
+					                                    {key, Value(static_cast<uint32_t>(shift))}));
+				}
+			}
 			indirect.table_immediate = low_memory->offset & ~3u;
 		} else {
 			if (handle.GetOpcode() != ValueOpcode::GetImageResource ||

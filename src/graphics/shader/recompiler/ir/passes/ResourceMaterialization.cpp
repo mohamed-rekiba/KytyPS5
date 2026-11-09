@@ -738,16 +738,30 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			for (uint32_t word = 0; word < count; ++word) {
 				const auto table_offset = affine ? first + word * step : uint64_t {word} * 4u;
 				uint64_t pointer_base = 0u;
+				uint64_t pointee_size = UINT64_MAX;
 				if (pointer != nullptr) {
 					std::array<uint32_t, 2> address {};
 					if (!ReadScalarTable(table_base, table_size, table_offset, runtime, address))
 						return read_failed("parent pointer read", word, 0u, table_base, table_offset, sizeof(address));
 					pointer_base = (uint64_t {address[1]} << 32u) | address[0];
+					if (pointer->buffer_offset) {
+						// The descriptor is in the buffer of the V# the pointer leads to, and reads
+						// past that buffer's size are zero, as on the GPU.
+						DescriptorValue vsharp {.dword_count = 4u};
+						if (!ReadScalarTable(pointer_base, UINT64_MAX, *pointer->buffer_offset, runtime,
+						                     std::span(vsharp.dwords).first(4u)))
+							return read_failed("child buffer read", word, 0u, pointer_base,
+							                   *pointer->buffer_offset, 16u);
+						ShaderBufferResource buffer;
+						if (!DecodeBufferDescriptor(vsharp, buffer)) return false;
+						pointer_base = buffer.Base48();
+						pointee_size = buffer.GetSize();
+					}
 				}
 				for (uint32_t child = 0; child < child_count; ++child) {
 					DescriptorValue candidate {.dword_count = dword_count};
 					if (pointer != nullptr) {
-						if (!ReadScalarTable(pointer_base, UINT64_MAX,
+						if (!ReadScalarTable(pointer_base, pointee_size,
 						        uint64_t {child} * pointer->stride + pointer->offset, runtime,
 						        std::span(candidate.dwords).first(read_dwords)))
 							return read_failed("child descriptor read", word, child, pointer_base,

@@ -1189,11 +1189,150 @@ void TestNestedPointerImageTable() {
         "context-free shift bound rejected a cyclic source or a bounded Select arm");
   auto boundary = make(9u);
   boundary->PlanAndTrack(); // Both descriptor spans end exactly at the unmappable first-page boundary.
-  for (const uint32_t variant : {1u, 2u, 3u, 5u, 7u, 8u, 10u}) {
+  for (const uint32_t variant : {2u, 3u, 7u, 8u, 10u}) {
     auto invalid = make(variant);
     CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
-        "nested pointer planning accepted wrapping keys, mismatched words, lane-local bounds or mappable null-pointee bytes");
+        "nested pointer planning accepted mismatched words or mappable null-pointee bytes");
   }
+  // A key with no static bound (one that wraps, or one bounded only on other
+  // lanes) takes its rows from the table's size at dispatch: a row past it
+  // reads a zero pointer, and the rows cover every offset a key wraps to.
+  for (const uint32_t variant : {1u, 5u}) {
+    auto unbounded = make(variant);
+    unbounded->PlanAndTrack();
+    const auto unbounded_plan = ExtractResourcePlan(unbounded->program);
+    Check(unbounded_plan.info.images.size() == 1u &&
+              unbounded_plan.descriptor_sources[unbounded_plan.info.images[0].source]
+                      .indirect_descriptor->pointer_table &&
+              !unbounded_plan.descriptor_sources[unbounded_plan.info.images[0].source]
+                       .indirect_descriptor->table_maximum,
+          "a nested pointer key with no static bound took a static row bound");
+  }
+}
+
+// A material table whose rows hold a pointer to the material: the material's
+// image is read from a buffer whose V# the material holds, one hop further
+// than TestNestedPointerImageTable. The key is the row of a per-lane value, so
+// it has no static bound; the table buffer's size bounds the rows instead.
+void TestNestedPointerBufferImageTable() {
+  constexpr uint32_t vsharp_offset = 32u, image_offset = 1120u;
+  const auto make = [](uint32_t vsharp_at = vsharp_offset) {
+    auto fixture = std::make_unique<Fixture>();
+    std::array<Value, 4> table_words, key_words;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      table_words[word] = fixture->UserData(word);
+      key_words[word] = fixture->UserData(word + 4u);
+    }
+    const auto table = fixture->Buffer(table_words);
+    const auto keys = fixture->Buffer(key_words);
+    MemoryInfo key_memory;
+    key_memory.kind = ResourceKind::Buffer;
+    key_memory.offen = true;
+    auto key = fixture->Emit(ValueOpcode::LoadBufferU32,
+        {keys, Value(0u), fixture->Emit(ValueOpcode::LaneId), Value(0u), Value(true)},
+        fixture->AddMemory(key_memory, 0x100u));
+    key = fixture->Emit(ValueOpcode::ReadLane, {key, Value(0u)});
+    const auto row = fixture->Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+    std::array<Value, 2> pointer;
+    for (uint32_t word = 0; word < 2u; ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarBuffer;
+      memory.offset = 8u + word * 4u;
+      pointer[word] = fixture->Emit(ValueOpcode::ReadConstBuffer, {table, row},
+                                    fixture->AddMemory(memory, 0x1f4u));
+    }
+    const auto address = fixture->Address(pointer[0], pointer[1]);
+    const auto load = [&](uint32_t first, uint32_t pc) {
+      std::array<Value, 4> words;
+      for (uint32_t word = 0; word < 4u; ++word) {
+        MemoryInfo memory;
+        memory.kind = ResourceKind::ScalarAddress;
+        memory.offset = first + word * 4u;
+        words[word] = fixture->Emit(ValueOpcode::LoadAddressU32,
+            {address, Value(0u), Value(0u), Value(true)}, fixture->AddMemory(memory, pc));
+      }
+      return words;
+    };
+    const auto material = fixture->Buffer(load(vsharp_at, 0x1104u));
+    std::array<Value, 8> image_words;
+    for (uint32_t word = 0; word < 8u; ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarBuffer;
+      memory.offset = image_offset + word * 4u;
+      image_words[word] = fixture->Emit(ValueOpcode::ReadConstBuffer, {material, Value(0u)},
+                                        fixture->AddMemory(memory, 0x1118u));
+    }
+    const auto image = fixture->Image(image_words);
+    const auto sampler = fixture->Sampler(load(0u, 0x110cu));
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture->Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, fixture->ImageAddress(), Value(true)},
+        fixture->AddMemory(memory, 0x1128u));
+    return fixture;
+  };
+  auto fixture = make();
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  Check(plan.info.images.size() == 1u && plan.info.samplers.size() == 1u,
+        "a material image behind a pointer and a V# was not planned as one indirect image");
+  if (plan.info.images.size() != 1u || plan.info.samplers.size() != 1u) return;
+  const auto& image_source = plan.descriptor_sources[plan.info.images[0].source];
+  const auto& image_indirect = image_source.indirect_descriptor;
+  Check(image_indirect && !image_indirect->table_maximum &&
+            image_indirect->pointer_table &&
+            image_indirect->pointer_table->buffer_offset == vsharp_offset &&
+            image_indirect->pointer_table->offset == image_offset,
+        "the material image lost its V# hop, its in-buffer offset, or took a static row bound");
+
+  // Rows hold {0, 0, material pointer}; each material holds its sampler at +0
+  // and the V# of its constants at +32, whose buffer holds the image at +1120.
+  constexpr uint32_t table = 0x2000u, materials = 0x3000u, constants = 0x8000u, count = 5u;
+  LinearTestMemory memory;
+  memory.words.resize((constants + count * 0x800u - memory.base) / 4u);
+  const auto at = [&](uint32_t address) { return memory.words.begin() + (address - memory.base) / 4u; };
+  for (uint32_t row = 0; row < count; ++row) {
+    const auto material = materials + row * 0x100u;
+    const auto buffer = constants + row * 0x800u;
+    *at(table + row * 16u + 8u) = material;
+    const std::array<uint32_t, 4> sampler{row, 0x00fff000u, 0u, 0u};
+    std::copy(sampler.begin(), sampler.end(), at(material));
+    const std::array<uint32_t, 4> vsharp{buffer, 0u, 0x800u, 0x5204u};
+    std::copy(vsharp.begin(), vsharp.end(), at(material + vsharp_offset));
+    const std::array<uint32_t, 8> image{10u + row,
+        uint32_t(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u, 0u,
+        Libs::Graphics::DstSel(4, 0, 0, 1) | (9u << 28u), 0u, 0u, 0u, 0u};
+    std::copy(image.begin(), image.end(), at(buffer + image_offset));
+  }
+  std::array<uint32_t, 8> user_data{table, 16u << 16u, count, 0x5204u,
+                                    0x1800u, 0u, 4u, 0x30005204u};
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == count + 1u,
+        "the material table did not yield one image per row through the V# hop");
+  for (uint32_t row = 0; row + 1u < snapshot.images.size(); ++row)
+    Check(snapshot.images[row + 1u].dwords[0] == 10u + row,
+          "a material image was read from the wrong row or the wrong V#");
+
+  // A V# whose size ends before the image reads zeros there: a null image,
+  // not the bytes after the buffer.
+  *at(materials + vsharp_offset + 8u) = image_offset;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == count,
+        "a material image past its V#'s size was read instead of becoming null");
+
+  // A different V# offset in another material function is a different plan.
+  auto other = make(48u);
+  other->PlanAndTrack();
+  const auto other_plan = ExtractResourcePlan(other->program);
+  Check(other_plan.info.images.size() == 1u &&
+            other_plan.descriptor_sources[other_plan.info.images[0].source]
+                    .indirect_descriptor->pointer_table->buffer_offset == 48u,
+        "the V# hop did not keep its own offset");
 }
 
 void TestIndexedPointerImageTable() {
@@ -9130,6 +9269,7 @@ int main() {
     Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("nested pointer image table", TestNestedPointerImageTable);
+    Run("nested pointer buffer image table", TestNestedPointerBufferImageTable);
     Run("indexed pointer image table", TestIndexedPointerImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
