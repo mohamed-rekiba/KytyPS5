@@ -1158,7 +1158,9 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	return ConstructU32Composite(state, components, values);
 }
 
-uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAccess& buffer) {
+// One component of a formatted load: `selector` is that component's DST_SEL.
+uint32_t LoadIndirectFormattedComponent(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                                        uint32_t selector) {
 	auto& state = ctx.state;
 	const auto geometry = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, 4), geometry,
@@ -1171,7 +1173,7 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAcces
 	const auto bytes = field(0);
 	const auto component = Binary(
 	    state, spv::OpUMod, TypeU32(state),
-	    Binary(state, spv::OpISub, TypeU32(state), buffer.selector, ConstantU32(state, 4)), field(1));
+	    Binary(state, spv::OpISub, TypeU32(state), selector, ConstantU32(state, 4)), field(1));
 	const auto alignment = Unary(state, spv::OpUConvert, TypeU64(state), field(3));
 	const auto base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
 	                         Unary(state, spv::OpNot, TypeU64(state), alignment));
@@ -1181,7 +1183,7 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAcces
 	          Binary(state, spv::OpIMul, TypeU32(state), component, field(2))));
 	const auto memory = AndCondition(
 	    state, Binary(state, spv::OpINotEqual, TypeBool(state), bytes, ConstantU32(state, 0)),
-	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), buffer.selector,
+	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
 	           ConstantU32(state, 4)));
 	const auto raw = EmitValueOrZeroIfCondition(
 	    state, AndCondition(state, memory, IndirectBufferInBounds(state, buffer, 0u, bytes, true)),
@@ -1199,7 +1201,7 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAcces
 	    });
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result,
-	                          state.indirect_format_function, buffer.format, buffer.selector,
+	                          state.indirect_format_function, buffer.format, selector,
 	                          component, raw);
 	return result;
 }
@@ -1524,8 +1526,21 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			}
 			EmitLabel(state, state.builder.AllocateId());
 			const auto buffer = PrepareIndirectBuffer(state, args, memory.formatted);
-			const auto result = memory.formatted ? LoadIndirectFormattedX(ctx, buffer)
-			    : LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
+			auto result = 0u;
+			if (memory.formatted) {
+				// Each component converts the element's component its DST_SEL names, three
+				// bits per component in word 3.
+				std::array<uint32_t, 4> values {};
+				for (uint32_t component = 0; component < components; ++component) {
+					const auto selector = component == 0u ? buffer.selector
+					    : EmitBitFieldUExtract(state, args[3], ConstantU32(state, component * 3u),
+					                           ConstantU32(state, 3u));
+					values[component] = LoadIndirectFormattedComponent(ctx, buffer, selector);
+				}
+				result = ConstructU32Composite(state, components, values);
+			} else {
+				result = LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
+			}
 			state.builder.AddFunction(spv::OpReturnValue, result);
 			state.builder.AddFunction(spv::OpFunctionEnd);
 		}

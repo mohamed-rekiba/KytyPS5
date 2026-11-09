@@ -1335,6 +1335,28 @@ void TestNestedPointerBufferImageTable() {
         "the V# hop did not keep its own offset");
 }
 
+// A GPU-selected V# takes formatted loads of one to four 32-bit components:
+// each component converts the element component its own DST_SEL names. D16
+// formatted loads keep their 16-bit packing and stay unsupported there.
+void TestIndirectFormattedVectorLoads() {
+  MemoryInfo memory;
+  memory.formatted = true;
+  memory.data_bits = 32u;
+  for (const auto opcode : {ValueOpcode::LoadBufferU32, ValueOpcode::LoadBufferU32x2,
+                            ValueOpcode::LoadBufferU32x3, ValueOpcode::LoadBufferU32x4})
+    Check(memory.SupportsIndirectBufferLoad(opcode),
+          "a formatted 32-bit load of several components was refused a GPU-selected V#");
+  Check(!memory.SupportsIndirectBufferLoad(ValueOpcode::ReadConstBuffer),
+        "a scalar read was taken as a formatted load");
+  memory.data_bits = 16u;
+  Check(!memory.SupportsIndirectBufferLoad(ValueOpcode::LoadBufferU32x2),
+        "a D16 formatted load was taken as a 32-bit one");
+  memory.data_bits = 32u;
+  memory.typed = true;
+  Check(!memory.SupportsIndirectBufferLoad(ValueOpcode::LoadBufferU32x4),
+        "a typed load was taken through a GPU-selected V#");
+}
+
 void TestIndexedPointerImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Case { Valid, ReverseSigned, MissingParent, WrongParent, MissingChild,
@@ -9270,6 +9292,7 @@ int main() {
     Run("waterfall image table", TestWaterfallImageTable);
     Run("nested pointer image table", TestNestedPointerImageTable);
     Run("nested pointer buffer image table", TestNestedPointerBufferImageTable);
+    Run("indirect formatted vector loads", TestIndirectFormattedVectorLoads);
     Run("indexed pointer image table", TestIndexedPointerImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
