@@ -8,7 +8,9 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // An image or sampler descriptor that no plan can follow reads as a null descriptor, instead of
 // failing the translation; each shader and pc logs it once. A shader can choose its descriptors
 // from code it calls through data, so new shapes keep appearing; a null texture is a visible
-// fault the rest of the frame survives. Tests of the rejection rules leave this off.
+// fault the rest of the frame survives. The same holds for a table of descriptor pointers with no
+// static row bound and more rows than the materializer can read. Tests of the rejection rules
+// leave this off.
 void SetNullUnplannedDescriptors(bool allowed) noexcept;
 [[nodiscard]] bool NullUnplannedDescriptorsAllowed() noexcept;
 

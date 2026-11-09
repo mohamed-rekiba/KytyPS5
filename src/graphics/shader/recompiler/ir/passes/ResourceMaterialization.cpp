@@ -8,6 +8,9 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <atomic>
+#include <cstdio>
+#include <mutex>
+#include <set>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -736,6 +739,21 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					}
 					return true;
 				}
+			}
+			if (child_count != 0u && !image_heap && count * child_count > MaxIndirectDescriptorProbes &&
+			    !indirect.table_maximum && NullUnplannedDescriptorsAllowed()) {
+				// Rows bounded only by the table's size, more than can be read: every row reads
+				// the null descriptor the root already holds.
+				static std::mutex                                  mutex;
+				static std::set<std::pair<uint64_t, uint32_t>> noted;
+				std::scoped_lock lock {mutex};
+				if (noted.emplace(program.shader_hash, resource_index).second)
+					std::printf("!!! NULL DESCRIPTOR !!! shader=0x%016llx resource=%u: a descriptor table "
+					            "of %llu rows is over the %u-row limit, so it reads null descriptors and "
+					            "rendering is incomplete\n",
+					            static_cast<unsigned long long>(program.shader_hash), resource_index,
+					            static_cast<unsigned long long>(count), MaxIndirectDescriptorProbes);
+				return true;
 			}
 			if (child_count == 0u || (!image_heap && count * child_count > MaxIndirectDescriptorProbes))
 				return failed("candidate count", fmt::format("rows={} limit={}", count, MaxIndirectDescriptorProbes));

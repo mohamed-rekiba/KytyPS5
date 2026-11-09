@@ -1318,6 +1318,21 @@ void TestNestedPointerBufferImageTable() {
             snapshot.images.size() == count,
         "a material image past its V#'s size was read instead of becoming null");
 
+  // A table with no static row bound and more rows than the probe cap: by
+  // default the materialization fails before any read. With null descriptors
+  // allowed, every row reads the null image instead, still without a read.
+  user_data[2] = 65537u;
+  const auto before_cap = memory.reads;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.reads == before_cap,
+        "an oversized material table was read or accepted while null descriptors were off");
+  SetNullUnplannedDescriptors(true);
+  const bool nulled = MaterializeResources(plan, runtime, snapshot, specialization);
+  SetNullUnplannedDescriptors(false);
+  Check(nulled && snapshot.images.size() == 1u && memory.reads == before_cap,
+        "an oversized material table did not read as null images, or was read");
+  user_data[2] = count;
+
   // A different V# offset in another material function is a different plan.
   auto other = make(48u);
   other->PlanAndTrack();
