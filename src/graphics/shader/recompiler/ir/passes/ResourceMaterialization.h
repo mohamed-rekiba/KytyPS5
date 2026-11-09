@@ -3,16 +3,19 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <string_view>
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-// An image or sampler descriptor that no plan can follow reads as a null descriptor, instead of
-// failing the translation; each shader and pc logs it once. A shader can choose its descriptors
-// from code it calls through data, so new shapes keep appearing; a null texture is a visible
-// fault the rest of the frame survives. The same holds for a table of descriptor pointers with no
-// static row bound and more rows than the materializer can read. Tests of the rejection rules
-// leave this off.
+// An image or sampler descriptor the shader translator cannot follow reads as a null descriptor,
+// instead of stopping the game. So does a table of image or sampler pointers with no static row
+// bound and more rows than the materializer can read. A shader can choose its descriptors from
+// code it calls through game data, so new shapes keep appearing; a null texture is a visible fault
+// the rest of the frame survives. Buffers, run-ahead guesses and the tests of the rejection rules
+// still fail. Each case logs once per shader and site.
 void SetNullUnplannedDescriptors(bool allowed) noexcept;
 [[nodiscard]] bool NullUnplannedDescriptorsAllowed() noexcept;
+void LogNullDescriptorOnce(uint64_t shader_hash, std::string_view site, std::string_view reason);
 
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
 // ResourceSnapshot and therefore do not create shader permutations.

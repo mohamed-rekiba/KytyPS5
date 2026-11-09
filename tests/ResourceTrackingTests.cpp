@@ -49,6 +49,14 @@ void CheckFatal(F &&function, std::string_view expected, const char *message) {
   Check(false, message);
 }
 
+// Turns null descriptors for unplannable shapes on for one scope.
+struct NullUnplannedScope {
+  NullUnplannedScope() { SetNullUnplannedDescriptors(true); }
+  ~NullUnplannedScope() { SetNullUnplannedDescriptors(false); }
+  NullUnplannedScope(const NullUnplannedScope &) = delete;
+  NullUnplannedScope &operator=(const NullUnplannedScope &) = delete;
+};
+
 struct Fixture {
   Program program;
   Block *block = nullptr;
@@ -1182,6 +1190,13 @@ void TestNestedPointerImageTable() {
   Check(!MaterializeResources(capped_plan, runtime, snapshot, specialization) &&
             memory.reads == before_cap,
         "oversized nested pointer table performed reads before enforcing its candidate cap");
+  {
+    // A static row bound is the tracker's promise: over the cap it still fails, also when
+    // null descriptors are allowed for tables bounded only by their size.
+    const NullUnplannedScope allowed;
+    Check(!MaterializeResources(capped_plan, runtime, snapshot, specialization),
+          "an oversized table with a static row bound read null descriptors");
+  }
   user_data[2] = count;
   auto cyclic = make(6u);
   cyclic->PlanAndTrack();
@@ -1326,9 +1341,11 @@ void TestNestedPointerBufferImageTable() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
             memory.reads == before_cap,
         "an oversized material table was read or accepted while null descriptors were off");
-  SetNullUnplannedDescriptors(true);
-  const bool nulled = MaterializeResources(plan, runtime, snapshot, specialization);
-  SetNullUnplannedDescriptors(false);
+  bool nulled = false;
+  {
+    const NullUnplannedScope allowed;
+    nulled = MaterializeResources(plan, runtime, snapshot, specialization);
+  }
   Check(nulled && snapshot.images.size() == 1u && memory.reads == before_cap,
         "an oversized material table did not read as null images, or was read");
   user_data[2] = count;
@@ -1506,15 +1523,11 @@ void TestUnplannedDescriptorsReadNull() {
   auto strict = make();
   CheckFatal([&] { strict->PlanAndTrack(); }, "not a valid runtime value",
              "an unplannable image was planned while null descriptors were off");
-  SetNullUnplannedDescriptors(true);
   auto lenient = make();
-  try {
+  {
+    const NullUnplannedScope allowed;
     lenient->PlanAndTrack();
-  } catch (...) {
-    SetNullUnplannedDescriptors(false);
-    throw;
   }
-  SetNullUnplannedDescriptors(false);
   const auto plan = ExtractResourcePlan(lenient->program);
   Check(plan.info.images.size() == 1u && plan.info.samplers.size() == 1u,
         "an unplannable image or sampler lost its binding");

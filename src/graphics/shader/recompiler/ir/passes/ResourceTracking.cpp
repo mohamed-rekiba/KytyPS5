@@ -13,10 +13,8 @@
 #include <cstdlib>
 #include <fmt/format.h>
 #include <map>
-#include <mutex>
 #include <numeric>
 #include <optional>
-#include <set>
 #include <span>
 #include <tuple>
 #include <unordered_map>
@@ -597,18 +595,6 @@ private:
 		const Inst* table_read = nullptr;
 		const Inst* selection_anchor = nullptr;
 	};
-
-	// A descriptor that no plan follows reads as null (SetNullUnplannedDescriptors).
-	void NoteNullDescriptor(uint32_t pc, const std::string& reason) const {
-		static std::mutex                                  mutex;
-		static std::set<std::pair<uint64_t, uint32_t>> noted;
-		std::scoped_lock lock {mutex};
-		if (!noted.emplace(m_program.shader_hash, pc).second) return;
-		std::printf("!!! NULL DESCRIPTOR !!! shader=0x%016llx stage=%s pc=0x%08x: %s; the translator "
-		            "cannot follow it, so it reads a null descriptor and rendering is incomplete\n",
-		            static_cast<unsigned long long>(m_program.shader_hash),
-		            std::string(StageName(m_program.stage)).c_str(), pc, reason.c_str());
-	}
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
 		const auto message =
@@ -4208,7 +4194,8 @@ private:
 			    !NullUnplannedDescriptorsAllowed() || t_recovery != nullptr) {
 				Fail(pc, reason);
 			}
-			NoteNullDescriptor(pc, reason);
+			LogNullDescriptorOnce(m_program.shader_hash, fmt::format("stage={} pc=0x{:08x}", StageName(m_program.stage), pc),
+			                      reason + "; the shader translator cannot follow it");
 			descriptor = {};
 			descriptor.dword_count = width;
 			descriptor.dwords.fill(Value(0u));

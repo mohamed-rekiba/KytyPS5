@@ -7,17 +7,16 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
-#include <atomic>
-#include <cstdio>
-#include <mutex>
-#include <set>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
+#include <mutex>
 #include <numeric>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -33,6 +32,18 @@ void SetNullUnplannedDescriptors(bool allowed) noexcept {
 
 bool NullUnplannedDescriptorsAllowed() noexcept {
 	return g_null_unplanned.load(std::memory_order_relaxed);
+}
+
+void LogNullDescriptorOnce(uint64_t shader_hash, std::string_view site, std::string_view reason) {
+	static std::mutex                                 mutex;
+	static std::set<std::pair<uint64_t, std::string>> logged;
+	std::scoped_lock lock {mutex};
+	if (!logged.emplace(shader_hash, std::string(site)).second) return;
+	std::fprintf(stderr,
+	             "!!! NULL DESCRIPTOR !!! shader=0x%016llx %.*s: %.*s; it reads a null descriptor, "
+	             "so rendering is incomplete\n",
+	             static_cast<unsigned long long>(shader_hash), static_cast<int>(site.size()), site.data(),
+	             static_cast<int>(reason.size()), reason.data());
 }
 
 namespace {
@@ -740,20 +751,20 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					return true;
 				}
 			}
-			if (child_count != 0u && !image_heap && count * child_count > MaxIndirectDescriptorProbes &&
-			    !indirect.table_maximum && NullUnplannedDescriptorsAllowed()) {
-				// Rows bounded only by the table's size, more than can be read: every row reads
-				// the null descriptor the root already holds.
-				static std::mutex                                  mutex;
-				static std::set<std::pair<uint64_t, uint32_t>> noted;
-				std::scoped_lock lock {mutex};
-				if (noted.emplace(program.shader_hash, resource_index).second)
-					std::printf("!!! NULL DESCRIPTOR !!! shader=0x%016llx resource=%u: a descriptor table "
-					            "of %llu rows is over the %u-row limit, so it reads null descriptors and "
-					            "rendering is incomplete\n",
-					            static_cast<unsigned long long>(program.shader_hash), resource_index,
-					            static_cast<unsigned long long>(count), MaxIndirectDescriptorProbes);
-				return true;
+			// A table of image or sampler pointers whose rows are bounded only by its size, more
+			// rows than can be read: every row reads the null descriptor the root already holds.
+			// Buffer tables still fail.
+			if constexpr (!std::is_same_v<Specialization, ResourceSpecialization::Buffer>) {
+				if (pointer != nullptr && child_count != 0u && !image_heap &&
+				    count * child_count > MaxIndirectDescriptorProbes && !indirect.table_maximum &&
+				    NullUnplannedDescriptorsAllowed()) {
+					constexpr bool image = std::is_same_v<Specialization, ResourceSpecialization::Image>;
+					LogNullDescriptorOnce(program.shader_hash,
+					    fmt::format("{} {}", image ? "image" : "sampler", resource_index),
+					    fmt::format("a descriptor pointer table of {} rows is over the {}-row limit",
+					                count, MaxIndirectDescriptorProbes));
+					return true;
+				}
 			}
 			if (child_count == 0u || (!image_heap && count * child_count > MaxIndirectDescriptorProbes))
 				return failed("candidate count", fmt::format("rows={} limit={}", count, MaxIndirectDescriptorProbes));
