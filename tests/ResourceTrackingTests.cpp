@@ -1461,6 +1461,58 @@ void TestNestedPointerSlotImageTable() {
   }
 }
 
+// An image and a sampler whose words are per-lane values: no plan can follow
+// them. With null descriptors allowed, both read as null and the shader
+// still translates; without, the translation fails as before.
+void TestUnplannedDescriptorsReadNull() {
+  const auto make = [] {
+    auto fixture = std::make_unique<Fixture>();
+    std::array<Value, 4> key_words;
+    for (uint32_t word = 0; word < 4u; ++word) key_words[word] = fixture->UserData(word);
+    const auto keys = fixture->Buffer(key_words);
+    MemoryInfo key_memory;
+    key_memory.kind = ResourceKind::Buffer;
+    key_memory.offen = true;
+    const auto lane_value = fixture->Emit(ValueOpcode::LoadBufferU32,
+        {keys, Value(0u), fixture->Emit(ValueOpcode::LaneId), Value(0u), Value(true)},
+        fixture->AddMemory(key_memory, 0x100u));
+    std::array<Value, 8> image_words;
+    image_words.fill(lane_value);
+    const auto image = fixture->Image(image_words, 0x200u);
+    const auto sampler = fixture->Sampler({lane_value, lane_value, lane_value, lane_value}, 0x200u);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture->Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, fixture->ImageAddress(), Value(true)},
+        fixture->AddMemory(memory, 0x200u));
+    return fixture;
+  };
+  auto strict = make();
+  CheckFatal([&] { strict->PlanAndTrack(); }, "not a valid runtime value",
+             "an unplannable image was planned while null descriptors were off");
+  SetNullUnplannedDescriptors(true);
+  auto lenient = make();
+  try {
+    lenient->PlanAndTrack();
+  } catch (...) {
+    SetNullUnplannedDescriptors(false);
+    throw;
+  }
+  SetNullUnplannedDescriptors(false);
+  const auto plan = ExtractResourcePlan(lenient->program);
+  Check(plan.info.images.size() == 1u && plan.info.samplers.size() == 1u,
+        "an unplannable image or sampler lost its binding");
+  if (plan.info.images.size() != 1u || plan.info.samplers.size() != 1u) return;
+  for (const auto source : {plan.info.images[0].source, plan.info.samplers[0].source}) {
+    const auto& descriptor = plan.descriptor_sources[source];
+    bool zero = !descriptor.indirect_descriptor;
+    for (uint32_t word = 0; word < descriptor.dword_count; ++word)
+      zero &= descriptor.dwords[word].Resolve() == Value(0u);
+    Check(zero, "an unplannable descriptor kept words other than zero");
+  }
+}
+
 // A GPU-selected V# takes formatted loads of one to four 32-bit components:
 // each component converts the element component its own DST_SEL names. D16
 // formatted loads keep their 16-bit packing and stay unsupported there.
@@ -9420,6 +9472,7 @@ int main() {
     Run("nested pointer buffer image table", TestNestedPointerBufferImageTable);
     Run("indirect formatted vector loads", TestIndirectFormattedVectorLoads);
     Run("nested pointer slot image table", TestNestedPointerSlotImageTable);
+    Run("unplanned descriptors read null", TestUnplannedDescriptorsReadNull);
     Run("indexed pointer image table", TestIndexedPointerImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

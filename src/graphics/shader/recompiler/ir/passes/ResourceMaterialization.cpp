@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -18,6 +19,19 @@
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+namespace {
+std::atomic<bool> g_null_unplanned {false};
+} // namespace
+
+void SetNullUnplannedDescriptors(bool allowed) noexcept {
+	g_null_unplanned.store(allowed, std::memory_order_relaxed);
+}
+
+bool NullUnplannedDescriptorsAllowed() noexcept {
+	return g_null_unplanned.load(std::memory_order_relaxed);
+}
+
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;

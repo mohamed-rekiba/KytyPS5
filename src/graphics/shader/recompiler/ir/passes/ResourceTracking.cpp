@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
@@ -12,8 +13,10 @@
 #include <cstdlib>
 #include <fmt/format.h>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <span>
 #include <tuple>
 #include <unordered_map>
@@ -594,6 +597,18 @@ private:
 		const Inst* table_read = nullptr;
 		const Inst* selection_anchor = nullptr;
 	};
+
+	// A descriptor that no plan follows reads as null (SetNullUnplannedDescriptors).
+	void NoteNullDescriptor(uint32_t pc, const std::string& reason) const {
+		static std::mutex                                  mutex;
+		static std::set<std::pair<uint64_t, uint32_t>> noted;
+		std::scoped_lock lock {mutex};
+		if (!noted.emplace(m_program.shader_hash, pc).second) return;
+		std::printf("!!! NULL DESCRIPTOR !!! shader=0x%016llx stage=%s pc=0x%08x: %s; the translator "
+		            "cannot follow it, so it reads a null descriptor and rendering is incomplete\n",
+		            static_cast<unsigned long long>(m_program.shader_hash),
+		            std::string(StageName(m_program.stage)).c_str(), pc, reason.c_str());
+	}
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
 		const auto message =
@@ -4185,8 +4200,21 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			const auto reason = fmt::format("{} dword {} is not a valid runtime value",
+			                                ValueOpcodeName(expected), bad_dword);
+			// A run-ahead guess (a recovery point is set) still fails: a wrong guess is discarded.
+			if ((expected != ValueOpcode::GetImageResource &&
+			     expected != ValueOpcode::GetSamplerResource) ||
+			    !NullUnplannedDescriptorsAllowed() || t_recovery != nullptr) {
+				Fail(pc, reason);
+			}
+			NoteNullDescriptor(pc, reason);
+			descriptor = {};
+			descriptor.dword_count = width;
+			descriptor.dwords.fill(Value(0u));
+			for (size_t word = 0; word < handle->NumArgs(); ++word) handle->SetArg(word, Value(0u));
+			for (auto& resolved: m_resolved_handles)
+				if (resolved.handle == handle && resolved.pc == pc) resolved.source = descriptor;
 		}
 		source = InternSource(descriptor);
 		return true;
