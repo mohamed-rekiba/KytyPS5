@@ -620,6 +620,16 @@ struct DescriptorSource {
 
 			bool operator==(const SelectorRead& other) const = default;
 		};
+		// A per-row index the materializer reads itself: a bit field of the dword at `dword_offset`
+		// in the buffer of the V# at `vsharp_offset` from the row's pointer.
+		struct SlotRead {
+			uint32_t vsharp_offset = 0;
+			uint32_t dword_offset  = 0;
+			uint32_t bit_offset    = 0;
+			uint32_t bit_count     = 32;
+
+			bool operator==(const SlotRead& other) const = default;
+		};
 		struct PointerTable {
 			uint32_t offset = 0;
 			uint32_t stride = 0;
@@ -628,6 +638,8 @@ struct DescriptorSource {
 			// When set, the pointer leads to a V# at this offset, and `offset` is the descriptor's
 			// offset in that V#'s buffer.
 			std::optional<uint32_t> vsharp_offset;
+			// The descriptor is at `slot * stride + offset` in that V#'s buffer.
+			std::optional<SlotRead> slot;
 
 			bool operator==(const PointerTable& other) const = default;
 		};

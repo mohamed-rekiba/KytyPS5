@@ -3076,31 +3076,97 @@ private:
 		return true;
 	}
 
-	// The pointer whose V#, four words at `vsharp_offset` from it, is the buffer `read` reads.
-	const Inst* VsharpPointer(const Inst& read, const Inst& handle, uint32_t& vsharp_offset) const {
+	// A V# that a memory pointer leads to: `address` holds the pointer, `load` reads the V#'s first
+	// word, `offset` is where the V# is from the pointer.
+	struct PointedVsharp {
+		const Inst* address = nullptr;
+		const Inst* load    = nullptr;
+		uint32_t    offset  = 0;
+	};
+
+	// The V# that is the buffer `read` reads, when it is four words a memory pointer leads to.
+	std::optional<PointedVsharp> VsharpPointer(const Inst& read, const Inst& handle) const {
 		const auto* buffer = read.Arg(0).Resolve().TryInstruction();
-		if (buffer == nullptr || buffer->GetOpcode() != ValueOpcode::GetBufferResource) return nullptr;
-		const Inst* pointer = nullptr;
-		Value first_address;
+		if (buffer == nullptr || buffer->GetOpcode() != ValueOpcode::GetBufferResource) return {};
+		PointedVsharp result;
 		for (uint32_t word = 0; word < 4u; ++word) {
 			const auto* load = buffer->Arg(word).Resolve().TryInstruction();
 			if (load == nullptr || load->GetOpcode() != ValueOpcode::LoadAddressU32 ||
 			    load->Arg(1).Resolve() != Value(0u) || load->Arg(2).Resolve() != Value(0u) ||
-			    !AvailableBefore(*load, handle)) return nullptr;
+			    !AvailableBefore(*load, handle)) return {};
 			const auto& memory = m_program.memory_info[load->Flags<MemoryFlags>().index];
 			const auto* address = load->Arg(0).Resolve().TryInstruction();
 			if (memory.kind != ResourceKind::ScalarAddress || memory.offset > INT32_MAX ||
 			    (memory.offset & 3u) != 0u || address == nullptr ||
 			    address->GetOpcode() != ValueOpcode::GetAddressResource ||
-			    (word != 0u && !EquivalentValue(m_program, first_address, load->Arg(0))))
-				return nullptr;
+			    (word != 0u && !EquivalentValue(m_program, result.load->Arg(0), load->Arg(0))))
+				return {};
 			if (word == 0u) {
-				vsharp_offset = memory.offset;
-				first_address = load->Arg(0);
-			} else if (memory.offset != vsharp_offset + word * 4u) return nullptr;
-			pointer = address;
+				result = {address, load, memory.offset};
+			} else if (memory.offset != result.offset + word * 4u) return {};
 		}
-		return pointer;
+		return result;
+	}
+
+	// A word of the pointer `address` holds, where `load` reads through it. A pointer register that
+	// another called function overwrote reaches the load only through a merge of the calls; the
+	// native source of the register at the load is the pointer itself.
+	Value PointerWord(const Inst& load, const Inst& address, uint32_t word) const {
+		const auto base = ScalarReadBase(load);
+		return (base == UINT32_MAX ? address.Arg(word)
+		                           : NativeDescriptorSource(address.Arg(word), base + word,
+		                                                    load.Flags<MemoryFlags>().pc))
+		    .Resolve();
+	}
+
+	bool SamePointer(const PointedVsharp& left, const Inst& right_load, const Inst& right_address) const {
+		return EquivalentValue(m_program, PointerWord(*left.load, *left.address, 0u),
+		                       PointerWord(right_load, right_address, 0u)) &&
+		       EquivalentValue(m_program, PointerWord(*left.load, *left.address, 1u),
+		                       PointerWord(right_load, right_address, 1u));
+	}
+
+	// A descriptor index read from memory behind the same pointer as the descriptor array: a bit
+	// field of a dword in the buffer of another V# the pointer leads to.
+	std::optional<DescriptorSource::IndirectDescriptor::SlotRead> MatchSlot(
+	    Value key, const Inst& pointer_load, const Inst& pointer, const Inst& handle) const {
+		DescriptorSource::IndirectDescriptor::SlotRead slot;
+		auto value = key.Resolve();
+		uint32_t mask = UINT32_MAX, shift = 0, first = 0, count = 0;
+		if (const auto* field = value.TryInstruction(); field != nullptr &&
+		    field->GetOpcode() == ValueOpcode::BitFieldUExtract &&
+		    ImmediateU32(field->Arg(1), first) && ImmediateU32(field->Arg(2), count) &&
+		    count != 0u && first + count <= 32u) {
+			slot.bit_offset = first;
+			slot.bit_count  = count;
+			value           = field->Arg(0).Resolve();
+		} else {
+			if (const auto* masked = value.TryInstruction(); masked != nullptr &&
+			    masked->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+				for (uint32_t arg = 0; arg < 2u && mask == UINT32_MAX; ++arg)
+					if (ImmediateU32(masked->Arg(arg), mask)) value = masked->Arg(arg ^ 1u).Resolve();
+				if (mask == UINT32_MAX || mask == 0u || !std::has_single_bit(mask + 1u)) return {};
+			}
+			if (const auto* shifted = value.TryInstruction(); shifted != nullptr &&
+			    shifted->GetOpcode() == ValueOpcode::ShiftRightLogical32) {
+				if (!ImmediateU32(shifted->Arg(1), shift) || shift >= 32u) return {};
+				value = shifted->Arg(0).Resolve();
+			}
+			slot.bit_offset = shift;
+			slot.bit_count  = std::min(32u - shift, static_cast<uint32_t>(std::popcount(mask)));
+		}
+		const auto* read = value.TryInstruction();
+		uint32_t index = 0;
+		const auto* memory = read != nullptr ? ScalarReadMemory(*read, index) : nullptr;
+		if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+		    read->GetOpcode() != ValueOpcode::ReadConstBuffer || read->Arg(1).Resolve() != Value(0u) ||
+		    memory->offset > INT32_MAX || (memory->offset & 3u) != 0u || !AvailableBefore(*read, handle))
+			return {};
+		const auto vsharp = VsharpPointer(*read, handle);
+		if (!vsharp || !SamePointer(*vsharp, pointer_load, pointer)) return {};
+		slot.vsharp_offset = vsharp->offset;
+		slot.dword_offset  = memory->offset;
+		return slot;
 	}
 
 	bool TryMakeNestedDescriptor(Inst& handle, const DescriptorSource& descriptor,
@@ -3114,28 +3180,41 @@ private:
 		    uint64_t {offset & ~3u} + (immediate & ~3u) > UINT32_MAX) return false;
 		const auto read_kind = m_program.memory_info[reads.memory[0]].kind;
 		const Inst* pointer = nullptr;
+		const Inst* pointer_load = nullptr;
 		std::optional<uint32_t> vsharp_offset;
+		std::optional<DescriptorSource::IndirectDescriptor::SlotRead> slot;
 		if (read_kind == ResourceKind::ScalarAddress) {
 			pointer = reads.reads[0]->Arg(0).ResolveInstruction();
-		} else if (read_kind == ResourceKind::ScalarBuffer && child_key.IsEmpty()) {
-			uint32_t offset_in_pointee = 0;
-			pointer = VsharpPointer(*reads.reads[0], handle, offset_in_pointee);
-			vsharp_offset = offset_in_pointee;
+			pointer_load = reads.reads[0];
+		} else if (read_kind == ResourceKind::ScalarBuffer) {
+			if (const auto vsharp = VsharpPointer(*reads.reads[0], handle)) {
+				pointer = vsharp->address;
+				pointer_load = vsharp->load;
+				vsharp_offset = vsharp->offset;
+				if (!child_key.IsEmpty()) {
+					slot = MatchSlot(child_key, *pointer_load, *pointer, handle);
+					if (!slot || stride < plan.read_dwords * 4u || (stride & 3u) != 0u) return false;
+				}
+			}
 		}
 		if (pointer == nullptr) return false;
 		DescriptorSource::IndirectDescriptor indirect;
 		DescriptorSource::IndirectDescriptor::PointerTable child {
-		    .offset = (offset & ~3u) + (immediate & ~3u), .stride = stride, .vsharp_offset = vsharp_offset};
+		    .offset = (offset & ~3u) + (immediate & ~3u), .stride = stride, .vsharp_offset = vsharp_offset,
+		    .slot = slot};
 		DescriptorSource table_source;
 		Value key;
-		if (child_key.IsEmpty()) {
+		if (child_key.IsEmpty() || slot) {
 			// Missing scalar-buffer pointer words are zero-filled. Only the existing
 			// unmapped first page permits omitted rows to map directly to a null image. Through a
 			// V#, that read is the V#: a zero V# has no bytes, so the descriptor in it is zero too.
 			if (vsharp_offset ? uint64_t {*vsharp_offset} + 16u > 0x4000u
 			                  : uint64_t {child.offset} + plan.read_dwords * 4u > 0x4000u) return false;
-			const auto* low = pointer->Arg(0).Resolve().TryInstruction();
-			const auto* high = pointer->Arg(1).Resolve().TryInstruction();
+			if (slot && uint64_t {slot->vsharp_offset} + 16u > 0x4000u) return false;
+			// TODO: a pointer word that is a Phi of a register copy (S_MOV_B32 of a table read before
+			// called functions that reuse the register) is not resolved yet.
+			const auto* low = PointerWord(*pointer_load, *pointer, 0u).TryInstruction();
+			const auto* high = PointerWord(*pointer_load, *pointer, 1u).TryInstruction();
 			uint32_t low_index, high_index;
 			const auto* low_memory = low != nullptr ? ScalarReadMemory(*low, low_index) : nullptr;
 			const auto* high_memory = high != nullptr ? ScalarReadMemory(*high, high_index) : nullptr;
@@ -3235,7 +3314,7 @@ private:
 		source.dwords.fill(Value(0u));
 		std::copy_n(table_source.dwords.begin(), 4u, source.dwords.begin());
 		source.indirect_descriptor = indirect;
-		if (!child_key.IsEmpty()) {
+		if (!child_key.IsEmpty() && !slot) {
 			auto* block = handle.Parent();
 			const auto where = std::ranges::find_if(block->Instructions(),
 			    [&](const Inst& inst) { return &inst == &handle; });

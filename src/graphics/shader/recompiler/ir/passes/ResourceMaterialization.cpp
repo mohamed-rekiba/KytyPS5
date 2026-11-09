@@ -739,11 +739,30 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				const auto table_offset = affine ? first + word * step : uint64_t {word} * 4u;
 				uint64_t pointer_base = 0u;
 				uint64_t pointee_size = UINT64_MAX;
+				uint64_t slot_offset  = 0u;
 				if (pointer != nullptr) {
 					std::array<uint32_t, 2> address {};
 					if (!ReadScalarTable(table_base, table_size, table_offset, runtime, address))
 						return read_failed("parent pointer read", word, 0u, table_base, table_offset, sizeof(address));
 					pointer_base = (uint64_t {address[1]} << 32u) | address[0];
+					if (pointer->slot) {
+						// The row's own index into the descriptor array, read as the GPU reads it:
+						// zero past the end of its V#'s buffer.
+						const auto& slot = *pointer->slot;
+						DescriptorValue vsharp {.dword_count = 4u};
+						std::array<uint32_t, 1> packed {};
+						ShaderBufferResource buffer;
+						if (!ReadScalarTable(pointer_base, UINT64_MAX, slot.vsharp_offset, runtime,
+						                     std::span(vsharp.dwords).first(4u)))
+							return read_failed("slot buffer read", word, 0u, pointer_base, slot.vsharp_offset, 16u);
+						if (!DecodeBufferDescriptor(vsharp, buffer)) return false;
+						if (!ReadScalarTable(buffer.Base48(), buffer.GetSize(), slot.dword_offset, runtime, packed))
+							return read_failed("slot read", word, 0u, buffer.Base48(), slot.dword_offset, 4u);
+						const auto field = slot.bit_count >= 32u
+						    ? packed[0] >> slot.bit_offset
+						    : (packed[0] >> slot.bit_offset) & ((1u << slot.bit_count) - 1u);
+						slot_offset = uint64_t {field} * pointer->stride;
+					}
 					if (pointer->vsharp_offset) {
 						// The descriptor is in the buffer of the V# the pointer leads to, and reads
 						// past that buffer's size are zero, as on the GPU.
@@ -761,11 +780,12 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				for (uint32_t child = 0; child < child_count; ++child) {
 					DescriptorValue candidate {.dword_count = dword_count};
 					if (pointer != nullptr) {
-						if (!ReadScalarTable(pointer_base, pointee_size,
-						        uint64_t {child} * pointer->stride + pointer->offset, runtime,
+						const auto child_offset =
+						    uint64_t {child} * pointer->stride + pointer->offset + slot_offset;
+						if (!ReadScalarTable(pointer_base, pointee_size, child_offset, runtime,
 						        std::span(candidate.dwords).first(read_dwords)))
 							return read_failed("child descriptor read", word, child, pointer_base,
-							    uint64_t {child} * pointer->stride + pointer->offset, descriptor_bytes);
+							    child_offset, descriptor_bytes);
 					} else if (!image_heap) {
 						if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
 						                     std::span(candidate.dwords).first(read_dwords))) return false;
