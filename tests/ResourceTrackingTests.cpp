@@ -1189,24 +1189,10 @@ void TestNestedPointerImageTable() {
         "context-free shift bound rejected a cyclic source or a bounded Select arm");
   auto boundary = make(9u);
   boundary->PlanAndTrack(); // Both descriptor spans end exactly at the unmappable first-page boundary.
-  for (const uint32_t variant : {2u, 3u, 7u, 8u, 10u}) {
+  for (const uint32_t variant : {1u, 2u, 3u, 5u, 7u, 8u, 10u}) {
     auto invalid = make(variant);
     CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
-        "nested pointer planning accepted mismatched words or mappable null-pointee bytes");
-  }
-  // A key with no static bound (one that wraps, or one bounded only on other
-  // lanes) takes its rows from the table's size at dispatch: a row past it
-  // reads a zero pointer, and the rows cover every offset a key wraps to.
-  for (const uint32_t variant : {1u, 5u}) {
-    auto unbounded = make(variant);
-    unbounded->PlanAndTrack();
-    const auto unbounded_plan = ExtractResourcePlan(unbounded->program);
-    Check(unbounded_plan.info.images.size() == 1u &&
-              unbounded_plan.descriptor_sources[unbounded_plan.info.images[0].source]
-                      .indirect_descriptor->pointer_table &&
-              !unbounded_plan.descriptor_sources[unbounded_plan.info.images[0].source]
-                       .indirect_descriptor->table_maximum,
-          "a nested pointer key with no static bound took a static row bound");
+        "nested pointer planning accepted wrapping keys, mismatched words, lane-local bounds or mappable null-pointee bytes");
   }
 }
 
@@ -1282,7 +1268,7 @@ void TestNestedPointerBufferImageTable() {
   const auto& image_indirect = image_source.indirect_descriptor;
   Check(image_indirect && !image_indirect->table_maximum &&
             image_indirect->pointer_table &&
-            image_indirect->pointer_table->buffer_offset == vsharp_offset &&
+            image_indirect->pointer_table->vsharp_offset == vsharp_offset &&
             image_indirect->pointer_table->offset == image_offset,
         "the material image lost its V# hop, its in-buffer offset, or took a static row bound");
 
@@ -1318,6 +1304,13 @@ void TestNestedPointerBufferImageTable() {
     Check(snapshot.images[row + 1u].dwords[0] == 10u + row,
           "a material image was read from the wrong row or the wrong V#");
 
+  // A zero pointer row reads its V# from the first page, through the same
+  // reader as any other row.
+  *at(table + 2u * 16u + 8u) = 0u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "a zero material pointer bypassed the specialization reader");
+  *at(table + 2u * 16u + 8u) = materials + 2u * 0x100u;
+
   // A V# whose size ends before the image reads zeros there: a null image,
   // not the bytes after the buffer.
   *at(materials + vsharp_offset + 8u) = image_offset;
@@ -1331,7 +1324,7 @@ void TestNestedPointerBufferImageTable() {
   const auto other_plan = ExtractResourcePlan(other->program);
   Check(other_plan.info.images.size() == 1u &&
             other_plan.descriptor_sources[other_plan.info.images[0].source]
-                    .indirect_descriptor->pointer_table->buffer_offset == 48u,
+                    .indirect_descriptor->pointer_table->vsharp_offset == 48u,
         "the V# hop did not keep its own offset");
 }
 

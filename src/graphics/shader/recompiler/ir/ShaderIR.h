@@ -627,7 +627,7 @@ struct DescriptorSource {
 			bool indexed = false; // Parent pointers use raw MUBUF record addressing.
 			// When set, the pointer leads to a V# at this offset, and `offset` is the descriptor's
 			// offset in that V#'s buffer.
-			std::optional<uint32_t> buffer_offset;
+			std::optional<uint32_t> vsharp_offset;
 
 			bool operator==(const PointerTable& other) const = default;
 		};

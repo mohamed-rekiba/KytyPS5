@@ -744,14 +744,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					if (!ReadScalarTable(table_base, table_size, table_offset, runtime, address))
 						return read_failed("parent pointer read", word, 0u, table_base, table_offset, sizeof(address));
 					pointer_base = (uint64_t {address[1]} << 32u) | address[0];
-					if (pointer->buffer_offset) {
+					if (pointer->vsharp_offset) {
 						// The descriptor is in the buffer of the V# the pointer leads to, and reads
 						// past that buffer's size are zero, as on the GPU.
 						DescriptorValue vsharp {.dword_count = 4u};
-						if (!ReadScalarTable(pointer_base, UINT64_MAX, *pointer->buffer_offset, runtime,
+						if (!ReadScalarTable(pointer_base, UINT64_MAX, *pointer->vsharp_offset, runtime,
 						                     std::span(vsharp.dwords).first(4u)))
 							return read_failed("child buffer read", word, 0u, pointer_base,
-							                   *pointer->buffer_offset, 16u);
+							                   *pointer->vsharp_offset, 16u);
 						ShaderBufferResource buffer;
 						if (!DecodeBufferDescriptor(vsharp, buffer)) return false;
 						pointer_base = buffer.Base48();
