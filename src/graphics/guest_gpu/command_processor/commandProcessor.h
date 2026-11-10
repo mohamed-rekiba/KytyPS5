@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -170,6 +171,15 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	// Labels this queue wrote in GPU order (ReleaseMem) while that write had not finished. A later
+	// WAIT_REG_MEM of this queue that the value meets runs after the write on the GPU anyway, so
+	// it needs no host wait.
+	struct GpuOrderedLabel {
+		uint64_t value = 0;
+		uint64_t size  = 0;
+		uint64_t tick  = 0;
+	};
+	std::unordered_map<uint64_t, GpuOrderedLabel> m_gpu_ordered_labels;
 };
 
 } // namespace Libs::Graphics

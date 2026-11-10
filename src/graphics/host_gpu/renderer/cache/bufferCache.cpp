@@ -1288,6 +1288,14 @@ bool BufferCache::ReadGuestBacked(uint64_t vaddr, void* data, uint64_t size) {
 	return LibKernel::Memory::TryReadBacking(vaddr, data, size);
 }
 
+uint64_t BufferCache::PendingGuestBackedWrite(uint64_t vaddr, uint64_t size) {
+	if (!m_import.Enabled() || !GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	const auto last_write = m_guest_backed_writes.LastWrite(vaddr, size);
+	return last_write != 0 && !m_scheduler.IsFree(last_write) ? last_write : 0;
+}
+
 bool BufferCache::WriteGuestBacked(uint64_t vaddr, const void* data, uint64_t size) {
 	// Labels and other guest writes may name any address; the page table covers guest ranges only.
 	if (!m_import.Enabled() || !GuestRange {vaddr, size}.Valid()) {

@@ -390,6 +390,9 @@ void CommandProcessor::WaitForRewind(bool valid) {
 	}
 }
 
+// Labels a command processor keeps for WAIT_REG_MEM (m_gpu_ordered_labels).
+constexpr size_t MaxGpuOrderedLabels = 256;
+
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
 	switch (func) {
 		case 0: return true;
@@ -412,6 +415,18 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
 
+	if (const auto it = m_gpu_ordered_labels.find(reinterpret_cast<uint64_t>(addr));
+	    it != m_gpu_ordered_labels.end()) {
+		const auto label = it->second;
+		const bool current =
+		    label.size >= sizeof(T) && m_renderer.GetBufferCache().PendingGuestBackedWrite(
+		                                   it->first, label.size) == label.tick;
+		if (!current) {
+			m_gpu_ordered_labels.erase(it);
+		} else if (TestWaitRegMemValue(static_cast<T>(label.value), ref, mask, func)) {
+			return;
+		}
+	}
 	if (!TestWaitRegMemValue(ReadMemory(addr), ref, mask, func)) {
 		SuspendPm4();
 	}
@@ -1375,6 +1390,31 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	const auto write_label = [this, address](const void* value, uint64_t size) {
 		const auto vaddr   = reinterpret_cast<uint64_t>(address);
 		auto&      buffers = m_renderer.GetBufferCache();
+		// A GPU write to the label that has not finished, such as a fill of guest-backed memory,
+		// would land over a CPU write, and the CPU write would first wait for the GPU to idle.
+		// The label is then written in GPU order after it, at the end of the pipe as on hardware.
+		// Its readers already wait for the GPU writes of guest-backed bytes.
+		if ((vaddr & 3u) == 0 && buffers.PendingGuestBackedWrite(vaddr, size) != 0) {
+			std::array<uint32_t, 2> words {};
+			std::memcpy(words.data(), value, size);
+			for (uint64_t offset = 0; offset < size; offset += sizeof(uint32_t)) {
+				buffers.FillBuffer(vaddr + offset, sizeof(uint32_t),
+				                   words[offset / sizeof(uint32_t)], false);
+			}
+			uint64_t label = 0;
+			std::memcpy(&label, value, size);
+			if (m_gpu_ordered_labels.size() >= MaxGpuOrderedLabels) {
+				std::erase_if(m_gpu_ordered_labels, [&buffers](const auto& entry) {
+					return buffers.PendingGuestBackedWrite(entry.first, entry.second.size) !=
+					       entry.second.tick;
+				});
+			}
+			const auto tick = buffers.PendingGuestBackedWrite(vaddr, size);
+			if (tick != 0 && m_gpu_ordered_labels.size() < MaxGpuOrderedLabels) {
+				m_gpu_ordered_labels[vaddr] = {label, size, tick};
+			}
+			return;
+		}
 		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
 		    buffers.HasGpuDirtyBytes(vaddr, size) ||
 		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {

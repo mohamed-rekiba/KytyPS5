@@ -108,6 +108,9 @@ public:
 	// range; the caller then accesses guest memory as usual.
 	[[nodiscard]] bool ReadGuestBacked(uint64_t vaddr, void* data, uint64_t size);
 	[[nodiscard]] bool WriteGuestBacked(uint64_t vaddr, const void* data, uint64_t size);
+	// GPU thread. The tick of the last GPU write to these bytes of guest-backed memory while it
+	// has not finished, otherwise 0.
+	[[nodiscard]] uint64_t PendingGuestBackedWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	// Any thread (the front worker, see frontWorker.h); HasGpuDirtyBytes is for the GPU thread.
