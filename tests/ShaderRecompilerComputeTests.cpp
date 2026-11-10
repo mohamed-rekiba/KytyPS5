@@ -4621,6 +4621,10 @@ public:
           2, 0, reinterpret_cast<void *>(address), label_value, 0);
       gpu.Submit(packet);
       gpu.WaitForIdle();
+      // A label over bytes the GPU is still writing lands in GPU order, when
+      // the GPU gets there; a guest read of its page waits for that. The page
+      // is read here without that wait, so the GPU's work is waited for first.
+      gpu.SendCommandSync([&] { resources.GetCommandScheduler().Finish(); });
       uint64_t label = 0;
       return LibKernel::Memory::TryReadBacking(address, &label,
                                                sizeof(label)) &&
