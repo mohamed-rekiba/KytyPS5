@@ -23,6 +23,8 @@ public:
 	}
 
 	U32  GetUserData(ScalarReg reg);
+	// Dword `slot` of the values the linker leaves out of the code (see LinkCallTable).
+	U32  GetLinkedConstant(uint32_t slot);
 	U32  GetScalarReg(ScalarReg reg);
 	void SetScalarReg(ScalarReg reg, U32 value);
 	U1   GetThreadBitScalarReg(ScalarReg reg);

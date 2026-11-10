@@ -15,6 +15,10 @@ U32 IREmitter::GetUserData(ScalarReg reg) {
 	return U32(Emit(ValueOpcode::GetUserData, {Value(reg)}));
 }
 
+U32 IREmitter::GetLinkedConstant(uint32_t slot) {
+	return U32(Emit(ValueOpcode::GetLinkedConstant, {Value(slot)}));
+}
+
 U32 IREmitter::GetScalarReg(ScalarReg reg) {
 	return U32(Emit(ValueOpcode::GetScalarRegister, {Value(reg)}));
 }

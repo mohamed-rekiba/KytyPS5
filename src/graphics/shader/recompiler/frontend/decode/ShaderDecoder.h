@@ -783,6 +783,9 @@ enum class OperandKind {
 	PrivateLimit,
 	Null,
 	Vgpr,
+	// Not an encoding: a value the linker leaves out of the code, read at dispatch from slot
+	// `value` (IR GetLinkedConstant).
+	LinkedConstant,
 };
 
 enum ImageSampleFlag : uint32_t {

@@ -8448,6 +8448,112 @@ void TestCallThroughTableLinksEveryFunction() {
   (void)TranslateProgram(source.linked->decoded, options);
 }
 
+void TestCallTableLinkIsAddressFree() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe0040000ull;
+  // The waterfall of TestCallThroughTableLinksEveryFunction: entries of 16
+  // bytes {function, data}, each pass calls the function of the first lane's.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 255),
+      static_cast<uint32_t>(base),
+      EncodeSMovB32(1, 255),
+      static_cast<uint32_t>(base >> 32u) | (16u << 16u), // stride 16
+      EncodeSMovB32(2, 130),                             // 2 records
+      EncodeSMovB32(3, 255),
+      0x00005204u,
+      0x7e100500u,                 // v_readfirstlane_b32 s8, v0
+      EncodeSop2(0x1e, 8, 8, 132), // s_lshl_b32 s8, s8, 4
+      0xf4280400u,
+      0x10000000u, // s_buffer_load_dwordx4 s[16:19], s[0:3], s8
+      0xbf8cc07fu, // s_waitcnt lgkmcnt(0)
+      EncodeSMovB32(14, 16),
+      EncodeSMovB32(15, 17),
+      EncodeSop1(0x21, 14, 14),  // s_swappc_b64 s[14:15], s[14:15]
+      EncodeSopp(0x05, 0xfff7u), // s_cbranch_scc1 to the read
+      EncodeSopp(0x01)};
+  struct Memory {
+    std::array<uint32_t, 64> words{};
+  };
+  // The same two functions, loaded at offsets `first` and `second` from base.
+  const auto load = [](Memory &memory, uint32_t first, uint32_t second) {
+    memory.words = {};
+    memory.words[0] = static_cast<uint32_t>(base + first);
+    memory.words[1] = static_cast<uint32_t>(base >> 32u);
+    memory.words[4] = static_cast<uint32_t>(base + second);
+    memory.words[5] = static_cast<uint32_t>(base >> 32u);
+    memory.words[first / 4u] = EncodeSMovB32(20, 129); // s_mov_b32 s20, 1
+    memory.words[first / 4u + 1u] = EncodeSop1(0x20, 0, 14);
+    memory.words[second / 4u] = EncodeSMovB32(20, 130); // s_mov_b32 s20, 2
+    memory.words[second / 4u + 1u] = EncodeSop1(0x20, 0, 14);
+  };
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto &m = *static_cast<Memory *>(data);
+    const uint64_t end = base + m.words.size() * 4u;
+    if (address < base || address > end || out.size_bytes() > end - address)
+      return false;
+    std::memcpy(out.data(),
+                reinterpret_cast<const uint8_t *>(m.words.data()) + address -
+                    base,
+                out.size_bytes());
+    return true;
+  };
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  const auto spirv = [&](const ShaderSource &source,
+                         const IR::SrtRuntime &runtime) {
+    auto translated = TranslateProgram(source.linked->decoded, options);
+    const auto plan = IR::ExtractResourcePlan(translated.program);
+    IR::ResourceSnapshot resources;
+    IR::ResourceSpecialization specialization;
+    Check(IR::MaterializeResources(plan, runtime, resources, specialization),
+          "the table call's resources did not materialize");
+    return CompileProgram(std::move(translated), options, specialization).spirv;
+  };
+
+  // A load order puts the functions at other addresses: the program is the
+  // same.
+  Memory one, two;
+  load(one, 0x40, 0x60);
+  load(two, 0xa0, 0x80);
+  IR::SrtRuntime runtime_one{.userdata = &one,
+                             .read_specialization_memory = read};
+  IR::SrtRuntime runtime_two{.userdata = &two,
+                             .read_specialization_memory = read};
+  auto source_one = PrepareShaderSource(shader, options);
+  auto source_two = PrepareShaderSource(shader, options);
+  (void)RefreshShaderSource(source_one, runtime_one);
+  (void)RefreshShaderSource(source_two, runtime_two);
+  Check(source_one.linked->code == source_two.linked->code,
+        "the linked code of a table call holds its functions' addresses");
+  Check(spirv(source_one, runtime_one) == spirv(source_two, runtime_two),
+        "the SPIR-V of a table call holds its functions' addresses");
+
+  // The same functions moved: the linking holds, with the new addresses.
+  const auto revision = source_one.revision;
+  load(one, 0xa0, 0x80);
+  (void)RefreshShaderSource(source_one, runtime_one);
+  Check(source_one.revision == revision,
+        "functions that only moved were linked again");
+  // A moved function with new code is linked again.
+  one.words[0xa0 / 4u] = EncodeSMovB32(20, 131);
+  (void)RefreshShaderSource(source_one, runtime_one);
+  Check(source_one.revision == revision + 1u,
+        "a moved function with new code was not linked again");
+  // The first functions again, at other addresses: the parked linking comes
+  // back, and compares with the new addresses.
+  load(one, 0x60, 0x40);
+  (void)RefreshShaderSource(source_one, runtime_one);
+  Check(source_one.revision == revision + 2u &&
+            source_one.linked->code == source_two.linked->code,
+        "a parked linking of the same functions was not taken back");
+  const auto &constants = source_one.linked->constants;
+  const auto holds_address = [&](uint32_t offset) {
+    return std::ranges::find(constants, static_cast<uint32_t>(base + offset)) !=
+           constants.end();
+  };
+  Check(constants.size() == 4u && holds_address(0x60) && holds_address(0x40),
+        "a parked linking kept the addresses it was linked with");
+}
+
 void TestCallInLoopIsSkipped() {
   using namespace ShaderRecompiler;
   // A waterfall loop calls through s[14:15]; the target changes per iteration,
@@ -14940,6 +15046,7 @@ int main() {
   TestMemoryFedScalarLeafCall();
   TestCallInLoopIsSkipped();
   TestCallThroughTableLinksEveryFunction();
+  TestCallTableLinkIsAddressFree();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

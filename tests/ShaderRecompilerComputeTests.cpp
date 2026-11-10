@@ -13930,6 +13930,148 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A call through a table of functions: a load order that moves the functions
+  // keeps the program, and each entry still calls its own function (the chain
+  // reads the targets it compares with at dispatch).
+  void CheckCallTableMovedFunctions() {
+    constexpr const char *name = "CallTableMovedFunctions";
+    constexpr uintptr_t base = 0x0000000204b00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto table = base + 0x100;
+    constexpr auto output = base + 0x4000;
+    // s[8:11] = the table (16-byte entries {function, data}, 2 records); s12 =
+    // the entry of the first lane plus user s4; call it and store s20, which
+    // the function sets.
+    std::vector<u32> code{
+        EncodeSMovB32(8, 255),
+        static_cast<u32>(table),
+        EncodeSMovB32(9, 255),
+        static_cast<u32>(table >> 32u) | (16u << 16u),
+        EncodeSMovB32(10, InlineU32(2)),
+        EncodeSMovB32(11, 255),
+        0x00005204u,
+        EncodeSMovB32(20, InlineU32(0)),
+        0x7e180500u,                            // v_readfirstlane_b32 s12, v0
+        EncodeSop2(0x00, 12, 12, 4),            // s_add_u32 s12, s12, s4
+        EncodeSop2(0x1e, 12, 12, InlineU32(4)), // s_lshl_b32 s12, s12, 4
+        0xf4280404u,
+        0x18000000u, // s_buffer_load_dwordx4 s[16:19], s[8:11], s12
+        0xbf8cc07fu, // s_waitcnt lgkmcnt(0)
+        EncodeSMovB32(14, 16),
+        EncodeSMovB32(15, 17),
+        EncodeSop1(0x21, 14, 14), // s_swappc_b64 s[14:15], s[14:15]
+        EncodeVop1(0x01, 1, 20),  // v_mov_b32 v1, s20
+        EncodeMubuf0(0x1c, 0, false),
+        EncodeMubuf1(1, 0, 0)};
+    AppendEnd(&code);
+    ShaderMapUserData(
+        reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size,
+                0, &physical) == 0,
+            "table fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                     physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "table fixture mapping failed");
+    std::memset(mapped, 0, size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1,
+                           .num_thread_y = 1,
+                           .num_thread_z = 1,
+                           .wave_size = 64,
+                           .user_sgpr = 5});
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = 4;
+      out.fields[3] =
+          DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; ++i)
+        shaders.SetCsUserSgpr(i, out.fields[i]);
+      // Functions A (s20 = 41) and B (s20 = 73), loaded at `a` and `b`; entry 0
+      // calls A.
+      const auto load = [&](uint64_t a, uint64_t b) {
+        Require(name, "reload functions",
+                context.InvalidateMemory(base + 0x1000, 0x3000),
+                "functions escaped mapped memory");
+        std::vector<u32> clear(0x3000 / 4u, 0u);
+        LibKernel::Memory::WriteBacking(base + 0x1000, clear.data(), 0x3000);
+        for (const auto &[address, value] :
+             {std::pair{a, 41u}, std::pair{b, 73u}}) {
+          const std::array function{EncodeSMovB32(20, 255), value,
+                                    EncodeSop1(0x20, 0, 14)};
+          LibKernel::Memory::WriteBacking(address, function.data(),
+                                          sizeof(function));
+        }
+        const std::array<u32, 8> entries{
+            static_cast<u32>(a), static_cast<u32>(a >> 32u), 0, 0,
+            static_cast<u32>(b), static_cast<u32>(b >> 32u), 0, 0};
+        Require(name, "reload table",
+                context.InvalidateMemory(table, sizeof(entries)),
+                "table escaped mapped memory");
+        LibKernel::Memory::WriteBacking(table, entries.data(), sizeof(entries));
+      };
+      uint64_t original_id = 0;
+      for (const auto &[a, b] : {std::pair{base + 0x1000, base + 0x2000},
+                                 std::pair{base + 0x3000, base + 0x1800}}) {
+        load(a, b);
+        for (const auto &[entry, expected] :
+             {std::pair{0u, 41u}, std::pair{1u, 73u}}) {
+          shaders.SetCsUserSgpr(4, entry);
+          Require(name, "reset output", context.InvalidateMemory(output, 4),
+                  "output escaped mapped memory");
+          const u32 zero = 0;
+          LibKernel::Memory::WriteBacking(output, &zero, sizeof(zero));
+          ShaderComputeInputInfo input{};
+          const auto program = context.GetPipelineCache().GetComputeProgram(
+              shaders.GetCs(), input);
+          if (original_id == 0)
+            original_id = program->id;
+          Require(name, "same program for moved functions",
+                  program->id == original_id,
+                  "moving the table's functions changed the program");
+          DispatchNow(context, processor, 1, 1, 1, 0x41u);
+          cache.ReadMemory(output, sizeof(u32));
+          u32 actual = 0;
+          Require(name, "entry calls its function",
+                  LibKernel::Memory::TryReadBacking(output, &actual,
+                                                    sizeof(actual)) &&
+                      actual == expected,
+                  "entry " + std::to_string(entry) + " stored " +
+                      std::to_string(actual) + ", expected " +
+                      std::to_string(expected));
+        }
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release",
+            LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical,
+                                                                size) == 0,
+            "table fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckScalarLeafCall() {
     constexpr const char* name = "ScalarLeafCall";
     constexpr uintptr_t base = 0x0000000204800000ull;
@@ -58922,6 +59064,7 @@ int RunSelectedCases(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scalar-leaf-call-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckScalarLeafCall();
+    vulkan.CheckCallTableMovedFunctions();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
@@ -58941,6 +59084,7 @@ int RunSelectedCases(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
     vulkan.CheckScalarLeafCall();
+    vulkan.CheckCallTableMovedFunctions();
     CheckAgcSystemTable(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
@@ -59559,6 +59703,7 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
+  vulkan.CheckCallTableMovedFunctions();
   if (vulkan.NotRunCaseCount() > 0) {
     std::printf("ShaderRecompilerComputeTests: %u cases not run on this "
                 "device, which lacks a "

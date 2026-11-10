@@ -673,8 +673,14 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
 	auto entry = m_program_cache.find(m_lookup_key);
-	const auto bind = [&](const ShaderModule& module) {
-		input_info.stage = {.module = &module, .resources = &entry->second.resources};
+	const auto bind  = [&](const ShaderModule& module) {
+		const auto& source = entry->second.call_source;
+		input_info.stage   = {.module    = &module,
+		                      .resources = &entry->second.resources,
+		                      .linked_constants =
+		                          source && source->linked
+		                              ? std::span<const uint32_t>(source->linked->constants)
+		                              : std::span<const uint32_t> {}};
 		module.info.bindings.AdvancePushData(push_data_cursor);
 		return &module;
 	};

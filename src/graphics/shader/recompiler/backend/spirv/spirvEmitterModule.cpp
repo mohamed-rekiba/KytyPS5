@@ -275,6 +275,10 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 3u;
 	}
+	if (info.linked_constants != 0) {
+		bindings.linked_constant_dword = bindings.memory_offset_dword;
+		bindings.memory_offset_dword += info.linked_constants;
+	}
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =

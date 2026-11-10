@@ -505,6 +505,8 @@ struct Bindings {
 	uint64_t descriptor_mask = 0;
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
+	// The values a linked call table compares its targets with, one dword each.
+	uint32_t linked_constant_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
@@ -553,6 +555,8 @@ struct ShaderInfo {
 	bool                            uses_flattened_srt            = false;
 	bool                            uses_image_heap               = false;
 	bool                            uses_dispatch_threads         = false;
+	// The slots GetLinkedConstant reads.
+	uint32_t                        linked_constants              = 0;
 	bool                            bvh                           = false;
 	bool                            bvh8                          = false;
 	bool                            bvh_stack                     = false;

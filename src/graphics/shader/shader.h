@@ -39,6 +39,10 @@ struct ShaderModule;
 struct ShaderStageRuntime {
 	const ShaderModule*                           module    = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot* resources = nullptr;
+	// The values of the module's linked constants for this dispatch: the targets a linked call
+	// table compares with (see ShaderSource::Linked::constants). They live in the program's
+	// linking, which the next lookup of the program may replace: PrepareBindings copies them.
+	std::span<const uint32_t> linked_constants;
 
 	[[nodiscard]] explicit operator bool() const {
 		return module != nullptr && resources != nullptr;
