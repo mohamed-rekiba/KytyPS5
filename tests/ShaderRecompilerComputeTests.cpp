@@ -40,6 +40,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -90,11 +91,13 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <future>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -109,6 +112,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -1511,6 +1515,59 @@ void ExpectFatal(const char *name, Function function) {
   std::printf("[host]    %-32s ok\n", name);
 }
 #endif
+
+// At most `threads` compiles run at once, and a cancel completes the ones
+// that have not started without running them.
+void CheckPipelineCompileQueue() {
+  constexpr const char *name = "PipelineCompileQueue";
+  std::atomic<int> running{0}, peak{0}, finished{0};
+  std::mutex mutex;
+  std::condition_variable released;
+  bool release = false;
+  std::vector<PipelineCompileQueue::Ticket> tickets;
+  {
+    PipelineCompileQueue queue(2);
+    for (int i = 0; i < 6; i++) {
+      tickets.push_back(queue.Post([&] {
+        const int now = ++running;
+        int seen = peak.load();
+        while (now > seen && !peak.compare_exchange_weak(seen, now)) {
+        }
+        std::unique_lock lock(mutex);
+        released.wait(lock, [&] { return release; });
+        --running;
+        ++finished;
+      }));
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (running.load() < 2) {
+      Require(name, "workers start",
+              std::chrono::steady_clock::now() < deadline,
+              "two posted compiles did not start");
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Require(name, "bounded concurrency", peak.load() == 2,
+            "more compiles ran at once than the queue has workers");
+    queue.CancelQueued();
+    {
+      std::scoped_lock lock(mutex);
+      release = true;
+    }
+    released.notify_all();
+  }
+  int dropped = 0;
+  for (auto &ticket : tickets) {
+    ticket.done.wait();
+    dropped += ticket.ran->load() ? 0 : 1;
+  }
+  Require(name, "cancel drops queued compiles",
+          finished.load() == 2 && dropped == 4,
+          "finished=" + std::to_string(finished.load()) +
+              " dropped=" + std::to_string(dropped));
+  std::printf("[host]    %-32s ok\n", name);
+}
 
 void CheckLeastRecentlyUsedCacheOrdering() {
   Common::LeastRecentlyUsedCache<uint32_t, uint64_t> cache;
@@ -14059,6 +14116,96 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A pipeline that takes longer than the compile budget is built on a worker:
+  // its dispatches are skipped until it is ready, then run as usual.
+  void CheckBackgroundComputePipeline() {
+    constexpr const char *name = "BackgroundComputePipeline";
+    constexpr uintptr_t base = 0x0000000204d00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto output = base + 0x100;
+    std::vector<u32> code{EncodeSMovB32(20, 255), 0x5a5a1234u,
+                          EncodeVop1(0x01, 1, 20), // v_mov_b32 v1, s20
+                          EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0)};
+    AppendEnd(&code);
+    ShaderMapUserData(
+        reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size,
+                0, &physical) == 0,
+            "fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                     physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixture mapping failed");
+    std::memset(mapped, 0, size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    PipelineCache::SetCompileBudget(std::chrono::milliseconds(0));
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1,
+                           .num_thread_y = 1,
+                           .num_thread_z = 1,
+                           .wave_size = 64,
+                           .user_sgpr = 4});
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = 4;
+      out.fields[3] =
+          DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; ++i)
+        shaders.SetCsUserSgpr(i, out.fields[i]);
+      const auto read_output = [&] {
+        cache.ReadMemory(output, sizeof(u32));
+        u32 value = 0;
+        Require(
+            name, "read output",
+            LibKernel::Memory::TryReadBacking(output, &value, sizeof(value)),
+            "output was not readable");
+        return value;
+      };
+      // The first dispatch starts the compile and does not wait for it.
+      DispatchNow(context, processor, 1, 1, 1, 0x41u);
+      Require(name, "dispatch skipped while compiling", read_output() == 0u,
+              "a dispatch ran before its pipeline was built");
+      // Later dispatches skip until the worker is done, then run.
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      while (read_output() != 0x5a5a1234u) {
+        Require(name, "dispatch runs once built",
+                std::chrono::steady_clock::now() < deadline,
+                "the dispatch did not run after the background compile");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        DispatchNow(context, processor, 1, 1, 1, 0x41u);
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    PipelineCache::SetCompileBudget(PipelineCache::WaitForCompile);
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release",
+            LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical,
+                                                                size) == 0,
+            "fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // A call through a table of functions: a load order that moves the functions
   // keeps the program, and each entry still calls its own function (the chain
   // reads the targets it compares with at dispatch).
@@ -22191,7 +22338,8 @@ public:
       DrawRenderState state{.depth_info = depth, .color_info = {color}, .color_count = 1,
                             .topology = topology, .ps_active = true,
                             .vertex_info = {vertex}, .ps_input_info = pixel};
-      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
+      return *context.GetPipelineCache().GetGraphicsPipeline(
+          scheduler.Current(), state);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected,
@@ -51956,7 +52104,7 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
                 input.lds_storage == (units > limit_units),
             "compute LDS was truncated or chose backing that exceeds the device limit");
     Require(name, "pipeline creation",
-            cache.GetComputePipeline(input).pipeline != nullptr,
+            cache.GetComputePipeline(input)->pipeline != nullptr,
             "full-size LDS shader did not create a Vulkan compute pipeline");
     if (previous_id != 0) {
       Require(name, "guest-size cache identity",
@@ -58335,6 +58483,7 @@ int RunSelectedCases(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckPipelineCompileQueue();
   PipelineCacheTestAccess::CheckCallPlansAreKept();
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
@@ -59194,6 +59343,7 @@ int RunSelectedCases(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckScalarLeafCall();
     vulkan.CheckCallTableMovedFunctions();
+    vulkan.CheckBackgroundComputePipeline();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
@@ -59214,6 +59364,7 @@ int RunSelectedCases(int argc, char **argv) {
     vulkan.CheckGpuCommandLane();
     vulkan.CheckScalarLeafCall();
     vulkan.CheckCallTableMovedFunctions();
+    vulkan.CheckBackgroundComputePipeline();
     CheckAgcSystemTable(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
@@ -59839,6 +59990,7 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
   vulkan.CheckCallTableMovedFunctions();
+  vulkan.CheckBackgroundComputePipeline();
   if (vulkan.NotRunCaseCount() > 0) {
     std::printf("ShaderRecompilerComputeTests: %u cases not run on this "
                 "device, which lacks a "

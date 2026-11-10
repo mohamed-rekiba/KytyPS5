@@ -1260,7 +1260,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
+	auto* compiled = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
+	if (compiled == nullptr) { // Still compiling on a worker: the draw is skipped.
+		return;
+	}
+	auto&                pipeline = *compiled;
 	vk::ImageAspectFlags feedback_aspects;
 	auto rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 	                                      state.depth_info, feedback_aspects, stages);

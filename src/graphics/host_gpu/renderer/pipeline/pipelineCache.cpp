@@ -37,6 +37,7 @@
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <ranges>
@@ -800,6 +801,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	return bind(compiled);
 }
 
+struct PipelineCache::PendingPipeline {
+	Pipeline                     pipeline;
+	PipelineCompileQueue::Ticket ticket;
+};
+
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
                              const std::filesystem::path&           shader_store)
@@ -818,6 +824,26 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 
 PipelineCache::~PipelineCache() {
 	m_prefetch.reset();
+	// The compiles that have not started are dropped; the running ones finish, and their
+	// pipelines are destroyed with the others.
+	if (m_compile_queue != nullptr) {
+		m_compile_queue->CancelQueued();
+	}
+	const auto keep = [this](auto& pending, auto& ready, auto&& store) {
+		for (auto& [key, job]: pending) {
+			job->ticket.done.wait();
+			if (job->ticket.ran->load(std::memory_order_acquire)) {
+				ready.emplace(key, job->pipeline);
+				store(key);
+				CheckpointDriverCache();
+			}
+		}
+		pending.clear();
+	};
+	keep(m_pending_compute, m_compute_pipelines, [](uint64_t) {});
+	keep(m_pending_graphics, m_graphics_pipelines,
+	     [this](const GraphicsPipelineKey& key) { StorePipeline(key); });
+	m_compile_queue.reset();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
@@ -1228,7 +1254,7 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	return GetProgram(params, input_info, push_data_cursor);
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
+PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state) {
 	const auto* colors        = state.color_info;
 	const auto& depth         = state.depth_info;
@@ -1396,54 +1422,128 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 	}
 
-	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
-	auto& pipeline        = iter->second;
-	if (!inserted) {
-		return pipeline;
+	if (const auto found = m_graphics_pipelines.find(key); found != m_graphics_pipelines.end()) {
+		return &found->second;
 	}
-
-	if (graphics_debug_dump_enabled()) {
+	if (graphics_debug_dump_enabled() && !m_pending_graphics.contains(key)) {
 		ShaderDbgDumpInputInfo(vs_input_info);
 		if (ps_active) {
 			ShaderDbgDumpInputInfo(ps_input_info);
 		}
 	}
-
-	{
-		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
-		                                         Common::DebugCounters::Counter::PipelineCreateNs,
-		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+	bool created  = false;
+	auto pipeline = ObtainPipeline(
+	    m_graphics_pipelines, m_pending_graphics, key,
+	    [&] {
+		    std::array<ShaderModule, 4> modules {};
+		    std::array<bool, 4>         present {};
+		    for (uint32_t i = 0; i < stages.size(); i++) {
+			    if (stages[i] != nullptr) {
+				    modules[i] = *stages[i];
+				    present[i] = true;
+			    }
+		    }
+		    return [this, key, modules, present](Pipeline& target) {
+			    std::array<const ShaderModule*, 4> copies {};
+			    for (uint32_t i = 0; i < copies.size(); i++) {
+				    copies[i] = present[i] ? &modules[i] : nullptr;
+			    }
+			    Common::DebugCounters::ScopedTimer timer(
+			        Common::DebugCounters::Counter::PipelinesCreated,
+			        Common::DebugCounters::Counter::PipelineCreateNs,
+			        Common::DebugCounters::Peak::PipelineCreateNs);
+			    CreatePipelineInternal(m_graphics, target, key, copies, m_driver_cache);
+		    };
+	    },
+	    created);
+	if (created) {
+		StorePipeline(key);
+		CheckpointDriverCache();
 	}
-	StorePipeline(key);
-	CheckpointDriverCache();
-
 	return pipeline;
 }
 
-PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
+namespace {
+
+std::atomic<int64_t> g_compile_budget_ms {PipelineCache::WaitForCompile.count()};
+
+} // namespace
+
+void PipelineCache::SetCompileBudget(std::chrono::milliseconds budget) noexcept {
+	g_compile_budget_ms.store(budget.count(), std::memory_order_relaxed);
+}
+
+template <class Ready, class Pending, class Key, class MakeTask>
+PipelineCache::Pipeline* PipelineCache::ObtainPipeline(Ready& ready, Pending& pending,
+                                                       const Key& key, MakeTask&& make_task,
+                                                       bool& created) {
+	created           = false;
+	const auto budget = g_compile_budget_ms.load(std::memory_order_relaxed);
+	auto       job    = pending.find(key);
+	if (job == pending.end()) {
+		auto task = make_task();
+		if (budget < 0) {
+			auto& pipeline = ready[key];
+			task(pipeline);
+			created = true;
+			return &pipeline;
+		}
+		if (m_compile_queue == nullptr) {
+			// Two at a time: a large compile can take minutes and gigabytes.
+			m_compile_queue = std::make_unique<PipelineCompileQueue>(2u);
+		}
+		auto started    = std::make_unique<PendingPipeline>();
+		started->ticket = m_compile_queue->Post(
+		    [task = std::move(task), target = started.get()] { task(target->pipeline); });
+		job = pending.emplace(key, std::move(started)).first;
+		// Only the request that queues the compile waits for it: a later one would wait again for
+		// a compile that is still queued behind others.
+		if (job->second->ticket.done.wait_for(std::chrono::milliseconds(budget)) !=
+		    std::future_status::ready) {
+			return nullptr;
+		}
+	} else if (budget < 0) {
+		job->second->ticket.done.wait();
+	} else if (job->second->ticket.done.wait_for(std::chrono::milliseconds(0)) !=
+	           std::future_status::ready) {
+		return nullptr;
+	}
+	// A compile is dropped only when the cache is destroyed.
+	EXIT_IF(!job->second->ticket.ran->load(std::memory_order_acquire));
+	auto& pipeline = ready.emplace(key, job->second->pipeline).first->second;
+	pending.erase(job);
+	created = true;
+	return &pipeline;
+}
+
+PipelineCache::Pipeline*
+PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	const auto& module = *input_info.stage.module;
-
-	auto [iter, inserted] = m_compute_pipelines.try_emplace(module.id);
-	auto& pipeline        = iter->second;
-	if (!inserted) {
-		return pipeline;
+	if (const auto found = m_compute_pipelines.find(module.id);
+	    found != m_compute_pipelines.end()) {
+		return &found->second;
 	}
-
-	if (graphics_debug_dump_enabled()) {
+	if (graphics_debug_dump_enabled() && !m_pending_compute.contains(module.id)) {
 		ShaderDbgDumpInputInfo(input_info);
 	}
-
-	{
-		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
-		                                         Common::DebugCounters::Counter::PipelineCreateNs,
-		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+	bool created  = false;
+	auto pipeline = ObtainPipeline(
+	    m_compute_pipelines, m_pending_compute, module.id,
+	    [&] {
+		    return [this, module](Pipeline& target) {
+			    Common::DebugCounters::ScopedTimer timer(
+			        Common::DebugCounters::Counter::PipelinesCreated,
+			        Common::DebugCounters::Counter::PipelineCreateNs,
+			        Common::DebugCounters::Peak::PipelineCreateNs);
+			    CreatePipelineInternal(m_graphics, target, module, m_driver_cache);
+		    };
+	    },
+	    created);
+	if (created) {
+		CheckpointDriverCache();
 	}
-	CheckpointDriverCache();
-
 	return pipeline;
 }
 } // namespace Libs::Graphics

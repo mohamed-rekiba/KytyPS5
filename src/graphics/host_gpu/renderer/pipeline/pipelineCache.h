@@ -8,6 +8,7 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -20,7 +21,9 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+
 #include <queue>
+
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -204,8 +207,18 @@ public:
 	                                      ShaderComputeInputInfo&      input_info,
 	                                      uint32_t                     push_data_start = 0);
 
-	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
-	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
+	// Null while the pipeline is still compiling on a worker (see SetCompileBudget): the caller
+	// skips the draw.
+	Pipeline* GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
+	// Null while the pipeline is still compiling on a worker (see SetCompileBudget): the caller
+	// skips the dispatch.
+	Pipeline* GetComputePipeline(const ShaderComputeInputInfo& input_info);
+
+	// The longest the GPU thread waits for a new pipeline. A longer compile goes on on a worker
+	// thread, and the work that needs the pipeline is skipped until it is ready, so that a slow
+	// driver compile cannot stop the game. WaitForCompile, the default, always waits.
+	static constexpr std::chrono::milliseconds WaitForCompile {-1};
+	static void SetCompileBudget(std::chrono::milliseconds budget) noexcept;
 
 	// Run-ahead (computePrescan.h): starts translating, on worker threads, the compute program a
 	// dispatch with these registers and initiator will need, when the program cache has none. A
@@ -281,6 +294,20 @@ private:
 	bool                          m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
+	// Pipelines that a worker is still compiling.
+	struct PendingPipeline;
+	std::unique_ptr<PipelineCompileQueue>                          m_compile_queue;
+	std::unordered_map<uint64_t, std::unique_ptr<PendingPipeline>> m_pending_compute;
+	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<PendingPipeline>,
+	                   GraphicsPipelineKeyHash>
+	    m_pending_graphics;
+	// The pipeline of `key` from `ready`, or null while a worker compiles it (see
+	// SetCompileBudget). `make_task()` gives the task that builds the pipeline: it owns what it
+	// reads, as the worker may run it after the caller's data is gone. `created` is set when the
+	// pipeline became ready.
+	template <class Ready, class Pending, class Key, class MakeTask>
+	Pipeline* ObtainPipeline(Ready& ready, Pending& pending, const Key& key, MakeTask&& make_task,
+	                         bool& created);
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created if a shader store is open, and writes the driver cache.
 	ShaderStoreWriter m_store;
