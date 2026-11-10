@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+#include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -926,7 +927,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	const auto colors       = std::span {state.color_info, state.color_count};
 	const auto pass_samples = state.depth_info.image_id ? state.depth_info.desc.info.samples
 	                                                    : state.color_info[0].desc.info.samples;
-	if (std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
+	// A depth-to-color copy runs no pass: CopyDepthToColor reads one depth sample per pixel.
+	if (!buffer.GetRegisters().GetRenderControl().copy_depth_to_color &&
+	    std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
 		    return color.desc.info.samples != pass_samples;
 	    })) {
 		const auto raster =
@@ -1057,9 +1060,14 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	const auto& hw = buffer.GetRegisters();
 	auto& depth = state.depth_info;
 	auto& color = state.color_info[0];
+	// A copy image command needs equal sample counts: a multisampled depth target goes through a
+	// shader that reads one sample.
+	const bool multisampled = depth.image_id && depth.desc.info.samples > 1;
+	// One rectangle: a rect list takes three vertices per rectangle, and leaves the rest unused.
 	EXIT_NOT_IMPLEMENTED(
-	    !m_context.GetGraphics().host.capabilities.maintenance8 ||
-	    !Prospero::IsRectList(ucfg.GetPrimType()) || draw.indexed || draw.index_count != 3 ||
+	    (!multisampled && !m_context.GetGraphics().host.capabilities.maintenance8) ||
+	    (multisampled && depth.desc.view_info.base_level != 0) ||
+	    !Prospero::IsRectList(ucfg.GetPrimType()) || draw.indexed || draw.index_count / 3u != 1u ||
 	    draw.instance_count != 1 || emit.vertex_offset != 0 || emit.first_instance != 0 ||
 	    state.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
 	    color.desc.info.samples != 1 || depth.desc.info.extent.width != color.Extent().width ||
@@ -1069,9 +1077,23 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	    state.ps_input_info.ps_depth_export_enable ||
 	    state.ps_input_info.ps_sample_mask_export_enable);
 	vk::ImageAspectFlags feedback;
-	const auto rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
-	if (depth.load_clear_aspects) {
-		buffer.BeginRendering(rendering);
+	RenderState          rendering;
+	if (multisampled) {
+		// A pass takes one sample count: acquire the targets apart, so that a pending depth clear
+		// runs in a pass of the depth target alone.
+		RenderDepthInfo no_depth {};
+		const auto      color_area = AcquireRenderTargets(buffer, &color, 1, no_depth, feedback);
+		rendering                  = AcquireRenderTargets(buffer, &color, 0, depth, feedback);
+		if (depth.load_clear_aspects) {
+			buffer.BeginRendering(rendering);
+		}
+		rendering.width  = std::min(rendering.width, color_area.width);
+		rendering.height = std::min(rendering.height, color_area.height);
+	} else {
+		rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
+		if (depth.load_clear_aspects) {
+			buffer.BeginRendering(rendering);
+		}
 	}
 	auto& cache = m_context.GetTextureCache();
 	auto& source = cache.GetImage(depth.image_id);
@@ -1081,7 +1103,19 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	                     destination.backing.format != vk::Format::eR32Sfloat);
 	const auto rect = calc_final_scissor(hw.GetScreenViewport(), hw.GetScanModeControl(),
 	                                    {rendering.width, rendering.height}, 0);
-	if (rect.right > rect.left && rect.bottom > rect.top) {
+	if (rect.right > rect.left && rect.bottom > rect.top && multisampled) {
+		const auto& rc = hw.GetRenderControl();
+		// The register description gives sample 0 as the centroid of a fully covered pixel. This
+		// is not measured on hardware.
+		const uint32_t sample = rc.copy_centroid ? 0u : rc.copy_sample;
+		buffer.EndRendering();
+		cache.m_blit_helper.CopyDepthSampleToColor(
+		    source, depth.desc.view_info.base_layer, destination, color.desc.view_info.base_level,
+		    color.desc.view_info.base_layer, sample,
+		    {{rect.left, rect.top},
+		     {static_cast<uint32_t>(rect.right - rect.left),
+		      static_cast<uint32_t>(rect.bottom - rect.top)}});
+	} else if (rect.right > rect.left && rect.bottom > rect.top) {
 		const vk::ImageCopy region {
 		    {vk::ImageAspectFlagBits::eDepth, depth.desc.view_info.base_level,
 		     depth.desc.view_info.base_layer, 1}, {rect.left, rect.top, 0},

@@ -316,11 +316,13 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		           static_cast<unsigned long long>(z.stencil_write_base_addr),
 		           static_cast<unsigned long long>(z.stencil_read_base_addr));
 	}
+	// num_samples is log2 of the sample count. CopyDepthToColor checks the color target.
 	if (rc.copy_depth_to_color &&
-	    (z.z_info.num_samples != 0 || rc.copy_sample != 0 ||
-	     z.z_info.format != Prospero::DepthFormat::kZ32F ||
-	     dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable || dc.stencil_enable ||
-	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
+	    (z.z_info.num_samples > 2 ||
+	     (!rc.copy_centroid && rc.copy_sample >= (1u << z.z_info.num_samples)) ||
+	     z.z_info.format != Prospero::DepthFormat::kZ32F || dc.z_enable || dc.z_write_enable ||
+	     dc.depth_bounds_enable || dc.stencil_enable || rc.depth_clear_enable ||
+	     rc.stencil_clear_enable)) {
 		DepthFatal("unsupported depth-to-color copy state");
 	}
 	r.desc = MakeDepthTargetDesc(buffer, z);

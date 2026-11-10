@@ -5187,6 +5187,135 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // A depth-to-color copy from a multisampled depth target into a single-sample
+  // R32 float target copies one sample per pixel, only inside the copy area.
+  void CheckDepthSampleToColorBlit() {
+    EnsureRuntimeContext();
+    constexpr const char *name = "DepthSampleToColorBlit";
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    BlitHelper blit(m_runtime_context, scheduler);
+
+    constexpr uint32_t width = 4;
+    constexpr uint32_t height = 4;
+    constexpr std::array<float, 2> sample_depth{0.25f, 0.75f};
+    constexpr float sentinel = -1.0f;
+
+    ImageInfo seed_info{};
+    seed_info.pixel_format = vk::Format::eR32G32Sfloat;
+    seed_info.guest_format = Prospero::BufferFormat::k32_32Float;
+    seed_info.type = Prospero::ImageType::kColor2D;
+    seed_info.extent = {width, height, 1};
+    seed_info.resources = {1, 1};
+    seed_info.pitch = width;
+    seed_info.bytes_per_block = 8;
+    seed_info.samples = 1;
+    seed_info.tile_mode = Prospero::TileMode::kLinear;
+    seed_info.mip_layout[0] = {0, width * height * 8, width, height};
+    Libs::Graphics::Image seed(m_runtime_context, scheduler, seed_info);
+
+    auto depth_info = seed_info;
+    depth_info.pixel_format = vk::Format::eD32SfloatS8Uint;
+    depth_info.guest_format = Prospero::BufferFormat::k32Float;
+    depth_info.bytes_per_block = 4;
+    depth_info.samples = 2;
+    depth_info.tile_mode = Prospero::TileMode::kDepth;
+    depth_info.mip_layout[0] = {0, width * height * 4, width, height};
+    Libs::Graphics::Image depth(m_runtime_context, scheduler, depth_info);
+
+    auto color_info = depth_info;
+    color_info.pixel_format = vk::Format::eR32Sfloat;
+    color_info.samples = 1;
+    color_info.tile_mode = Prospero::TileMode::kRenderTarget;
+    std::array<std::unique_ptr<Libs::Graphics::Image>, 2> colors{
+        std::make_unique<Libs::Graphics::Image>(m_runtime_context, scheduler,
+                                                color_info),
+        std::make_unique<Libs::Graphics::Image>(m_runtime_context, scheduler,
+                                                color_info)};
+
+    auto command = scheduler.Current().Handle();
+    const vk::ImageSubresourceRange color_range{vk::ImageAspectFlagBits::eColor,
+                                                0, 1, 0, 1};
+    seed.Transit(vk::ImageLayout::eTransferDstOptimal,
+                 vk::AccessFlagBits2::eTransferWrite, {}, command);
+    const vk::ClearColorValue seed_value{
+        std::array<float, 4>{sample_depth[0], sample_depth[1], 0.0f, 0.0f}};
+    command.clearColorImage(seed.backing.image,
+                            vk::ImageLayout::eTransferDstOptimal, &seed_value,
+                            1, &color_range);
+    const vk::ClearColorValue sentinel_value{
+        std::array<float, 4>{sentinel, 0.0f, 0.0f, 0.0f}};
+    for (auto &color : colors) {
+      color->Transit(vk::ImageLayout::eTransferDstOptimal,
+                     vk::AccessFlagBits2::eTransferWrite, {}, command);
+      command.clearColorImage(color->backing.image,
+                              vk::ImageLayout::eTransferDstOptimal,
+                              &sentinel_value, 1, &color_range);
+    }
+    // Sample i of each depth pixel takes channel i of the seed.
+    blit.ReinterpretColorAsMsDepth(seed, depth);
+    // Sample 1 into the left half of the first target; sample 0 into all of the
+    // second.
+    blit.CopyDepthSampleToColor(depth, 0, *colors[0], 0, 0, 1,
+                                vk::Rect2D{{0, 0}, {width / 2, height}});
+    blit.CopyDepthSampleToColor(depth, 0, *colors[1], 0, 0, 0,
+                                vk::Rect2D{{0, 0}, {width, height}});
+
+    constexpr uint32_t pixels = width * height;
+    std::array<Buffer, 2> readbacks{
+        CreateHostBuffer(name, pixels * sizeof(float),
+                         vk::BufferUsageFlagBits::eTransferDst,
+                         std::vector<u32>(pixels, 0)),
+        CreateHostBuffer(name, pixels * sizeof(float),
+                         vk::BufferUsageFlagBits::eTransferDst,
+                         std::vector<u32>(pixels, 0))};
+    command = scheduler.Current().Handle();
+    for (uint32_t index = 0; index < colors.size(); index++) {
+      colors[index]->Transit(vk::ImageLayout::eTransferSrcOptimal,
+                             vk::AccessFlagBits2::eTransferRead, {}, command);
+      vk::BufferImageCopy copy{};
+      copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+      copy.imageExtent = {width, height, 1};
+      command.copyImageToBuffer(colors[index]->backing.image,
+                                vk::ImageLayout::eTransferSrcOptimal,
+                                readbacks[index].buffer, 1, &copy);
+    }
+    vk::MemoryBarrier host_barrier{};
+    host_barrier.sType = vk::StructureType::eMemoryBarrier;
+    host_barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    host_barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                            vk::PipelineStageFlagBits::eHost, {}, 1,
+                            &host_barrier, 0, nullptr, 0, nullptr);
+    scheduler.Finish();
+
+    const auto partial = ReadBuffer(name, readbacks[0], pixels);
+    const auto full = ReadBuffer(name, readbacks[1], pixels);
+    bool partial_ok = partial.size() == pixels;
+    bool full_ok = full.size() == pixels;
+    for (uint32_t y = 0; y < height; y++) {
+      for (uint32_t x = 0; x < width; x++) {
+        const uint32_t pixel = y * width + x;
+        const float expected = x < width / 2 ? sample_depth[1] : sentinel;
+        partial_ok &=
+            partial_ok && std::bit_cast<float>(partial[pixel]) == expected;
+        full_ok &=
+            full_ok && std::bit_cast<float>(full[pixel]) == sample_depth[0];
+      }
+    }
+    Require(name, "selected sample inside the copy area", partial_ok,
+            "the copy wrote the wrong sample, or wrote outside its area");
+    Require(name, "sample 0 over the whole target", full_ok,
+            "the copy of sample 0 did not reach every pixel");
+    for (auto &readback : readbacks) {
+      DestroyBuffer(&readback);
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   // A buffer over direct memory is guest memory itself where the host imports
   // it (guestMemoryImport.h): the GPU reads what the CPU wrote without an
   // upload, its writes are in guest memory once they complete, and the command
@@ -59369,6 +59498,11 @@ int RunSelectedCases(int argc, char **argv) {
     vulkan.CheckUnifiedImageViewCache();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-sample-copy-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthSampleToColorBlit();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--storage-sampled-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
@@ -59670,6 +59804,7 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
+  vulkan.CheckDepthSampleToColorBlit();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorage();
   vulkan.CheckGraphicsPushConstantBank();

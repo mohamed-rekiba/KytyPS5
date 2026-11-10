@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "gpu_blit_shaders/gpu_blit_color_to_ms_depth_spv.h"
+#include "gpu_blit_shaders/gpu_blit_depth_sample_to_color_spv.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -38,12 +39,24 @@ BlitHelper::BlitHelper(GraphicContext& graphics, CommandScheduler& scheduler)
 
 	m_vertex_shader   = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, m_graphics.device);
 	m_fragment_shader = CompileSPV(GPU_BLIT_COLOR_TO_MS_DEPTH_SPV, m_graphics.device);
+
+	const vk::PushConstantRange sample_push {vk::ShaderStageFlagBits::eFragment, 0,
+	                                         sizeof(uint32_t)};
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &sample_push;
+	RequireVulkanSuccess(
+	    m_graphics.device.createPipelineLayout(&layout_info, nullptr, &m_depth_sample_layout),
+	    "create BlitHelper depth-sample pipeline layout");
+	m_depth_sample_shader = CompileSPV(GPU_BLIT_DEPTH_SAMPLE_TO_COLOR_SPV, m_graphics.device);
 }
 
 BlitHelper::~BlitHelper() {
 	for (const auto& pipeline: m_pipelines) {
 		m_graphics.device.destroyPipeline(pipeline.handle, nullptr);
 	}
+	m_graphics.device.destroyPipeline(m_depth_sample_pipeline, nullptr);
+	m_graphics.device.destroyShaderModule(m_depth_sample_shader, nullptr);
+	m_graphics.device.destroyPipelineLayout(m_depth_sample_layout, nullptr);
 	m_graphics.device.destroyShaderModule(m_fragment_shader, nullptr);
 	m_graphics.device.destroyShaderModule(m_vertex_shader, nullptr);
 	m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
@@ -183,6 +196,151 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	                            {destination_info.extent.width, destination_info.extent.height}};
 	command.setViewport(0, 1, &viewport);
 	command.setScissor(0, 1, &scissor);
+	command.draw(3, 1, 0, 0);
+	command.endRendering();
+	// The helper pipeline has static state that invalidates the guest draw's dynamic state.
+	m_scheduler.GetDynamicState().Invalidate();
+}
+
+vk::Pipeline BlitHelper::GetDepthSamplePipeline() {
+	if (m_depth_sample_pipeline != nullptr) {
+		return m_depth_sample_pipeline;
+	}
+
+	std::array<vk::PipelineShaderStageCreateInfo, 2> stages {};
+	stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
+	stages[0].module = m_vertex_shader;
+	stages[0].pName  = "main";
+	stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
+	stages[1].module = m_depth_sample_shader;
+	stages[1].pName  = "main";
+
+	vk::PipelineVertexInputStateCreateInfo   vertex_input {};
+	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
+	input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+	vk::PipelineViewportStateCreateInfo viewport {};
+	viewport.viewportCount = 1;
+	viewport.scissorCount  = 1;
+	vk::PipelineRasterizationStateCreateInfo rasterization {};
+	rasterization.lineWidth = 1.0f;
+	vk::PipelineMultisampleStateCreateInfo multisample {};
+	multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+	vk::PipelineDepthStencilStateCreateInfo depth {};
+	vk::PipelineColorBlendAttachmentState   blend_attachment {};
+	blend_attachment.colorWriteMask = vk::ColorComponentFlagBits::eR;
+	vk::PipelineColorBlendStateCreateInfo color_blend {};
+	color_blend.attachmentCount = 1;
+	color_blend.pAttachments    = &blend_attachment;
+	const std::array dynamic_states {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+	vk::PipelineDynamicStateCreateInfo dynamic {};
+	dynamic.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
+	dynamic.pDynamicStates    = dynamic_states.data();
+
+	const vk::Format                color_format = vk::Format::eR32Sfloat;
+	vk::PipelineRenderingCreateInfo rendering {};
+	rendering.colorAttachmentCount    = 1;
+	rendering.pColorAttachmentFormats = &color_format;
+
+	vk::GraphicsPipelineCreateInfo create {};
+	create.pNext               = &rendering;
+	create.stageCount          = static_cast<uint32_t>(stages.size());
+	create.pStages             = stages.data();
+	create.pVertexInputState   = &vertex_input;
+	create.pInputAssemblyState = &input_assembly;
+	create.pViewportState      = &viewport;
+	create.pRasterizationState = &rasterization;
+	create.pMultisampleState   = &multisample;
+	create.pDepthStencilState  = &depth;
+	create.pColorBlendState    = &color_blend;
+	create.pDynamicState       = &dynamic;
+	create.layout              = m_depth_sample_layout;
+
+	RequireVulkanSuccess(m_graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr,
+	                                                               &m_depth_sample_pipeline),
+	                     "create depth-sample-to-color pipeline");
+	return m_depth_sample_pipeline;
+}
+
+void BlitHelper::CopyDepthSampleToColor(Image& source, uint32_t source_layer, Image& destination,
+                                        uint32_t destination_level, uint32_t destination_layer,
+                                        uint32_t sample, const vk::Rect2D& rect) {
+	const auto& source_info      = source.info;
+	const auto& destination_info = destination.info;
+	const auto  width            = std::max(destination_info.extent.width >> destination_level, 1u);
+	const auto  height = std::max(destination_info.extent.height >> destination_level, 1u);
+	const auto  right  = static_cast<int64_t>(rect.offset.x) + rect.extent.width;
+	const auto  bottom = static_cast<int64_t>(rect.offset.y) + rect.extent.height;
+	EXIT_IF(DepthAspectTransferFormat(source_info.pixel_format) == vk::Format::eUndefined ||
+	        destination.backing.format != vk::Format::eR32Sfloat || source_info.samples <= 1 ||
+	        sample >= source_info.samples || destination_info.samples != 1 ||
+	        source.backing.image_type != vk::ImageType::e2D ||
+	        destination.backing.image_type != vk::ImageType::e2D ||
+	        source_layer >= source.backing.layers ||
+	        destination_layer >= destination.backing.layers ||
+	        destination_level >= destination.backing.mip_levels || rect.offset.x < 0 ||
+	        rect.offset.y < 0 || right > width || bottom > height ||
+	        right > source_info.extent.width || bottom > source_info.extent.height ||
+	        source.backing.image == nullptr || destination.backing.image == nullptr);
+	m_scheduler.EndRendering();
+
+	ImageViewInfo source_view_info {};
+	source_view_info.format     = source.backing.format;
+	source_view_info.type       = vk::ImageViewType::e2D;
+	source_view_info.aspect     = vk::ImageAspectFlagBits::eDepth;
+	source_view_info.base_layer = source_layer;
+	source_view_info.usage      = vk::ImageUsageFlagBits::eSampled;
+	const auto source_view      = source.FindView(source_view_info);
+
+	ImageViewInfo destination_view_info {};
+	destination_view_info.format     = destination.backing.format;
+	destination_view_info.type       = vk::ImageViewType::e2D;
+	destination_view_info.aspect     = vk::ImageAspectFlagBits::eColor;
+	destination_view_info.base_level = destination_level;
+	destination_view_info.base_layer = destination_layer;
+	destination_view_info.usage      = vk::ImageUsageFlagBits::eColorAttachment;
+	const auto destination_view      = destination.FindView(destination_view_info);
+
+	auto& command_buffer = m_scheduler.Current();
+	auto  command        = command_buffer.Handle();
+	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
+	               command);
+	destination.Transit(
+	    vk::ImageLayout::eColorAttachmentOptimal, vk::AccessFlagBits2::eColorAttachmentWrite,
+	    ImageSubresourceRange {destination_level, 1, destination_layer, 1}, command);
+
+	vk::RenderingAttachmentInfo color_attachment {};
+	color_attachment.imageView   = destination_view;
+	color_attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	// Pixels outside the copy area keep their values.
+	color_attachment.loadOp  = vk::AttachmentLoadOp::eLoad;
+	color_attachment.storeOp = vk::AttachmentStoreOp::eStore;
+
+	vk::RenderingInfo rendering {};
+	rendering.renderArea           = rect;
+	rendering.layerCount           = 1;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &color_attachment;
+	command.beginRendering(&rendering);
+
+	vk::DescriptorImageInfo descriptor_image {};
+	descriptor_image.imageView   = source_view;
+	descriptor_image.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	vk::WriteDescriptorSet descriptor_write {};
+	descriptor_write.dstBinding      = 0;
+	descriptor_write.descriptorCount = 1;
+	descriptor_write.descriptorType  = vk::DescriptorType::eSampledImage;
+	descriptor_write.pImageInfo      = &descriptor_image;
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_depth_sample_layout, 0, 1,
+	                             &descriptor_write);
+	command.pushConstants(m_depth_sample_layout, vk::ShaderStageFlagBits::eFragment, 0,
+	                      sizeof(sample), &sample);
+	command.bindPipeline(vk::PipelineBindPoint::eGraphics, GetDepthSamplePipeline());
+
+	// The viewport covers the whole level, so the coordinate of a fragment is its texel.
+	const vk::Viewport viewport {0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height),
+	                             0.0f, 1.0f};
+	command.setViewport(0, 1, &viewport);
+	command.setScissor(0, 1, &rect);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
 	// The helper pipeline has static state that invalidates the guest draw's dynamic state.
