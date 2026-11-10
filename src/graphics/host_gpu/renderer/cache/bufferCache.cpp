@@ -683,9 +683,18 @@ void BufferCache::DemoteGuestBackedBuffers() {
 	if (demote.empty()) {
 		return;
 	}
-	// The GPU's writes to them are in guest memory once the work so far completes; the copies
-	// that take their place start from guest memory, as new buffers do.
-	m_scheduler.Finish();
+	// The copies that take their place start from guest memory, as new buffers do: the GPU's
+	// writes to these buffers must be there first. Only those writes are waited for; most have
+	// completed by the frame boundary, and the rest of the GPU's work keeps running.
+	uint64_t last_write = 0;
+	for (const auto id: demote) {
+		const auto& buffer = m_slot_buffers[id];
+		last_write =
+		    std::max(last_write, PendingGuestBackedWrite(buffer.CpuAddress(), buffer.Size()));
+	}
+	if (last_write != 0) {
+		m_scheduler.Wait(last_write);
+	}
 	for (const auto id: demote) {
 		const auto& buffer  = m_slot_buffers[id];
 		const auto  address = buffer.CpuAddress();
