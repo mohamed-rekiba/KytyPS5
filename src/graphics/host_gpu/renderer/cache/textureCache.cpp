@@ -2395,7 +2395,9 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		if (trapped) {
 			m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
 			std::scoped_lock write_back_lock {m_write_back_mutex};
-			m_write_backs.erase(std::ranges::find(m_write_backs, write_back));
+			// find_if: the MSVC library rejects a vectorized find of a 24-byte struct.
+			m_write_backs.erase(std::ranges::find_if(
+			    m_write_backs, [&](const WriteBack& other) { return other == write_back; }));
 		}
 	});
 	if (held) {
