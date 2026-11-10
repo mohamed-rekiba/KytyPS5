@@ -240,7 +240,6 @@ public:
 		auto inserted = m_ranges.emplace_hint(position, start, r);
 		UpdatePageTableEntries(inserted->second, true);
 		MergeAroundUnlocked(inserted);
-		m_generation.fetch_add(1, std::memory_order_release);
 		return true;
 	}
 
@@ -277,7 +276,6 @@ public:
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 
-		m_generation.fetch_add(1, std::memory_order_release);
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size &&
 		    IsReservedRangeType(position->second.type)) {
@@ -325,7 +323,9 @@ public:
 		first->second = replacement;
 		UpdatePageTableEntries(first->second, true);
 		MergeAroundUnlocked(first);
-		m_generation.fetch_add(1, std::memory_order_release);
+		if (IsCommittedRangeType(expected_type) && !IsCommittedRangeType(type)) {
+			m_generation.fetch_add(1, std::memory_order_release);
+		}
 		return true;
 	}
 
@@ -404,11 +404,16 @@ public:
 		return true;
 	}
 
-	// Changes whenever a range is added, removed or replaced: an answer of ClampRangeSize stays
-	// right while this does not change.
+	// Changes whenever committed memory can shrink: a range is removed, or a committed range is
+	// replaced by a reserved one. A committed span seen by ClampRangeSize stays committed while
+	// this does not change. Added ranges and edits of protection or name cannot shrink a span, and
+	// the game maps memory many times per frame, so they keep the value.
 	uint64_t Generation() const noexcept { return m_generation.load(std::memory_order_acquire); }
 
-	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
+	// Also returns the committed span the walk passed, from the start of the first range to the
+	// end of the last one: every byte in it is committed.
+	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size, uint64_t* span_begin,
+	                        uint64_t* span_end) {
 		Common::LockGuard lock(m_mutex);
 
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
@@ -419,41 +424,20 @@ public:
 		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
 			return 0;
 		}
-		const auto vma_end = End(vma->second.start, vma->second.size);
+		*span_begin = vma->second.start;
+		*span_end   = End(vma->second.start, vma->second.size);
 
-		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
-		uint64_t expected     = virtual_addr + clamped_size;
+		uint64_t clamped_size = std::min(size, *span_end - virtual_addr);
 		++vma;
 
-		while (vma != m_ranges.end() && vma->second.start == expected &&
+		while (vma != m_ranges.end() && vma->second.start == *span_end &&
 		       IsCommittedRangeType(vma->second.type) && clamped_size < size) {
-			const auto chunk = std::min(size - clamped_size, vma->second.size);
-			clamped_size += chunk;
-			expected += chunk;
+			clamped_size += std::min(size - clamped_size, vma->second.size);
+			*span_end = End(vma->second.start, vma->second.size);
 			++vma;
 		}
 
 		return clamped_size;
-	}
-
-	// The committed stretch that holds `address`, from the start of its range to the first byte
-	// that is not committed; false when `address` is not in a committed range.
-	bool CommittedSpan(uint64_t address, uint64_t* begin, uint64_t* end) {
-		Common::LockGuard lock(m_mutex);
-
-		auto vma = FindContaining(address);
-		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
-			return false;
-		}
-		*begin           = vma->second.start;
-		uint64_t current = End(vma->second.start, vma->second.size);
-		for (++vma; vma != m_ranges.end() && vma->second.start == current &&
-		            IsCommittedRangeType(vma->second.type);
-		     ++vma) {
-			current = End(vma->second.start, vma->second.size);
-		}
-		*end = current;
-		return true;
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
@@ -920,11 +904,11 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 		}
 	}
 
-	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	uint64_t   span_begin   = 0;
+	uint64_t   span_end     = 0;
+	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size, &span_begin, &span_end);
 	if (clamped_size == size) {
-		if (uint64_t begin = 0, end = 0; g_virtual_ranges->CommittedSpan(vaddr, &begin, &end)) {
-			spans[next_span++ % spans.size()] = {begin, end, generation};
-		}
+		spans[next_span++ % spans.size()] = {span_begin, span_end, generation};
 	}
 	if (clamped_size == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64

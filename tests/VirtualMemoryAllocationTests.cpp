@@ -2772,6 +2772,51 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// A clamp answer is cached per committed span. A new mapping elsewhere must keep the answer, and
+// an unmap inside the span must end it, both for a plain mapping and for one in a reservation.
+void TestClampRangeSizeSeesUnmapInsideCachedSpan() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "ClampRangeSizeSeesUnmapInsideCachedSpan";
+	constexpr uint64_t page     = SceKernelPageSize;
+	const auto         baseline = AvailableFlexibleMemory(test);
+
+	for (const bool in_reservation: {false, true}) {
+		void* mapped = nullptr;
+		int   flags  = 0;
+		if (in_reservation) {
+			CheckOk(test, KernelReserveVirtualRange(&mapped, page * 4, 0, page),
+			        "KernelReserveVirtualRange");
+			flags = SceKernelMapFixed;
+		}
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&mapped, page * 4, SceKernelProtCpuRw, flags,
+		                                     "clamp_cache"),
+		        "KernelMapNamedFlexibleMemory(span)");
+		const auto base = reinterpret_cast<uint64_t>(mapped);
+
+		Check(test, ClampRangeSize(base + 0x100, page * 3) == page * 3,
+		      "clamp inside a committed span changed the size");
+		void* other = nullptr;
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&other, page, SceKernelProtCpuRw, 0, "clamp_other"),
+		        "KernelMapNamedFlexibleMemory(other)");
+		Check(test, ClampRangeSize(base + 0x100, page * 3) == page * 3,
+		      "clamp changed after a mapping elsewhere");
+
+		CheckOk(test, KernelMunmap(base + page * 2, page), "KernelMunmap(hole in span)");
+		Check(test, ClampRangeSize(base + 0x100, page * 3) == page * 2 - 0x100,
+		      "clamp crossed a hole made inside a cached span");
+
+		CheckOk(test, KernelMunmap(base, page * 2), "KernelMunmap(left)");
+		CheckOk(test, KernelMunmap(base + page * 3, page), "KernelMunmap(right)");
+		CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(other), page),
+		        "KernelMunmap(other)");
+	}
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "clamp cache test leaked flexible-memory budget");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMunmapGpuRuns() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test     = "MunmapGpuRuns";
@@ -5965,6 +6010,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
+	RunTest(TestClampRangeSizeSeesUnmapInsideCachedSpan);
 	RunTest(TestMunmapGpuRuns);
 	RunTest(TestMunmapRoundsToPages);
 	RunTest(TestRangeNamesCoverWholePages);
