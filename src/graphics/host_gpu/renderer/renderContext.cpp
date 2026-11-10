@@ -130,15 +130,30 @@ GuestSpan RenderContext::MappingAt(uint64_t vaddr) const {
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.Add(vaddr, size);
-	if (auto* watch = UffdWriteWatch::Get(); watch != nullptr) {
-		watch->Register(vaddr, size);
+	if (CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported memory map from an asynchronous GPU completion, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
 	}
-	// The next device-address pass synchronizes the buffers of the new range only: the game's
-	// allocator maps and unmaps many times per frame, and a pass over every buffer each time costs
-	// milliseconds per frame.
-	m_buffer_cache.RecordMappingChange(vaddr, size);
+	const auto map = [this, vaddr, size] {
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Add(vaddr, size);
+		if (auto* watch = UffdWriteWatch::Get(); watch != nullptr) {
+			watch->Register(vaddr, size);
+		}
+		// The next device-address pass synchronizes the buffers of the new range only: the game's
+		// allocator maps and unmaps many times per frame, and a pass over every buffer each time
+		// costs milliseconds per frame.
+		m_buffer_cache.RecordMappingChange(vaddr, size);
+	};
+	// A guest thread can run on a stack in GPU-tracked memory. A push to a protected stack page
+	// under these locks would fault, and the fault handler takes the same locks. The GPU thread
+	// runs on a host stack, and it keeps the map in order with the unmaps it already runs.
+	if (m_gpu == nullptr || m_gpu->IsStopping()) {
+		map();
+		return;
+	}
+	m_gpu->SendCommandSync(map);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
