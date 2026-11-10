@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <fmt/format.h>
 #include <functional>
@@ -852,6 +853,13 @@ Decoder::Instruction EncodeLinked(std::initializer_list<uint32_t> raw, uint32_t 
 	return inst;
 }
 
+namespace {
+
+std::atomic<int64_t> g_call_table_settle_ms {0};
+std::atomic<int64_t> g_call_table_longest_ms {0};
+
+} // namespace
+
 // Links every function of the table, and replaces the call with a chain that compares the target
 // with each entry's and calls its function. A target that is not in the table calls nothing.
 // The walk of the program's call targets (RefreshShaderSource) holds the table's descriptor.
@@ -930,6 +938,39 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 		return nullptr;
 	};
 	if (const auto* program = reuse(holds)) return *program;
+	// The table only gained entries: every target of the linking is still in it, with the same
+	// code.
+	const auto grew = [&](const ShaderSource::Linked& linked) {
+		if (!std::ranges::includes(targets, linked.table_targets)) return false;
+		std::vector<uint32_t> observed;
+		for (const auto& [low, high]: linked.table_targets)
+			observed.insert(observed.end(), {low, high});
+		for (const auto& [address, count]: linked.observed_ranges) {
+			const auto at = observed.size();
+			observed.resize(at + count);
+			if (!clean.read_specialization_memory(clean.userdata, address,
+			                                      std::span(observed).subspan(at)))
+				return false;
+		}
+		return observed == linked.observed_function;
+	};
+	const auto settle =
+	    std::chrono::milliseconds(g_call_table_settle_ms.load(std::memory_order_relaxed));
+	const auto longest =
+	    std::chrono::milliseconds(g_call_table_longest_ms.load(std::memory_order_relaxed));
+	if (settle.count() > 0 && source.linked && grew(*source.linked)) {
+		const auto now = std::chrono::steady_clock::now();
+		if (source.growing_targets.empty()) source.growing_since = now;
+		if (source.growing_targets != targets) {
+			source.growing_targets = targets;
+			source.growing_changed = now;
+		}
+		if (now - source.growing_changed < settle && now - source.growing_since < longest) {
+			read_linked(*source.linked);
+			return source.linked->decoded;
+		}
+	}
+	source.growing_targets.clear();
 
 	// Read every function first: the chain before them needs their count.
 	std::vector<uint32_t> observed;
@@ -1136,6 +1177,12 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 }
 
 } // namespace
+
+void SetCallTableSettle(std::chrono::milliseconds settle,
+                        std::chrono::milliseconds longest) noexcept {
+	g_call_table_settle_ms.store(settle.count(), std::memory_order_relaxed);
+	g_call_table_longest_ms.store(longest.count(), std::memory_order_relaxed);
+}
 
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
 	EXIT_IF(source.unsupported_call_pc != UINT32_MAX);

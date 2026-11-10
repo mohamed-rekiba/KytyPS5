@@ -1489,8 +1489,9 @@ PipelineCache::Pipeline* PipelineCache::ObtainPipeline(Ready& ready, Pending& pe
 			return &pipeline;
 		}
 		if (m_compile_queue == nullptr) {
-			// Two at a time: a large compile can take minutes and gigabytes.
-			m_compile_queue = std::make_unique<PipelineCompileQueue>(2u);
+			// One at a time: a large compile takes the driver minutes and over 10 GB of memory, and two
+			// at once used up the memory of a 96 GB host.
+			m_compile_queue = std::make_unique<PipelineCompileQueue>(1u);
 		}
 		auto started    = std::make_unique<PendingPipeline>();
 		started->ticket = m_compile_queue->Post(
