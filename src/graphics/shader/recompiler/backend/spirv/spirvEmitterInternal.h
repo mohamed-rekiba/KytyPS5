@@ -617,42 +617,68 @@ void DefineTrinityFunctions(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 
 // These templates accept local lambdas from several emitter translation units.
+// Selects the value of case `index` by branches of two ways on the index, each of which defines
+// the value. A switch would merge the cases' values in one phi, which a host compiler that reads
+// each case as its own `if` sees as unset on a path through no case: every loop around it then
+// carries the value. Cases [first, last).
+template <typename Fn>
+uint32_t EmitIndexTree(EmitterState& state, uint32_t index, uint32_t first, uint32_t last,
+                       uint32_t result_type, Fn& emit) {
+	if (last - first == 1u) return emit(first);
+	const auto middle      = first + (last - first) / 2u;
+	const auto low_label   = state.builder.AllocateId();
+	const auto high_label  = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	const auto low_half =
+	    Binary(state, spv::OpULessThan, TypeBool(state), index, ConstantU32(state, middle));
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, low_half, low_label, high_label);
+	EmitLabel(state, low_label);
+	const auto low      = EmitIndexTree(state, index, first, middle, result_type, emit);
+	const auto low_exit = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, high_label);
+	const auto high      = EmitIndexTree(state, index, middle, last, result_type, emit);
+	const auto high_exit = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, merge_label);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, result_type, value, low, low_exit, high, high_exit);
+	return value;
+}
+
+// Runs `emit` for case `index` of `count`. When `emit` gives a value, returns the value of the case
+// that ran, and an index past the cases runs the first; otherwise such an index runs no case.
 template <typename Fn>
 auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
                         uint32_t result_type, Fn&& emit) {
 	constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Fn, uint32_t>>;
 	EXIT_IF(count == 0u);
-	const auto merge_label = state.builder.AllocateId();
-	std::vector<uint32_t> labels(count);
-	std::vector<uint32_t> words {spv::OpSwitch, index, merge_label};
-	for (uint32_t item = 0; item < count; item++) {
-		labels[item] = state.builder.AllocateId();
-		words.push_back(item);
-		words.push_back(labels[item]);
-	}
 	if constexpr (has_result) {
-		words[2] = labels.front();
-	}
-	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
-	state.builder.AddFunction(words);
-	std::vector<uint32_t> phi;
-	if constexpr (has_result) {
-		phi = {spv::OpPhi, result_type, state.builder.AllocateId()};
-	}
-	for (uint32_t item = 0; item < count; item++) {
-		EmitLabel(state, labels[item]);
-		if constexpr (has_result) {
-			phi.push_back(emit(item));
-			phi.push_back(state.current_label);
-		} else {
-			emit(item);
+		if (count == 1u) return emit(0u);
+		const auto in_range =
+		    Binary(state, spv::OpULessThan, TypeBool(state), index, ConstantU32(state, count));
+		const auto selected =
+		    Select(state, TypeU32(state), in_range, index, ConstantU32(state, 0u));
+		return EmitIndexTree(state, selected, 0u, count, result_type, emit);
+	} else {
+		const auto            merge_label = state.builder.AllocateId();
+		std::vector<uint32_t> labels(count);
+		std::vector<uint32_t> words {spv::OpSwitch, index, merge_label};
+		for (uint32_t item = 0; item < count; item++) {
+			labels[item] = state.builder.AllocateId();
+			words.push_back(item);
+			words.push_back(labels[item]);
 		}
-		state.builder.AddFunction(spv::OpBranch, merge_label);
-	}
-	EmitLabel(state, merge_label);
-	if constexpr (has_result) {
-		state.builder.AddFunction(phi);
-		return phi[2];
+		state.builder.AddFunction(spv::OpSelectionMerge, merge_label,
+		                          spv::SelectionControlMaskNone);
+		state.builder.AddFunction(words);
+		for (uint32_t item = 0; item < count; item++) {
+			EmitLabel(state, labels[item]);
+			emit(item);
+			state.builder.AddFunction(spv::OpBranch, merge_label);
+		}
+		EmitLabel(state, merge_label);
 	}
 }
 

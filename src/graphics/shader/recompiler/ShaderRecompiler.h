@@ -4,12 +4,13 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
-#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
 #include <bitset>
+#include <chrono>
 #include <optional>
 #include <span>
 #include <vector>
@@ -94,6 +95,12 @@ struct ShaderSource {
 	uint32_t              wave_size =
 	    64; // Of the shader: a vector compare writes one scalar register in wave32.
 	std::optional<Linked> linked;
+	// A table with functions that the linking does not have, while the functions it has still
+	// read the same: the new targets seen, when the last one came, and when the first one came (see
+	// SetCallTableSettle).
+	std::vector<std::pair<uint32_t, uint32_t>> growing_targets;
+	std::chrono::steady_clock::time_point      growing_changed;
+	std::chrono::steady_clock::time_point      growing_since;
 	// A table call links what one dispatch's table holds; dispatches with other tables take turns.
 	// The linkings they left are kept, so that the next dispatch of a known table links nothing.
 	std::vector<Linked>                        parked_links;
@@ -106,6 +113,12 @@ struct ShaderSource {
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);
+// A call table with new functions keeps the program it has, until no new function came for
+// `settle`, or until `longest` after the first one came. A game can add a function every few
+// seconds while it loads, and each new linking is a translation and a pipeline to build; the new
+// functions are called by nothing until then. Zero, the default, links every new function at once.
+void                          SetCallTableSettle(std::chrono::milliseconds settle,
+                                                 std::chrono::milliseconds longest) noexcept;
 [[nodiscard]] TranslateResult TranslateProgram(const Decoder::Program& decoded,
 	                                           const CompileOptions& options);
 

@@ -408,8 +408,13 @@ void RenderExecutor::FinishDispatchDirect(uint64_t submit_id, CommandBuffer& buf
 		thread_group_z = input_info.workgroup_counts[2];
 	}
 
+	auto* compiled = m_context.GetPipelineCache().GetComputePipeline(input_info);
+	if (compiled == nullptr) { // Still compiling on a worker: the dispatch is skipped.
+		ResetBindings();
+		return;
+	}
+	auto& pipeline = *compiled;
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -600,8 +605,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto* compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, input_info, use_thread_dimensions ? ShaderRecompiler::IR::PushData::NoStart : 0u);
 	if (compute_program == nullptr) return;
+	auto* compiled = m_context.GetPipelineCache().GetComputePipeline(input_info);
+	if (compiled == nullptr) { // Still compiling on a worker: the dispatch is skipped.
+		ResetBindings();
+		return;
+	}
+	auto& pipeline = *compiled;
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;

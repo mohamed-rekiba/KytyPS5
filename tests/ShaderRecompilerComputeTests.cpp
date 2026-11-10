@@ -40,6 +40,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -90,11 +91,13 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <future>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -109,6 +112,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -1511,6 +1515,59 @@ void ExpectFatal(const char *name, Function function) {
   std::printf("[host]    %-32s ok\n", name);
 }
 #endif
+
+// At most `threads` compiles run at once, and a cancel completes the ones
+// that have not started without running them.
+void CheckPipelineCompileQueue() {
+  constexpr const char *name = "PipelineCompileQueue";
+  std::atomic<int> running{0}, peak{0}, finished{0};
+  std::mutex mutex;
+  std::condition_variable released;
+  bool release = false;
+  std::vector<PipelineCompileQueue::Ticket> tickets;
+  {
+    PipelineCompileQueue queue(2);
+    for (int i = 0; i < 6; i++) {
+      tickets.push_back(queue.Post([&] {
+        const int now = ++running;
+        int seen = peak.load();
+        while (now > seen && !peak.compare_exchange_weak(seen, now)) {
+        }
+        std::unique_lock lock(mutex);
+        released.wait(lock, [&] { return release; });
+        --running;
+        ++finished;
+      }));
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (running.load() < 2) {
+      Require(name, "workers start",
+              std::chrono::steady_clock::now() < deadline,
+              "two posted compiles did not start");
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Require(name, "bounded concurrency", peak.load() == 2,
+            "more compiles ran at once than the queue has workers");
+    queue.CancelQueued();
+    {
+      std::scoped_lock lock(mutex);
+      release = true;
+    }
+    released.notify_all();
+  }
+  int dropped = 0;
+  for (auto &ticket : tickets) {
+    ticket.done.wait();
+    dropped += ticket.ran->load() ? 0 : 1;
+  }
+  Require(name, "cancel drops queued compiles",
+          finished.load() == 2 && dropped == 4,
+          "finished=" + std::to_string(finished.load()) +
+              " dropped=" + std::to_string(dropped));
+  std::printf("[host]    %-32s ok\n", name);
+}
 
 void CheckLeastRecentlyUsedCacheOrdering() {
   Common::LeastRecentlyUsedCache<uint32_t, uint64_t> cache;
@@ -14062,6 +14119,96 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A pipeline that takes longer than the compile budget is built on a worker:
+  // its dispatches are skipped until it is ready, then run as usual.
+  void CheckBackgroundComputePipeline() {
+    constexpr const char *name = "BackgroundComputePipeline";
+    constexpr uintptr_t base = 0x0000000204d00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto output = base + 0x100;
+    std::vector<u32> code{EncodeSMovB32(20, 255), 0x5a5a1234u,
+                          EncodeVop1(0x01, 1, 20), // v_mov_b32 v1, s20
+                          EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0)};
+    AppendEnd(&code);
+    ShaderMapUserData(
+        reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size,
+                0, &physical) == 0,
+            "fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                     physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixture mapping failed");
+    std::memset(mapped, 0, size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    PipelineCache::SetCompileBudget(std::chrono::milliseconds(0));
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1,
+                           .num_thread_y = 1,
+                           .num_thread_z = 1,
+                           .wave_size = 64,
+                           .user_sgpr = 4});
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = 4;
+      out.fields[3] =
+          DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; ++i)
+        shaders.SetCsUserSgpr(i, out.fields[i]);
+      const auto read_output = [&] {
+        cache.ReadMemory(output, sizeof(u32));
+        u32 value = 0;
+        Require(
+            name, "read output",
+            LibKernel::Memory::TryReadBacking(output, &value, sizeof(value)),
+            "output was not readable");
+        return value;
+      };
+      // The first dispatch starts the compile and does not wait for it.
+      DispatchNow(context, processor, 1, 1, 1, 0x41u);
+      Require(name, "dispatch skipped while compiling", read_output() == 0u,
+              "a dispatch ran before its pipeline was built");
+      // Later dispatches skip until the worker is done, then run.
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      while (read_output() != 0x5a5a1234u) {
+        Require(name, "dispatch runs once built",
+                std::chrono::steady_clock::now() < deadline,
+                "the dispatch did not run after the background compile");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        DispatchNow(context, processor, 1, 1, 1, 0x41u);
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    PipelineCache::SetCompileBudget(PipelineCache::WaitForCompile);
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release",
+            LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical,
+                                                                size) == 0,
+            "fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // A call through a table of functions: a load order that moves the functions
   // keeps the program, and each entry still calls its own function (the chain
   // reads the targets it compares with at dispatch).
@@ -22194,7 +22341,8 @@ public:
       DrawRenderState state{.depth_info = depth, .color_info = {color}, .color_count = 1,
                             .topology = topology, .ps_active = true,
                             .vertex_info = {vertex}, .ps_input_info = pixel};
-      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
+      return *context.GetPipelineCache().GetGraphicsPipeline(
+          scheduler.Current(), state);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected,
@@ -38793,7 +38941,13 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave;
   test.has_compute_info = true;
-  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", formatted ? "OpSwitch" : "Volatile"};
+  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge",
+                         formatted ? "convert_indirect_buffer_format"
+                                   : "Volatile"};
+  // A formatted load selects its format by branches of two ways, not by a
+  // switch.
+  if (formatted)
+    test.forbidden_spirv = {"OpSwitch"};
   if (!formatted) test.forbidden_spirv = {"convert_indirect_buffer_format",
                                          "indirect_buffer_format_geometry"};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
@@ -45883,9 +46037,13 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
       if (count == 8u) {
         std::set<u32> nonuniform;
         std::vector<u32> stores;
+        constexpr u32 formats =
+            u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
         u32 bda_function = 0, conversion_function = 0, geometry_function = 0, function = 0;
         u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
         u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
+        u32 geometry_branches = 0, geometry_phis = 0, geometry_compares = 0,
+            geometry_selects = 0;
         bool geometry_pure = true, geometry_cases = true;
         for (size_t offset = 5; offset < compiled.spirv.size();) {
           const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
@@ -45907,15 +46065,17 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
           if (function == geometry_function && function != 0u) {
             geometry_pure &= opcode != spv::OpLoad && opcode != spv::OpStore &&
                              opcode != spv::OpFunctionCall;
-            if (opcode == spv::OpSwitch) {
-              ++geometry_switches;
-              constexpr u32 formats = u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
-              geometry_cases &= words.size() == 3u + 2u * formats;
-              if (words.size() == 3u + 2u * formats) {
-                geometry_cases &= words[2] == words[4]; // Invalid formats use format zero.
-                for (u32 format = 0; format < formats; ++format)
-                  geometry_cases &= words[3u + 2u * format] == format;
-              }
+            // The format selects its geometry by branches of two ways: a tree
+            // over every format has one branch and one phi of two values per
+            // format but one. An invalid format is compared with the format
+            // count and replaced with format zero.
+            geometry_switches += opcode == spv::OpSwitch;
+            geometry_branches += opcode == spv::OpBranchConditional;
+            geometry_compares += opcode == spv::OpULessThan;
+            geometry_selects += opcode == spv::OpSelect;
+            if (opcode == spv::OpPhi) {
+              ++geometry_phis;
+              geometry_cases &= words.size() == 7u;
             }
           }
           if (opcode == spv::OpFunctionCall) {
@@ -45929,10 +46089,14 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
         Require(test.name, "one shared formatted conversion",
                 conversion_definitions == 1u && conversion_calls == 1u,
                 "formatted loads must call one conversion function across virtual halves");
-        Require(test.name, "one shared pure format geometry",
-                geometry_definitions == 1u && geometry_calls == conversion_calls &&
-                    geometry_switches == 1u && geometry_cases && geometry_pure,
-                "format geometry duplicated, lost a format/default or acquired memory accesses");
+        Require(
+            test.name, "one shared pure format geometry",
+            geometry_definitions == 1u && geometry_calls == conversion_calls &&
+                geometry_switches == 0u && geometry_branches == formats - 1u &&
+                geometry_phis == formats - 1u && geometry_compares == formats &&
+                geometry_selects == 1u && geometry_cases && geometry_pure,
+            "format geometry duplicated, lost a format/default or acquired "
+            "memory accesses");
         Require(test.name, "one shared indirect store per virtual half",
                 std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
                     (wave > vulkan.SubgroupSize() ? 2 : 1),
@@ -46050,7 +46214,11 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
         test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
         test.forbidden_spirv = {"OpSwitch", "PhysicalStorageBuffer", "convert_indirect_buffer_format",
                                "indirect_buffer_format_geometry"};
-      } else if (count == 6u) test.required_spirv = {"OpSwitch"};
+      } else if (count == 6u) {
+        // The candidate is selected by branches of two ways, not by a switch.
+        test.required_spirv = {"OpBranchConditional"};
+        test.forbidden_spirv = {"OpSwitch"};
+      }
       auto compiled = CompileCase(test, vulkan.SubgroupSize());
       Require(test.name, "mixed native aliases", count != 6u ||
                   (compiled.program.info.buffer_u8 && compiled.program.info.buffer_u16),
@@ -48654,14 +48822,18 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
     ValidateSpirv("ResidentImageHeap", spirv);
     Require(name, "image heap disassembly", tools.Disassemble(spirv, &text),
             "failed to disassemble the image heap shader");
-    Require(name, "image heap selection",
-            program.info.uses_image_heap && CountText(text, "OpConvertUToPtr") == 1 &&
-                CountText(text, "UMin") == 1 &&
-                CountText(text, "OpSwitch") == (mixed ? 1 : 0) &&
-                CountText(text, "OpImageSampleExplicitLod") == (mixed ? 2 : 1) &&
-                CountText(text, "DescriptorSet 1") == (mixed ? 2 : 1) &&
-                text.find("PhysicalStorageBuffer64") != std::string::npos,
-            "image heap kinds did not sample the slot-selected heap element");
+    Require(
+        name, "image heap selection",
+        program.info.uses_image_heap &&
+            CountText(text, "OpConvertUToPtr") == 1 &&
+            CountText(text, "UMin") == 1 &&
+            // Two kinds are selected by a branch of two ways, not by a switch.
+            CountText(text, "OpSwitch") == 0 &&
+            (!mixed || CountText(text, "OpBranchConditional") >= 1) &&
+            CountText(text, "OpImageSampleExplicitLod") == (mixed ? 2 : 1) &&
+            CountText(text, "DescriptorSet 1") == (mixed ? 2 : 1) &&
+            text.find("PhysicalStorageBuffer64") != std::string::npos,
+        "image heap kinds did not sample the slot-selected heap element");
   }
 
   program.memory_info[0].image_dimension =
@@ -49209,9 +49381,10 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
   TestCase test;
   test.name = name;
-  // A table consecutive from ordinal 1 selects without a switch; a single candidate and a table
-  // with a gap keep it.
+  // A table consecutive from ordinal 1 and a single candidate select without
+  // branches; a table with a gap selects by branches.
   const std::array<std::vector<u32>, 3> tables{{{3u, 0u, 1u}, {2u}, {0u, 2u, 1u}}};
+  size_t consecutive_branches = 0;
   for (size_t case_index = 0; case_index < 2u * tables.size(); ++case_index) {
     const auto &table = tables[case_index % tables.size()];
     const bool mapped = case_index >= tables.size();
@@ -49236,9 +49409,18 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
     std::string text;
     Require(name, "sampler table disassembly", tools.Disassemble(compiled.spirv, &text),
             "failed to disassemble the sampler table shader");
-    Require(name, "sampler table selection",
-            CountText(text, "OpSwitch") == (&table == &tables.front() ? 0u : 1u),
-            "only a consecutive sampler table selects without a switch");
+    // The candidates are selected by branches of two ways: the consecutive
+    // table and the single candidate need none, and the table with a gap needs
+    // more than they do.
+    const auto branches = CountText(text, "OpBranchConditional");
+    if (&table == &tables.front())
+      consecutive_branches = branches;
+    Require(
+        name, "sampler table selection",
+        CountText(text, "OpSwitch") == 0u &&
+            (&table == &tables.back() ? branches > consecutive_branches
+                                      : branches == consecutive_branches),
+        "only a sampler table with a gap selects its candidate by branches");
     test.initial.assign(wave_size, 0xdeadbeefu);
     test.expected.resize(wave_size);
     for (u32 lane_index = 0; lane_index < wave_size; ++lane_index) {
@@ -51978,7 +52160,7 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
                 input.lds_storage == (units > limit_units),
             "compute LDS was truncated or chose backing that exceeds the device limit");
     Require(name, "pipeline creation",
-            cache.GetComputePipeline(input).pipeline != nullptr,
+            cache.GetComputePipeline(input)->pipeline != nullptr,
             "full-size LDS shader did not create a Vulkan compute pipeline");
     if (previous_id != 0) {
       Require(name, "guest-size cache identity",
@@ -52231,6 +52413,13 @@ void CheckShaderStore(VulkanHarness &vulkan) {
   warm.compiled = {};
   Require(name, "warm restart", run() == warm && std::filesystem::file_size(store) == size,
           "a restart compiled a module, created a pipeline late or rewrote the store");
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+  // A rebuild that changes no shader code gives a new executable with the same shader output.
+  std::filesystem::last_write_time(std::filesystem::read_symlink("/proc/self/exe"),
+                                   std::filesystem::file_time_type::clock::now());
+  Require(name, "rebuilt emulator", run() == warm && std::filesystem::file_size(store) == size,
+          "a new executable with the same shader code started the store over");
+#endif
   std::filesystem::resize_file(store, size + 3);
   Require(name, "torn tail", run() == warm && std::filesystem::file_size(store) == size,
           "a torn last record was kept");
@@ -58357,6 +58546,7 @@ int RunSelectedCases(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckPipelineCompileQueue();
   PipelineCacheTestAccess::CheckCallPlansAreKept();
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
@@ -59217,6 +59407,7 @@ int RunSelectedCases(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckScalarLeafCall();
     vulkan.CheckCallTableMovedFunctions();
+    vulkan.CheckBackgroundComputePipeline();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
@@ -59237,6 +59428,7 @@ int RunSelectedCases(int argc, char **argv) {
     vulkan.CheckGpuCommandLane();
     vulkan.CheckScalarLeafCall();
     vulkan.CheckCallTableMovedFunctions();
+    vulkan.CheckBackgroundComputePipeline();
     CheckAgcSystemTable(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
@@ -59862,6 +60054,7 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
   vulkan.CheckCallTableMovedFunctions();
+  vulkan.CheckBackgroundComputePipeline();
   if (vulkan.NotRunCaseCount() > 0) {
     std::printf("ShaderRecompilerComputeTests: %u cases not run on this "
                 "device, which lacks a "

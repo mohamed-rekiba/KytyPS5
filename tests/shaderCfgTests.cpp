@@ -8448,6 +8448,220 @@ void TestCallThroughTableLinksEveryFunction() {
   (void)TranslateProgram(source.linked->decoded, options);
 }
 
+void TestCallTableGrowthWaitsToSettle() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe0040000ull;
+  // The waterfall of TestCallThroughTableLinksEveryFunction, over a table of
+  // four records; an entry with a null target calls nothing.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 255),
+      static_cast<uint32_t>(base),
+      EncodeSMovB32(1, 255),
+      static_cast<uint32_t>(base >> 32u) | (16u << 16u), // stride 16
+      EncodeSMovB32(2, 132),                             // 4 records
+      EncodeSMovB32(3, 255),
+      0x00005204u,
+      0x7e100500u,                 // v_readfirstlane_b32 s8, v0
+      EncodeSop2(0x1e, 8, 8, 132), // s_lshl_b32 s8, s8, 4
+      0xf4280400u,
+      0x10000000u, // s_buffer_load_dwordx4 s[16:19], s[0:3], s8
+      0xbf8cc07fu, // s_waitcnt lgkmcnt(0)
+      EncodeSMovB32(14, 16),
+      EncodeSMovB32(15, 17),
+      EncodeSop1(0x21, 14, 14),  // s_swappc_b64 s[14:15], s[14:15]
+      EncodeSopp(0x05, 0xfff7u), // s_cbranch_scc1 to the read
+      EncodeSopp(0x01)};
+  struct Memory {
+    std::array<uint32_t, 64> words{};
+  } memory;
+  const auto add = [&](uint32_t entry, uint32_t offset, uint32_t value) {
+    memory.words[entry * 4u] = static_cast<uint32_t>(base + offset);
+    memory.words[entry * 4u + 1u] = static_cast<uint32_t>(base >> 32u);
+    memory.words[offset / 4u] = EncodeSMovB32(20, 128u + value);
+    memory.words[offset / 4u + 1u] = EncodeSop1(0x20, 0, 14);
+  };
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto &m = *static_cast<Memory *>(data);
+    const uint64_t end = base + m.words.size() * 4u;
+    if (address < base || address > end || out.size_bytes() > end - address)
+      return false;
+    std::memcpy(out.data(),
+                reinterpret_cast<const uint8_t *>(m.words.data()) + address -
+                    base,
+                out.size_bytes());
+    return true;
+  };
+  IR::SrtRuntime runtime{.userdata = &memory,
+                         .read_specialization_memory = read};
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  add(0, 0x40, 1);
+  add(1, 0x60, 2);
+
+  // While the table only gains entries, the linking holds until the table
+  // settles, or until the longest wait.
+  SetCallTableSettle(std::chrono::hours(1), std::chrono::hours(1));
+  auto source = PrepareShaderSource(shader, options);
+  (void)RefreshShaderSource(source, runtime);
+  const auto revision = source.revision;
+  add(2, 0x80, 3);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == revision && source.linked->constants.size() == 4u,
+        "a table that gained an entry was linked again before it settled");
+  // A changed function is linked again at once.
+  memory.words[0x40 / 4u] = EncodeSMovB32(20, 133);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == revision + 1u &&
+            source.linked->constants.size() == 6u,
+        "a changed function waited for the table to settle");
+  // Past the longest wait, a grown table is linked again.
+  add(3, 0xa0, 4);
+  SetCallTableSettle(std::chrono::hours(1), std::chrono::milliseconds(0));
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == revision + 2u,
+        "a grown table was not linked again after the longest wait");
+  SetCallTableSettle(std::chrono::milliseconds(0),
+                     std::chrono::milliseconds(0));
+}
+
+void TestCallTableKeepsFunctionsTheTableDropped() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe0040000ull;
+  // The waterfall of TestCallThroughTableLinksEveryFunction, over a table of
+  // four records that lists only the functions in use; an entry with a null
+  // target calls nothing.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 255),
+      static_cast<uint32_t>(base),
+      EncodeSMovB32(1, 255),
+      static_cast<uint32_t>(base >> 32u) | (16u << 16u), // stride 16
+      EncodeSMovB32(2, 132),                             // 4 records
+      EncodeSMovB32(3, 255),
+      0x00005204u,
+      0x7e100500u,                 // v_readfirstlane_b32 s8, v0
+      EncodeSop2(0x1e, 8, 8, 132), // s_lshl_b32 s8, s8, 4
+      0xf4280400u,
+      0x10000000u, // s_buffer_load_dwordx4 s[16:19], s[0:3], s8
+      0xbf8cc07fu, // s_waitcnt lgkmcnt(0)
+      EncodeSMovB32(14, 16),
+      EncodeSMovB32(15, 17),
+      EncodeSop1(0x21, 14, 14),  // s_swappc_b64 s[14:15], s[14:15]
+      EncodeSopp(0x05, 0xfff7u), // s_cbranch_scc1 to the read
+      EncodeSopp(0x01)};
+  struct Memory {
+    std::array<uint32_t, 64> words{};
+  } memory;
+  const auto add = [&](uint32_t entry, uint32_t offset, uint32_t value) {
+    memory.words[entry * 4u] = static_cast<uint32_t>(base + offset);
+    memory.words[entry * 4u + 1u] = static_cast<uint32_t>(base >> 32u);
+    memory.words[offset / 4u] = EncodeSMovB32(20, 128u + value);
+    memory.words[offset / 4u + 1u] = EncodeSop1(0x20, 0, 14);
+  };
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto &m = *static_cast<Memory *>(data);
+    const uint64_t end = base + m.words.size() * 4u;
+    if (address < base || address > end || out.size_bytes() > end - address)
+      return false;
+    std::memcpy(out.data(),
+                reinterpret_cast<const uint8_t *>(m.words.data()) + address -
+                    base,
+                out.size_bytes());
+    return true;
+  };
+  IR::SrtRuntime runtime{.userdata = &memory,
+                         .read_specialization_memory = read};
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  add(0, 0x40, 1);
+  add(1, 0x60, 2);
+
+  const auto drop = [&](uint32_t entry) {
+    memory.words[entry * 4u] = 0u;
+    memory.words[entry * 4u + 1u] = 0u;
+  };
+  auto source = PrepareShaderSource(shader, options);
+  (void)RefreshShaderSource(source, runtime);
+  const auto revision = source.revision;
+  // The table drops a function and gains one: the linking keeps the dropped
+  // function, which still reads the same.
+  drop(0);
+  add(2, 0x80, 3);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == revision + 1u &&
+            source.linked->constants.size() == 6u,
+        "a linking did not keep a function that the table dropped");
+  // Any table of linked functions holds the linking.
+  add(0, 0x40, 1);
+  (void)RefreshShaderSource(source, runtime);
+  drop(1);
+  drop(2);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == revision + 1u,
+        "a table of functions that were linked before was linked again");
+  // A function in the table that reads other code is linked again.
+  memory.words[0x40 / 4u] = EncodeSMovB32(20, 133);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == revision + 2u,
+        "a changed function in the table was not linked again");
+  (void)TranslateProgram(source.linked->decoded, options);
+}
+
+// A switch that selects a value merges each case's value in a phi. A host
+// compiler that reads each case as its own `if` sees a path through no case,
+// where the value is the one from the previous loop iteration: every enclosing
+// loop then carries it. The value is selected by branches of two ways, each of
+// which defines it.
+void TestIndexSwitchValueIsDefinedOnEveryPath() {
+  using namespace ShaderRecompiler::Spirv::Emitter;
+  for (const uint32_t count : {1u, 2u, 3u, 8u, 156u}) {
+    ShaderRecompiler::IR::Program program;
+    program.stage = ShaderType::Compute;
+    static const ShaderComputeInputInfo compute{};
+    ShaderStageInputInfo input;
+    input.compute = &compute;
+    EmitterState state(program, input, HostGpu::Full());
+    state.builder.RequireCapability(spv::CapabilityShader);
+    state.builder.AddMemoryModel(spv::AddressingModelLogical,
+                                 spv::MemoryModelGLSL450);
+    const auto u32 = TypeU32(state);
+    const auto pick_type = state.builder.Type(spv::OpTypeFunction, u32, u32);
+    const auto pick = state.builder.AllocateId();
+    const auto index = state.builder.AllocateId();
+    state.builder.AddFunction(spv::OpFunction, u32, pick,
+                              spv::FunctionControlMaskNone, pick_type);
+    state.builder.AddFunction(spv::OpFunctionParameter, u32, index);
+    EmitLabel(state, state.builder.AllocateId());
+    const auto value =
+        EmitIndexSwitch(state, index, count, u32, [&](uint32_t item) {
+          return ConstantU32(state, item * 7u + 1u);
+        });
+    state.builder.AddFunction(spv::OpReturnValue, value);
+    state.builder.AddFunction(spv::OpFunctionEnd);
+    const auto main = state.builder.AllocateId();
+    state.builder.AddFunction(spv::OpFunction, TypeVoid(state), main,
+                              spv::FunctionControlMaskNone,
+                              TypeFunction(state));
+    EmitLabel(state, state.builder.AllocateId());
+    state.builder.AddFunction(spv::OpFunctionCall, u32,
+                              state.builder.AllocateId(), pick,
+                              ConstantU32(state, 1u));
+    state.builder.AddFunction(spv::OpReturn);
+    state.builder.AddFunction(spv::OpFunctionEnd);
+    state.builder.AddEntryPoint(spv::ExecutionModelGLCompute, main, "main", {});
+    state.builder.AddExecutionMode(main, spv::ExecutionModeLocalSize, 1u, 1u,
+                                   1u);
+    const auto binary = state.builder.Build();
+    CheckSpirvBinaryValidates(binary);
+    // Every OpPhi merges exactly two branches, and no switch carries the value.
+    for (size_t i = 5; i < binary.size();) {
+      const uint32_t op = binary[i] & 0xffffu, words = binary[i] >> 16u;
+      Check(op != 251u,
+            "a switch that selects a value is still emitted as OpSwitch");
+      Check(op != 245u || words == 7u,
+            "a value phi merges more than two branches");
+      i += words;
+    }
+  }
+}
+
 void TestCallTableLinkIsAddressFree() {
   using namespace ShaderRecompiler;
   constexpr uint64_t base = 0xfe0040000ull;
@@ -15067,6 +15281,9 @@ int main() {
   TestCallInLoopIsSkipped();
   TestCallThroughTableLinksEveryFunction();
   TestCallTableLinkIsAddressFree();
+  TestCallTableGrowthWaitsToSettle();
+  TestCallTableKeepsFunctionsTheTableDropped();
+  TestIndexSwitchValueIsDefinedOnEveryPath();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

@@ -4,7 +4,9 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "emulator.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kytyGitVersion.h"
 
@@ -495,6 +497,13 @@ static int Main(int argc, char* argv[]) {
 	// A game keeps running with a null texture where the shader translator cannot follow a
 	// descriptor; the tests leave this off, so their rejection checks still fail.
 	Libs::Graphics::ShaderRecompiler::IR::SetNullUnplannedDescriptors(true);
+	// A pipeline the driver takes longer than this to compile is finished on a worker, and the
+	// game keeps running without its work until then; the tests wait for every compile.
+	Libs::Graphics::PipelineCache::SetCompileBudget(std::chrono::milliseconds(100));
+	// A call table that grows while a game loads is linked again once it settles, not on each
+	// new entry; the tests link every change at once.
+	Libs::Graphics::ShaderRecompiler::SetCallTableSettle(std::chrono::seconds(3),
+	                                                     std::chrono::seconds(20));
 	InitializeThreads();
 
 	RunOptions options;
