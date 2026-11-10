@@ -111,6 +111,9 @@ public:
 	// GPU thread. The tick of the last GPU write to these bytes of guest-backed memory while it
 	// has not finished, otherwise 0.
 	[[nodiscard]] uint64_t PendingGuestBackedWrite(uint64_t vaddr, uint64_t size);
+	// GPU thread. Shaders that write through device addresses, at places no range records, have
+	// work that is not finished or not recorded yet.
+	[[nodiscard]] bool AddressWritesPending();
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	// Any thread (the front worker, see frontWorker.h); HasGpuDirtyBytes is for the GPU thread.

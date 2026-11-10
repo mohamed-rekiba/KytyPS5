@@ -951,7 +951,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
-		const auto        packet_header = packet[0];
+		const auto        packet_header = CommandWords(packet, 1)[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		g_recent_packets[g_recent_packet_count++ % 24] = {total_dw - remaining_dw, packet_header,
 		                                                  total_dw, 0,
@@ -999,11 +999,24 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     RecentPacketsText().c_str());
 		}
 
-		if (!KeepsWorkPending(packet)) {
-			m_renderer.GetRenderExecutor().FlushPendingWork();
+		const auto  words_dw = std::min(KYTY_PM4_LEN(packet_header), remaining_dw);
+		const auto* words    = CommandWords(packet, words_dw);
+		if (!KeepsWorkPending(words)) {
+			auto&      executor    = m_renderer.GetRenderExecutor();
+			const bool had_pending = executor.HasPendingWork();
+			executor.FlushPendingWork();
+			// The work can write the packet: a copy queued behind it (DmaData).
+			if (had_pending && words != packet) {
+				words = CommandWords(packet, words_dw);
+			}
 		}
 		const auto packet_dw =
-		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		    handler(*this, packet_header & ~1u, words + 1, remaining_dw, total_dw) + 1;
+		if (words != packet && packet_dw > words_dw) {
+			EXIT("PM4 packet read past its length: header=0x%08" PRIx32 " packet_dw=%" PRIu64
+			     " length=%" PRIu32 "\n",
+			     packet_header, uint64_t {packet_dw}, words_dw);
+		}
 		if (!LeavesComputeChainOpen(packet_header)) {
 			// After the pending work: a dispatch queued last can open a chain when it is recorded.
 			// Any other queued work ends a chain it follows itself.
@@ -1464,6 +1477,26 @@ T CommandProcessor::ReadMemory(const T* address) {
 		value = *static_cast<const volatile T*>(address);
 	}
 	return value;
+}
+
+const uint32_t* CommandProcessor::CommandWords(const uint32_t* words, uint32_t count) {
+	const auto address = reinterpret_cast<uint64_t>(words);
+	const auto size    = uint64_t {count} * sizeof(uint32_t);
+	auto&      buffers = m_renderer.GetBufferCache();
+	// A read in place faults where the page holds GPU-written bytes: the protection is by pages.
+	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	if (count == 0 || !GuestRange {address, size}.Valid() ||
+	    !buffers.HasGpuDirtyBytes(page_begin, page_end - page_begin) ||
+	    buffers.AddressWritesPending() ||
+	    m_renderer.GetTextureCache().WriteBackTick(address, size) != 0) {
+		return words;
+	}
+	m_command_words.resize(count);
+	if (!buffers.ReadGuestBacked(address, m_command_words.data(), size)) {
+		return words;
+	}
+	return m_command_words.data();
 }
 
 void CommandProcessor::WriteBackImages() {

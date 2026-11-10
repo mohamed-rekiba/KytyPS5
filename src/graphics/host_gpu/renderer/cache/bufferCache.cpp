@@ -1323,6 +1323,11 @@ uint64_t BufferCache::PendingGuestBackedWrite(uint64_t vaddr, uint64_t size) {
 	return last_write != 0 && !m_scheduler.IsFree(last_write) ? last_write : 0;
 }
 
+bool BufferCache::AddressWritesPending() {
+	return m_unsettled_everywhere ||
+	       (m_address_write_tick != 0 && !m_scheduler.IsFree(m_address_write_tick));
+}
+
 bool BufferCache::WriteGuestBacked(uint64_t vaddr, const void* data, uint64_t size) {
 	// Labels and other guest writes may name any address; the page table covers guest ranges only.
 	if (!m_import.Enabled() || !GuestRange {vaddr, size}.Valid()) {

@@ -7,6 +7,7 @@
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/perfCounters.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
@@ -5407,6 +5408,81 @@ public:
     Require(name, "write recorded after a submission",
             late_value == 0xbbbbbbbbu,
             "a read-back missed a write recorded after a submission");
+
+    // A command buffer next to a label the GPU writes: the command processor
+    // reads its packets without a page fault, and waits only for a GPU write
+    // to the packet words themselves (a copy that patches the second packet).
+    constexpr uint64_t command_page = 0x23000;
+    constexpr uint64_t first_packet = command_page + 0x40;
+    constexpr uint64_t patched_packet = command_page + 0x60;
+    constexpr uint64_t patch_source = 0x25000;
+    constexpr uint64_t first_label = 0x24000;
+    constexpr uint64_t patched_label = 0x24100;
+    const auto release_packet = [](uint64_t address, uint64_t value) {
+      std::array<uint32_t, 8> packet{};
+      packet[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+      packet[1] = 0x28u | (5u << 8u);
+      packet[2] = 2u << 29u;
+      packet[3] = static_cast<uint32_t>(address);
+      packet[4] = static_cast<uint32_t>(address >> 32u);
+      packet[5] = static_cast<uint32_t>(value);
+      packet[6] = static_cast<uint32_t>(value >> 32u);
+      return packet;
+    };
+    const auto first =
+        release_packet(base + first_label, 0x0123456776543210ull);
+    const auto patch =
+        release_packet(base + patched_label, 0x89abcdeffedcba98ull);
+    for (uint32_t i = 0; i < 8; i++) {
+      memory[first_packet / 4 + i] = first[i];
+      memory[patched_packet / 4 + i] = 0x80000000u; // NOPs until the patch
+      memory[patch_source / 4 + i] = patch[i];
+    }
+    const bool counting = PerfCounters::Enabled();
+    PerfCounters::SetEnabled(true);
+    const auto faults_before = PerfCounters::Read()[static_cast<size_t>(
+        PerfCounters::Counter::GuestFaults)];
+    // In one stream, as a game does: the GPU writes the label, a copy patches
+    // the second packet, and an indirect buffer runs the packets.
+    const auto dma = [](uint8_t src_sel, uint64_t dst, uint64_t src,
+                        uint32_t bytes) {
+      return std::array<uint32_t, 7>{KYTY_PM4(7, Pm4::IT_DMA_DATA, 0),
+                                     static_cast<uint32_t>(src_sel) << 29u,
+                                     static_cast<uint32_t>(src),
+                                     static_cast<uint32_t>(src >> 32u),
+                                     static_cast<uint32_t>(dst),
+                                     static_cast<uint32_t>(dst >> 32u),
+                                     bytes};
+    };
+    const auto fill = dma(2, base + command_page, 0xccccccccu, 4);
+    const auto copy = dma(0, base + patched_packet, base + patch_source, 32);
+    const uint64_t commands_address = base + first_packet;
+    std::array<uint32_t, 18> stream{};
+    std::copy(fill.begin(), fill.end(), stream.begin());
+    std::copy(copy.begin(), copy.end(), stream.begin() + 7);
+    stream[14] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
+    stream[15] = static_cast<uint32_t>(commands_address);
+    stream[16] = static_cast<uint32_t>(commands_address >> 32u);
+    stream[17] = 16u;
+    context.GetGpu().Submit(stream);
+    context.GetGpu().WaitForIdle();
+    const auto faults_after = PerfCounters::Read()[static_cast<size_t>(
+        PerfCounters::Counter::GuestFaults)];
+    PerfCounters::SetEnabled(counting);
+    context.GetGpu().SendCommandSync([&] { scheduler.Finish(); });
+    Require(name, "packets beside a GPU-written label",
+            faults_after == faults_before,
+            "the command processor faulted on a page the GPU writes elsewhere");
+    Require(name, "packet beside a GPU-written label",
+            memory[first_label / 4] == 0x76543210u &&
+                memory[first_label / 4 + 1] == 0x01234567u,
+            "the command processor did not run a packet beside a GPU-written "
+            "label");
+    Require(name, "packet patched by the GPU",
+            memory[patched_label / 4] == 0xfedcba98u &&
+                memory[patched_label / 4 + 1] == 0x89abcdefu,
+            "the command processor read a packet before the GPU's patch "
+            "landed");
 
     // Shaders that write a buffer through formatted stores get a copy of guest
     // memory instead, from the next frame boundary on; what the GPU wrote

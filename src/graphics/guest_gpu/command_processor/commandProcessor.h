@@ -107,6 +107,12 @@ public:
 	// write it (BufferCache::ReadGuestBacked).
 	template <typename T>
 	[[nodiscard]] T ReadMemory(const T* address);
+	// The `count` words of a command buffer from `words` on. A game can keep labels in its command
+	// buffers, next to the commands, and have the GPU write them: the page is then the GPU's, and a
+	// read in place would wait for every GPU write to the page. Such words are read without that
+	// wait unless a GPU write to them is still running (ReadGuestBacked); the result is valid until
+	// the next call. Other words are read in place.
+	[[nodiscard]] const uint32_t* CommandWords(const uint32_t* words, uint32_t count);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
@@ -180,6 +186,8 @@ private:
 		uint64_t tick  = 0;
 	};
 	std::unordered_map<uint64_t, GpuOrderedLabel> m_gpu_ordered_labels;
+	// The words CommandWords read without the wait.
+	std::vector<uint32_t> m_command_words;
 };
 
 } // namespace Libs::Graphics
