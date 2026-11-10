@@ -537,7 +537,10 @@ struct PipelineCache::ProgramPrefetch {
 	}
 
 	void Run(const std::stop_token& stop) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if defined(__APPLE__)
+		// macOS names only the calling thread, and has no per-thread nice value.
+		pthread_setname_np("ShaderPrefetch");
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		pthread_setname_np(pthread_self(), "ShaderPrefetch");
 		// Guesses must not take CPU time from the GPU thread or the game.
 		setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 10);
