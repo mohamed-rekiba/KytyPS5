@@ -258,6 +258,10 @@ private:
 	// Prepared for a GPU write that is not recorded yet. See SettleGpuWrites.
 	static constexpr size_t MaxUnsettledWriters = 256;
 	std::vector<BufferId>   m_unsettled_writers;
+	// The ranges of guest memory that those writes cover in buffers that are guest memory itself.
+	// A submission before a write is recorded puts the write in a later one: the ranges take the
+	// tick of the submission that records them (SettleGpuWrites).
+	std::vector<GuestRange> m_unsettled_guest_backed;
 	// Memory that only buffers that are copies hold, and the buffers that are guest memory itself
 	// still to become copies (DemoteGuestBackedBuffers). Formatted stores write image-like data
 	// next to and over images; with the buffer as guest memory itself, such a write can reach

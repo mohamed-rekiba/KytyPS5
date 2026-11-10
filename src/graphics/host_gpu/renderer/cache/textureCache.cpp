@@ -2318,6 +2318,10 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	}
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	if (buffer.IsGuestBacked()) {
+		// The copy writes guest memory: a read-back of these pages waits for it.
+		m_guest_backed_writes.Add(image.info.data.address, copy_size, m_scheduler.CurrentTick());
+	}
 	return true;
 }
 

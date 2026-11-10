@@ -5354,6 +5354,60 @@ public:
             memory[fill_offset / 4] == 0x77777777u,
             "the fill did not reach guest memory");
 
+    // A read-back opens a page of a buffer that is guest memory itself after
+    // the GPU's writes to that page only: the command processor reads its
+    // command buffers from such buffers, while the GPU writes other pages of
+    // them.
+    constexpr uint64_t done_page = 0x20000;
+    constexpr uint64_t open_page = 0x21000;
+    constexpr uint64_t late_page = 0x22000;
+    bool same_buffer = false;
+    bool other_page_submitted = true;
+    bool written_page_waited = false;
+    uint32_t done_value = 0;
+    uint32_t open_value = 0;
+    uint32_t late_value = 0;
+    context.GetGpu().SendCommandSync([&] {
+      auto [done_buffer, done_offset] =
+          cache.ObtainBuffer(base + done_page, sizeof(uint32_t), true);
+      done_buffer->Fill(done_offset, sizeof(uint32_t), 0x99999999u);
+      cache.SettleGpuWrites();
+      scheduler.Finish();
+      auto [open_buffer, open_offset] =
+          cache.ObtainBuffer(base + open_page, sizeof(uint32_t), true);
+      same_buffer = done_buffer == open_buffer;
+      open_buffer->Fill(open_offset, sizeof(uint32_t), 0xaaaaaaaau);
+      cache.SettleGpuWrites();
+      const auto tick = scheduler.CurrentTick();
+      cache.ReadMemory(base + done_page, sizeof(uint32_t));
+      other_page_submitted = scheduler.CurrentTick() != tick;
+      done_value = memory[done_page / 4];
+      cache.ReadMemory(base + open_page, sizeof(uint32_t));
+      written_page_waited = scheduler.CurrentTick() != tick;
+      open_value = memory[open_page / 4];
+      // A submission between the preparation of a write and its recording
+      // puts the write in the next one.
+      auto [late_buffer, late_offset] =
+          cache.ObtainBuffer(base + late_page, sizeof(uint32_t), true);
+      scheduler.Flush();
+      late_buffer->Fill(late_offset, sizeof(uint32_t), 0xbbbbbbbbu);
+      cache.SettleGpuWrites();
+      cache.ReadMemory(base + late_page, sizeof(uint32_t));
+      late_value = memory[late_page / 4];
+    });
+    Require(name, "pages in one buffer", same_buffer,
+            "the test pages are in different buffers");
+    Require(name, "finished page read", done_value == 0x99999999u,
+            "a page the GPU wrote earlier did not hold its write");
+    Require(name, "no wait for other pages", !other_page_submitted,
+            "a read-back waited for a GPU write to another page of the buffer");
+    Require(name, "wait for the page's own write",
+            written_page_waited && open_value == 0xaaaaaaaau,
+            "a read-back opened a page before its GPU write completed");
+    Require(name, "write recorded after a submission",
+            late_value == 0xbbbbbbbbu,
+            "a read-back missed a write recorded after a submission");
+
     // Shaders that write a buffer through formatted stores get a copy of guest
     // memory instead, from the next frame boundary on; what the GPU wrote
     // before is in guest memory then.

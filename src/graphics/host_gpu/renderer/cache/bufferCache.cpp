@@ -420,6 +420,10 @@ void BufferCache::SettleGpuWrites() noexcept {
 		}
 	}
 	m_unsettled_writers.clear();
+	for (const auto& range: m_unsettled_guest_backed) {
+		m_guest_backed_writes.Add(range.address, range.size, m_scheduler.CurrentTick());
+	}
+	m_unsettled_guest_backed.clear();
 	if (m_unsettled_everywhere) {
 		m_unsettled_everywhere = false;
 		m_address_write_tick   = m_scheduler.CurrentTick();
@@ -486,9 +490,16 @@ std::optional<uint64_t> BufferCache::ReadBack(uint64_t vaddr, uint64_t size, boo
 	// A write that is prepared but not recorded yet counts as one in the open submission.
 	const bool unsettled = m_unsettled_everywhere ||
 	                       std::ranges::find(m_unsettled_writers, id) != m_unsettled_writers.end();
-	const auto last_write =
-	    unsettled ? current : std::max(buffer.LastGpuWriteTick(), m_address_write_tick);
-	const auto plan = PlanReadback({
+	// A buffer that is guest memory itself waits only for the GPU's writes to the pages that this
+	// read-back opens, not for its last write anywhere: such buffers span megabytes, and the
+	// command processor reads its command buffers from pages of them that the GPU does not write.
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	const auto buffer_write =
+	    buffer.IsGuestBacked() ? m_guest_backed_writes.LastWrite(page_begin, page_end - page_begin)
+	                           : buffer.LastGpuWriteTick();
+	const auto last_write = unsettled ? current : std::max(buffer_write, m_address_write_tick);
+	const auto plan       = PlanReadback({
 	    .cpu_readable =
 	        buffer.IsGuestBacked() || (!m_read_back_through_gpu && !buffer.Mapped().empty()),
 	    .last_write_tick = last_write,
@@ -815,6 +826,8 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 			    overlap.CpuAddress(), overlap.Size(), [&](uint64_t start, uint64_t end) {
 				    new_buffer.CopyFrom(m_scheduler.Current(), overlap, overlap.Offset(start),
 				                        new_buffer.Offset(start), end - start);
+				    // The copy writes guest memory: a read-back of these pages waits for it.
+				    m_guest_backed_writes.Add(start, end - start, m_scheduler.CurrentTick());
 			    });
 		}
 	} else {
@@ -1118,6 +1131,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	if (is_written && buffer.IsGuestBacked()) {
 		m_guest_backed_writes.Add(vaddr, size, m_scheduler.CurrentTick());
+		if (m_unsettled_guest_backed.size() < MaxUnsettledWriters) {
+			m_unsettled_guest_backed.push_back({vaddr, size});
+		} else {
+			m_unsettled_everywhere = true;
+		}
 		if (is_texel_buffer && MarkCopyOnly(vaddr, size)) {
 			m_demote.push_back(id);
 		}
