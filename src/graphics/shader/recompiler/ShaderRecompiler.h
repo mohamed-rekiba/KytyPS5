@@ -95,8 +95,9 @@ struct ShaderSource {
 	uint32_t              wave_size =
 	    64; // Of the shader: a vector compare writes one scalar register in wave32.
 	std::optional<Linked> linked;
-	// A table that only gains entries while its linking still holds: the targets it had when the
-	// growth was last seen, when that was, and when the growth began (see SetCallTableSettle).
+	// A table with functions that the linking does not have, while the functions it has still
+	// read the same: the new targets seen, when the last one came, and when the first one came (see
+	// SetCallTableSettle).
 	std::vector<std::pair<uint32_t, uint32_t>> growing_targets;
 	std::chrono::steady_clock::time_point      growing_changed;
 	std::chrono::steady_clock::time_point      growing_since;
@@ -112,10 +113,10 @@ struct ShaderSource {
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);
-// A call table that only gains entries keeps the program it has, until the table has not changed
-// for `settle`, or until `longest` after the growth began. A game can add an entry every few
+// A call table with new functions keeps the program it has, until no new function came for
+// `settle`, or until `longest` after the first one came. A game can add a function every few
 // seconds while it loads, and each new linking is a translation and a pipeline to build; the new
-// entries call nothing until then. Zero, the default, links every change at once.
+// functions are called by nothing until then. Zero, the default, links every new function at once.
 void                          SetCallTableSettle(std::chrono::milliseconds settle,
                                                  std::chrono::milliseconds longest) noexcept;
 [[nodiscard]] TranslateResult TranslateProgram(const Decoder::Program& decoded,

@@ -901,26 +901,40 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 		if (!entries.empty()) reads.emplace_back(base + first, entries.size() * 4u);
 	};
 
-	// A linking holds if the targets are those of the table and every function still reads the
-	// same.
-	const auto holds = [&](const ShaderSource::Linked& linked) {
-		if (linked.table_targets != targets) return false;
-		std::vector<uint32_t> observed;
-		for (const auto& [low, high]: targets)
-			observed.insert(observed.end(), {low, high});
+	// The addresses of the table's functions.
+	std::vector<uint64_t> addresses;
+	for (const auto& [low, high]: targets)
+		addresses.push_back(((uint64_t {high} << 32u) | low) & ~uint64_t {3});
+	std::ranges::sort(addresses);
+	const auto in_table = [&](uint64_t address) {
+		return std::ranges::binary_search(addresses, address);
+	};
+	// A linking holds every function it was linked with, also those that a later table no longer
+	// has: a table that lists only the functions in use changes with each dispatch, and links once
+	// for all its functions. The linking holds while the table's functions are all in it and still
+	// read the same; it grew while those in it read the same.
+	enum class Fit { Holds, Grew, Changed };
+	const auto fit = [&](const ShaderSource::Linked& linked) {
+		size_t                at = linked.table_targets.size() * 2u;
+		std::vector<uint32_t> now;
 		for (const auto& [address, count]: linked.observed_ranges) {
-			const auto at = observed.size();
-			observed.resize(at + count);
-			if (!clean.read_specialization_memory(clean.userdata, address,
-			                                      std::span(observed).subspan(at)))
-				return false;
+			const auto words = std::span(linked.observed_function).subspan(at, count);
+			at += count;
+			if (!in_table(address)) continue;
+			now.resize(count);
+			if (!clean.read_specialization_memory(clean.userdata, address, std::span(now)) ||
+			    !std::ranges::equal(now, words))
+				return Fit::Changed;
 		}
-		return observed == linked.observed_function;
+		return std::ranges::includes(linked.table_targets, targets) ? Fit::Holds : Fit::Grew;
+	};
+	const auto holds = [&](const ShaderSource::Linked& linked) {
+		return fit(linked) == Fit::Holds;
 	};
 	const auto read_linked = [&](const ShaderSource::Linked& linked) {
 		read_table();
 		for (const auto& [address, count]: linked.observed_ranges)
-			reads.emplace_back(address, uint64_t {count} * 4u);
+			if (in_table(address)) reads.emplace_back(address, uint64_t {count} * 4u);
 	};
 	// The current linking if it matches, else a parked one that does.
 	const auto reuse = [&](auto&& matches) -> const Decoder::Program* {
@@ -938,44 +952,58 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 		return nullptr;
 	};
 	if (const auto* program = reuse(holds)) return *program;
-	// The table only gained entries: every target of the linking is still in it, with the same
-	// code.
-	const auto grew = [&](const ShaderSource::Linked& linked) {
-		if (!std::ranges::includes(targets, linked.table_targets)) return false;
-		std::vector<uint32_t> observed;
-		for (const auto& [low, high]: linked.table_targets)
-			observed.insert(observed.end(), {low, high});
-		for (const auto& [address, count]: linked.observed_ranges) {
-			const auto at = observed.size();
-			observed.resize(at + count);
-			if (!clean.read_specialization_memory(clean.userdata, address,
-			                                      std::span(observed).subspan(at)))
-				return false;
-		}
-		return observed == linked.observed_function;
-	};
 	const auto settle =
 	    std::chrono::milliseconds(g_call_table_settle_ms.load(std::memory_order_relaxed));
 	const auto longest =
 	    std::chrono::milliseconds(g_call_table_longest_ms.load(std::memory_order_relaxed));
-	if (settle.count() > 0 && source.linked && grew(*source.linked)) {
+	if (settle.count() > 0 && source.linked && fit(*source.linked) == Fit::Grew) {
 		const auto now = std::chrono::steady_clock::now();
 		if (source.growing_targets.empty()) source.growing_since = now;
-		if (source.growing_targets != targets) {
-			source.growing_targets = targets;
-			source.growing_changed = now;
+		bool gained = false;
+		for (const auto& target: targets) {
+			if (std::ranges::binary_search(source.linked->table_targets, target) ||
+			    std::ranges::binary_search(source.growing_targets, target))
+				continue;
+			source.growing_targets.insert(std::ranges::upper_bound(source.growing_targets, target),
+			                              target);
+			gained = true;
 		}
+		if (gained) source.growing_changed = now;
 		if (now - source.growing_changed < settle && now - source.growing_since < longest) {
 			read_linked(*source.linked);
 			return source.linked->decoded;
 		}
 	}
-	source.growing_targets.clear();
 
-	// Read every function first: the chain before them needs their count.
-	std::vector<uint32_t> observed;
-	for (const auto& [low, high]: targets)
-		observed.insert(observed.end(), {low, high});
+	// The functions to link: the table's, those that came while the table grew, and those of the
+	// current linking that still read the same.
+	auto link_targets = targets;
+	for (const auto& target: source.growing_targets)
+		if (!std::ranges::binary_search(targets, target)) link_targets.push_back(target);
+	source.growing_targets.clear();
+	constexpr size_t MaxLinkedFunctions = 256u;
+	if (source.linked) {
+		const auto&           old = *source.linked;
+		size_t                at  = old.table_targets.size() * 2u;
+		std::vector<uint32_t> now;
+		for (const auto& [address, count]: old.observed_ranges) {
+			const auto words = std::span(old.observed_function).subspan(at, count);
+			at += count;
+			if (in_table(address) || link_targets.size() >= MaxLinkedFunctions) continue;
+			now.resize(count);
+			if (!clean.read_specialization_memory(clean.userdata, address, std::span(now)) ||
+			    !std::ranges::equal(now, words))
+				continue;
+			for (const auto& target: old.table_targets) {
+				const auto at_address =
+				    (((uint64_t {target.second} << 32u) | target.first) & ~uint64_t {3}) == address;
+				if (at_address && std::ranges::find(link_targets, target) == link_targets.end())
+					link_targets.push_back(target);
+			}
+		}
+	}
+	std::ranges::sort(link_targets);
+
 	std::vector<std::pair<uint64_t, uint32_t>> ranges;
 	struct Function {
 		uint64_t                          address = 0;
@@ -985,19 +1013,30 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 	};
 	std::vector<Function> functions;
 	uint32_t              failed = 0;
-	for (const auto& target: targets) {
+	for (const auto& target: link_targets) {
 		const auto address = ((uint64_t {target.second} << 32u) | target.first) & ~uint64_t {3};
 		if (std::ranges::find(functions, address, &Function::address) != functions.end()) continue;
 		Function function {.address = address};
 		if (!ReadTableFunction(clean, address, call, load.src0.reg, source.wave_size, function.code,
 		                       function.words)) {
-			++failed;
+			if (in_table(address)) ++failed;
 			continue;
 		}
 		ranges.emplace_back(address, static_cast<uint32_t>(function.words.size()));
-		observed.insert(observed.end(), function.words.begin(), function.words.end());
 		functions.push_back(std::move(function));
 	}
+	// A function that is not in the table and does not read is not linked.
+	std::erase_if(link_targets, [&](const auto& target) {
+		const auto address = ((uint64_t {target.second} << 32u) | target.first) & ~uint64_t {3};
+		return !in_table(address) &&
+		       std::ranges::find(functions, address, &Function::address) == functions.end();
+	});
+	// The targets, then every function's words.
+	std::vector<uint32_t> observed;
+	for (const auto& [low, high]: link_targets)
+		observed.insert(observed.end(), {low, high});
+	for (const auto& function: functions)
+		observed.insert(observed.end(), function.words.begin(), function.words.end());
 	// The cases, in the order of their functions' code: a load order that puts the same functions
 	// at other addresses links the same program, with other constants.
 	struct Case {
@@ -1006,7 +1045,7 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 		size_t                        function = 0; // Index in functions.
 	};
 	std::vector<Case> ordered;
-	for (const auto& target: targets) {
+	for (const auto& target: link_targets) {
 		const auto address = ((uint64_t {target.second} << 32u) | target.first) & ~uint64_t {3};
 		const auto found   = std::ranges::find(functions, address, &Function::address);
 		if (found == functions.end()) continue;
@@ -1029,7 +1068,7 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 	const auto moved = [&](ShaderSource::Linked& linked) {
 		if (linked.case_keys != case_keys || linked.case_code != case_code) return false;
 		linked.constants         = constants;
-		linked.table_targets     = targets;
+		linked.table_targets     = link_targets;
 		linked.observed_function = observed;
 		linked.observed_ranges   = ranges;
 		return true;
@@ -1151,19 +1190,19 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 	linked.code.insert(linked.code.end(), linked_words.begin(), linked_words.end());
 	linked.code.insert(linked.code.end(), source.code.begin() + word_split, source.code.end());
 	linked.decoded.code = linked.code;
-	LOGF("Shader call at pc 0x%08x: %zu functions linked from a table of %zu targets, %u not "
+	LOGF("Shader call at pc 0x%08x: %zu functions linked for a table of %zu targets, %u not "
 	     "linkable%s\n",
 	     call.pc, functions.size(), targets.size(), failed,
 	     inline_code ? "" : " (after the program)");
 	linked.observed_function = std::move(observed);
 	linked.observed_ranges   = ranges;
-	linked.table_targets     = targets;
+	linked.table_targets     = link_targets;
 	linked.constants         = std::move(constants);
 	linked.case_keys         = std::move(case_keys);
 	linked.case_code         = std::move(case_code);
 	read_table();
 	for (const auto& [address, count]: ranges)
-		reads.emplace_back(address, uint64_t {count} * 4u);
+		if (in_table(address)) reads.emplace_back(address, uint64_t {count} * 4u);
 	linked.id = ++source.link_count;
 	if (source.linked) {
 		constexpr size_t MaxParkedLinks = 64u;
