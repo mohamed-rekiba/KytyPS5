@@ -37,6 +37,10 @@
 
 #if defined(_WIN32)
 #include <winsock2.h>
+// The Windows headers define GetUserName as a macro, which renames Config::GetUserName.
+#ifdef GetUserName
+#undef GetUserName
+#endif
 #else
 #include <cerrno>
 #include <fcntl.h>
