@@ -52413,6 +52413,13 @@ void CheckShaderStore(VulkanHarness &vulkan) {
   warm.compiled = {};
   Require(name, "warm restart", run() == warm && std::filesystem::file_size(store) == size,
           "a restart compiled a module, created a pipeline late or rewrote the store");
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+  // A rebuild that changes no shader code gives a new executable with the same shader output.
+  std::filesystem::last_write_time(std::filesystem::read_symlink("/proc/self/exe"),
+                                   std::filesystem::file_time_type::clock::now());
+  Require(name, "rebuilt emulator", run() == warm && std::filesystem::file_size(store) == size,
+          "a new executable with the same shader code started the store over");
+#endif
   std::filesystem::resize_file(store, size + 3);
   Require(name, "torn tail", run() == warm && std::filesystem::file_size(store) == size,
           "a torn last record was kept");

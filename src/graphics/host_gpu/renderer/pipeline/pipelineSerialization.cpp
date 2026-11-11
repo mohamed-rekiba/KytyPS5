@@ -1,11 +1,11 @@
-#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
-
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "kytyShaderStamps.h"
 
 #include <algorithm>
 #include <chrono>
@@ -14,13 +14,6 @@
 #include <ranges>
 #include <xxhash.h>
 #include <zstd.h>
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#endif
 
 // The shader store: a header, then zstd-compressed records of everything a run created first.
 // Records are only appended, so a store cut short by a crash keeps every complete record.
@@ -40,26 +33,6 @@ struct Frame {
 	uint32_t raw_size        = 0;
 	uint64_t checksum        = 0; // XXH3 of the compressed bytes.
 };
-
-// Changes with every build, so records never meet code that encodes them differently. Zero when
-// the executable cannot be found.
-uint64_t BuildStamp() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	std::array<wchar_t, 32768> name {};
-	GetModuleFileNameW(nullptr, name.data(), static_cast<DWORD>(name.size()));
-	const std::filesystem::path path = name.data();
-#elif defined(__APPLE__)
-	std::array<char, 4096> name {};
-	auto size = static_cast<uint32_t>(name.size());
-	_NSGetExecutablePath(name.data(), &size);
-	const std::filesystem::path path = name.data();
-#else
-	const std::filesystem::path path = "/proc/self/exe";
-#endif
-	std::error_code error;
-	const auto      time = std::filesystem::last_write_time(path, error).time_since_epoch().count();
-	return error ? 0 : static_cast<uint64_t>(time);
-}
 
 // The host as the store sees it: every field by value, never the object's bytes, which have
 // padding. A new field of HostCapabilities or DriverFaults must be added here, or modules built
@@ -110,14 +83,11 @@ uint64_t HostSignature(const HostGpu& host) {
 	return XXH3_64bits(words, sizeof(words));
 }
 
-// What every record depends on besides its own fields; empty when the build is unknown.
+// What every record depends on besides its own fields. The stamps change with the code that
+// encodes records or decides what a shader becomes, not with every build.
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
-	const auto stamp = BuildStamp();
-	if (stamp == 0) {
-		return {};
-	}
 	Writer header;
-	IoAll(header, stamp, HostSignature(graphics.host),
+	IoAll(header, ShaderStamps::Format, ShaderStamps::Translator, HostSignature(graphics.host),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
 }
@@ -192,9 +162,6 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		return;
 	}
 	const auto header = StoreHeader(m_graphics);
-	if (header.empty()) {
-		return;
-	}
 	const auto           start = std::chrono::steady_clock::now();
 	std::vector<uint8_t> bytes;
 	if (Common::File file;
