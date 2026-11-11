@@ -12085,6 +12085,26 @@ void TestAutomaticObjectPrimitiveId() {
           "automatic RT7 lost its integer primitive ID addition");
     CheckSpirvBinaryValidates(result.spirv);
   }
+  const auto object_and_primitive_key = MakeStageStaticKey(pixel);
+  pixel.object_id_without_primitive_id = true;
+  Check(MakeStageStaticKey(pixel) != object_and_primitive_key,
+        "object ID without primitive ID was omitted from the shader identity");
+  {
+    const auto result = RecompileForTest(shader, options, prefix);
+    Check(std::ranges::any_of(result.program.info.outputs,
+                              [](const StageOutput &output) {
+                                return output.kind ==
+                                           StageOutputKind::ObjectPrimitiveId &&
+                                       output.location == 7;
+                              }),
+          "object ID without primitive ID lost its RT7 output");
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("BuiltIn PrimitiveId") == std::string::npos &&
+              source.find("OpIAdd %uint") == std::string::npos,
+          "object ID without primitive ID still added the primitive ID");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+  pixel.object_id_without_primitive_id = false;
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   pixel.target_shader_mask = 0xf0000000u;
   ExpectFatal([&] { (void)RecompileForTest(shader, options, prefix); },

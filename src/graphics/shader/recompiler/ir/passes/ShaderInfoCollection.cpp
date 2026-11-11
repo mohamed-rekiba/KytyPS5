@@ -640,7 +640,9 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 				    })) {
 					return Fail("explicit MRT7 export overlaps automatic object/primitive ID");
 				}
-				AddBuiltinInput(info, StageInputKind::PrimitiveId);
+				if (!input_info.pixel->object_id_without_primitive_id) {
+					AddBuiltinInput(info, StageInputKind::PrimitiveId);
+				}
 				AddOutput(info, StageOutputKind::ObjectPrimitiveId, 0, 7, "out_object_primitive_id");
 			}
 			break;

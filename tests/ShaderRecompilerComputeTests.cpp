@@ -1705,6 +1705,7 @@ struct GraphicsCase {
   u32 pixel_custom_interpolation_mask = 0;
   u32 width = 1;
   std::vector<u32> object_ids;
+  bool object_id_without_primitive_id = false;
   std::vector<u32> gds_initial;
 };
 
@@ -2302,6 +2303,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test,
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
   pixel_info.object_primitive_id = !test.object_ids.empty();
+  pixel_info.object_id_without_primitive_id =
+      test.object_id_without_primitive_id;
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -51351,6 +51354,24 @@ GraphicsCase GraphicsObjectPrimitiveId(bool discard) {
   return test;
 }
 
+// PA_CL_OBJPRIM_ID_CNTL.ADD_PIPED_PRIM_ID = 0: RT7 holds VGT_OBJECT_ID alone,
+// the same value for every primitive of the draw.
+GraphicsCase GraphicsObjectIdWithoutPrimitiveId() {
+  auto test = GraphicsObjectPrimitiveId(false);
+  test.name = "GraphicsObjectIdWithoutPrimitiveId";
+  test.object_id_without_primitive_id = true;
+  const u32 pixels = test.width * test.layers;
+  const size_t color_dwords =
+      test.expected_pixel.size() / test.object_ids.size() - pixels;
+  for (size_t draw = 0; draw < test.object_ids.size(); ++draw) {
+    const size_t rt7 = draw * (color_dwords + pixels) + color_dwords;
+    for (u32 pixel = 0; pixel < pixels; ++pixel) {
+      test.expected_pixel[rt7 + pixel] = test.object_ids[draw];
+    }
+  }
+  return test;
+}
+
 TestCase MultipleWorkitemsGlobalId() {
   using O = ShaderOpcode;
 
@@ -52097,6 +52118,7 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsBranchPathFinalVmExportDiscardsInactiveExec(),
       GraphicsObjectPrimitiveId(false),
       GraphicsObjectPrimitiveId(true),
+      GraphicsObjectIdWithoutPrimitiveId(),
   };
 }
 
@@ -59139,6 +59161,7 @@ int RunSelectedCases(int argc, char **argv) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsObjectPrimitiveId(false));
     RunGraphicsCase(&vulkan, GraphicsObjectPrimitiveId(true));
+    RunGraphicsCase(&vulkan, GraphicsObjectIdWithoutPrimitiveId());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--centroid-only") == 0) {

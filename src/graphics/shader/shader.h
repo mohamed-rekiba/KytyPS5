@@ -249,6 +249,9 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
 	bool                                           object_primitive_id          = false;
+	// PA_CL_OBJPRIM_ID_CNTL.ADD_PIPED_PRIM_ID = 0: RT7 holds the object ID without the
+	// primitive ID added.
+	bool object_id_without_primitive_id = false;
 	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;

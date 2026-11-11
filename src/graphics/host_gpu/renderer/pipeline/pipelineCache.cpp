@@ -1069,11 +1069,19 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		vertex_info[0].indirect_offsets = state.indirect_offsets;
 		vertex_info[0].indirect_draw    = state.indirect_draw;
 	}
+	// PA_CL_OBJPRIM_ID_CNTL.ADD_PIPED_PRIM_ID = 0: RT7 holds VGT_OBJECT_ID alone.
+	const bool object_id_only = (sh.m_paClObjprimIdCntl & 2u) == 0;
 	if (object_primitive_id) {
-		// PA_CL_OBJPRIM_ID_CNTL = 2: VGT_OBJECT_ID plus the pipelined 32-bit primitive ID.
-		EXIT_NOT_IMPLEMENTED(sh.m_paClObjprimIdCntl != 2u || mesh_active || tess_active ||
-		                     !pixel_active || (sh.m_vgtDrawPayloadCntl & 8u) == 0 ||
-		                     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList);
+		// PA_CL_OBJPRIM_ID_CNTL = 2: VGT_OBJECT_ID plus the pipelined 32-bit primitive ID. The
+		// primitive ID follows host numbering, so only triangle lists add it.
+		// PA_CL_OBJPRIM_ID_CNTL = 0 with VGT_DRAW_PAYLOAD_CNTL.OBJECT_ID_INST_EN = 0: the same
+		// VGT_OBJECT_ID for every primitive and instance, whatever the primitive type.
+		const bool object_id_per_instance = (sh.m_vgtDrawPayloadCntl & 8u) != 0;
+		EXIT_NOT_IMPLEMENTED(
+		    (sh.m_paClObjprimIdCntl & ~2u) != 0 || mesh_active || tess_active || !pixel_active ||
+		    (object_id_only ? object_id_per_instance
+		                    : !object_id_per_instance ||
+		                          user_config.GetPrimType() != Prospero::PrimitiveType::kTriList));
 		const auto& target = context.GetRenderTarget(7);
 		EXIT_NOT_IMPLEMENTED(Prospero::ResolveRenderTargetFormat(target.info.format,
 		                                                       target.info.channel_type)
@@ -1132,6 +1140,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		}
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		pixel_info.object_primitive_id = object_primitive_id;
+		pixel_info.object_id_without_primitive_id = object_primitive_id && object_id_only;
 		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
 			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
 			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
