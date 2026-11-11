@@ -38938,7 +38938,13 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave;
   test.has_compute_info = true;
-  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", formatted ? "OpSwitch" : "Volatile"};
+  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge",
+                         formatted ? "convert_indirect_buffer_format"
+                                   : "Volatile"};
+  // A formatted load selects its format by branches of two ways, not by a
+  // switch.
+  if (formatted)
+    test.forbidden_spirv = {"OpSwitch"};
   if (!formatted) test.forbidden_spirv = {"convert_indirect_buffer_format",
                                          "indirect_buffer_format_geometry"};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
@@ -46028,9 +46034,13 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
       if (count == 8u) {
         std::set<u32> nonuniform;
         std::vector<u32> stores;
+        constexpr u32 formats =
+            u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
         u32 bda_function = 0, conversion_function = 0, geometry_function = 0, function = 0;
         u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
         u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
+        u32 geometry_branches = 0, geometry_phis = 0, geometry_compares = 0,
+            geometry_selects = 0;
         bool geometry_pure = true, geometry_cases = true;
         for (size_t offset = 5; offset < compiled.spirv.size();) {
           const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
@@ -46052,15 +46062,17 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
           if (function == geometry_function && function != 0u) {
             geometry_pure &= opcode != spv::OpLoad && opcode != spv::OpStore &&
                              opcode != spv::OpFunctionCall;
-            if (opcode == spv::OpSwitch) {
-              ++geometry_switches;
-              constexpr u32 formats = u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
-              geometry_cases &= words.size() == 3u + 2u * formats;
-              if (words.size() == 3u + 2u * formats) {
-                geometry_cases &= words[2] == words[4]; // Invalid formats use format zero.
-                for (u32 format = 0; format < formats; ++format)
-                  geometry_cases &= words[3u + 2u * format] == format;
-              }
+            // The format selects its geometry by branches of two ways: a tree
+            // over every format has one branch and one phi of two values per
+            // format but one. An invalid format is compared with the format
+            // count and replaced with format zero.
+            geometry_switches += opcode == spv::OpSwitch;
+            geometry_branches += opcode == spv::OpBranchConditional;
+            geometry_compares += opcode == spv::OpULessThan;
+            geometry_selects += opcode == spv::OpSelect;
+            if (opcode == spv::OpPhi) {
+              ++geometry_phis;
+              geometry_cases &= words.size() == 7u;
             }
           }
           if (opcode == spv::OpFunctionCall) {
@@ -46074,10 +46086,14 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
         Require(test.name, "one shared formatted conversion",
                 conversion_definitions == 1u && conversion_calls == 1u,
                 "formatted loads must call one conversion function across virtual halves");
-        Require(test.name, "one shared pure format geometry",
-                geometry_definitions == 1u && geometry_calls == conversion_calls &&
-                    geometry_switches == 1u && geometry_cases && geometry_pure,
-                "format geometry duplicated, lost a format/default or acquired memory accesses");
+        Require(
+            test.name, "one shared pure format geometry",
+            geometry_definitions == 1u && geometry_calls == conversion_calls &&
+                geometry_switches == 0u && geometry_branches == formats - 1u &&
+                geometry_phis == formats - 1u && geometry_compares == formats &&
+                geometry_selects == 1u && geometry_cases && geometry_pure,
+            "format geometry duplicated, lost a format/default or acquired "
+            "memory accesses");
         Require(test.name, "one shared indirect store per virtual half",
                 std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
                     (wave > vulkan.SubgroupSize() ? 2 : 1),
@@ -46195,7 +46211,11 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
         test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
         test.forbidden_spirv = {"OpSwitch", "PhysicalStorageBuffer", "convert_indirect_buffer_format",
                                "indirect_buffer_format_geometry"};
-      } else if (count == 6u) test.required_spirv = {"OpSwitch"};
+      } else if (count == 6u) {
+        // The candidate is selected by branches of two ways, not by a switch.
+        test.required_spirv = {"OpBranchConditional"};
+        test.forbidden_spirv = {"OpSwitch"};
+      }
       auto compiled = CompileCase(test, vulkan.SubgroupSize());
       Require(test.name, "mixed native aliases", count != 6u ||
                   (compiled.program.info.buffer_u8 && compiled.program.info.buffer_u16),
@@ -48799,14 +48819,18 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
     ValidateSpirv("ResidentImageHeap", spirv);
     Require(name, "image heap disassembly", tools.Disassemble(spirv, &text),
             "failed to disassemble the image heap shader");
-    Require(name, "image heap selection",
-            program.info.uses_image_heap && CountText(text, "OpConvertUToPtr") == 1 &&
-                CountText(text, "UMin") == 1 &&
-                CountText(text, "OpSwitch") == (mixed ? 1 : 0) &&
-                CountText(text, "OpImageSampleExplicitLod") == (mixed ? 2 : 1) &&
-                CountText(text, "DescriptorSet 1") == (mixed ? 2 : 1) &&
-                text.find("PhysicalStorageBuffer64") != std::string::npos,
-            "image heap kinds did not sample the slot-selected heap element");
+    Require(
+        name, "image heap selection",
+        program.info.uses_image_heap &&
+            CountText(text, "OpConvertUToPtr") == 1 &&
+            CountText(text, "UMin") == 1 &&
+            // Two kinds are selected by a branch of two ways, not by a switch.
+            CountText(text, "OpSwitch") == 0 &&
+            (!mixed || CountText(text, "OpBranchConditional") >= 1) &&
+            CountText(text, "OpImageSampleExplicitLod") == (mixed ? 2 : 1) &&
+            CountText(text, "DescriptorSet 1") == (mixed ? 2 : 1) &&
+            text.find("PhysicalStorageBuffer64") != std::string::npos,
+        "image heap kinds did not sample the slot-selected heap element");
   }
 
   program.memory_info[0].image_dimension =
@@ -49354,9 +49378,10 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
   TestCase test;
   test.name = name;
-  // A table consecutive from ordinal 1 selects without a switch; a single candidate and a table
-  // with a gap keep it.
+  // A table consecutive from ordinal 1 and a single candidate select without
+  // branches; a table with a gap selects by branches.
   const std::array<std::vector<u32>, 3> tables{{{3u, 0u, 1u}, {2u}, {0u, 2u, 1u}}};
+  size_t consecutive_branches = 0;
   for (size_t case_index = 0; case_index < 2u * tables.size(); ++case_index) {
     const auto &table = tables[case_index % tables.size()];
     const bool mapped = case_index >= tables.size();
@@ -49381,9 +49406,18 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
     std::string text;
     Require(name, "sampler table disassembly", tools.Disassemble(compiled.spirv, &text),
             "failed to disassemble the sampler table shader");
-    Require(name, "sampler table selection",
-            CountText(text, "OpSwitch") == (&table == &tables.front() ? 0u : 1u),
-            "only a consecutive sampler table selects without a switch");
+    // The candidates are selected by branches of two ways: the consecutive
+    // table and the single candidate need none, and the table with a gap needs
+    // more than they do.
+    const auto branches = CountText(text, "OpBranchConditional");
+    if (&table == &tables.front())
+      consecutive_branches = branches;
+    Require(
+        name, "sampler table selection",
+        CountText(text, "OpSwitch") == 0u &&
+            (&table == &tables.back() ? branches > consecutive_branches
+                                      : branches == consecutive_branches),
+        "only a sampler table with a gap selects its candidate by branches");
     test.initial.assign(wave_size, 0xdeadbeefu);
     test.expected.resize(wave_size);
     for (u32 lane_index = 0; lane_index < wave_size; ++lane_index) {

@@ -8604,6 +8604,64 @@ void TestCallTableKeepsFunctionsTheTableDropped() {
   (void)TranslateProgram(source.linked->decoded, options);
 }
 
+// A switch that selects a value merges each case's value in a phi. A host
+// compiler that reads each case as its own `if` sees a path through no case,
+// where the value is the one from the previous loop iteration: every enclosing
+// loop then carries it. The value is selected by branches of two ways, each of
+// which defines it.
+void TestIndexSwitchValueIsDefinedOnEveryPath() {
+  using namespace ShaderRecompiler::Spirv::Emitter;
+  for (const uint32_t count : {1u, 2u, 3u, 8u, 156u}) {
+    ShaderRecompiler::IR::Program program;
+    program.stage = ShaderType::Compute;
+    static const ShaderComputeInputInfo compute{};
+    ShaderStageInputInfo input;
+    input.compute = &compute;
+    EmitterState state(program, input, HostGpu::Full());
+    state.builder.RequireCapability(spv::CapabilityShader);
+    state.builder.AddMemoryModel(spv::AddressingModelLogical,
+                                 spv::MemoryModelGLSL450);
+    const auto u32 = TypeU32(state);
+    const auto pick_type = state.builder.Type(spv::OpTypeFunction, u32, u32);
+    const auto pick = state.builder.AllocateId();
+    const auto index = state.builder.AllocateId();
+    state.builder.AddFunction(spv::OpFunction, u32, pick,
+                              spv::FunctionControlMaskNone, pick_type);
+    state.builder.AddFunction(spv::OpFunctionParameter, u32, index);
+    EmitLabel(state, state.builder.AllocateId());
+    const auto value =
+        EmitIndexSwitch(state, index, count, u32, [&](uint32_t item) {
+          return ConstantU32(state, item * 7u + 1u);
+        });
+    state.builder.AddFunction(spv::OpReturnValue, value);
+    state.builder.AddFunction(spv::OpFunctionEnd);
+    const auto main = state.builder.AllocateId();
+    state.builder.AddFunction(spv::OpFunction, TypeVoid(state), main,
+                              spv::FunctionControlMaskNone,
+                              TypeFunction(state));
+    EmitLabel(state, state.builder.AllocateId());
+    state.builder.AddFunction(spv::OpFunctionCall, u32,
+                              state.builder.AllocateId(), pick,
+                              ConstantU32(state, 1u));
+    state.builder.AddFunction(spv::OpReturn);
+    state.builder.AddFunction(spv::OpFunctionEnd);
+    state.builder.AddEntryPoint(spv::ExecutionModelGLCompute, main, "main", {});
+    state.builder.AddExecutionMode(main, spv::ExecutionModeLocalSize, 1u, 1u,
+                                   1u);
+    const auto binary = state.builder.Build();
+    CheckSpirvBinaryValidates(binary);
+    // Every OpPhi merges exactly two branches, and no switch carries the value.
+    for (size_t i = 5; i < binary.size();) {
+      const uint32_t op = binary[i] & 0xffffu, words = binary[i] >> 16u;
+      Check(op != 251u,
+            "a switch that selects a value is still emitted as OpSwitch");
+      Check(op != 245u || words == 7u,
+            "a value phi merges more than two branches");
+      i += words;
+    }
+  }
+}
+
 void TestCallTableLinkIsAddressFree() {
   using namespace ShaderRecompiler;
   constexpr uint64_t base = 0xfe0040000ull;
@@ -15205,6 +15263,7 @@ int main() {
   TestCallTableLinkIsAddressFree();
   TestCallTableGrowthWaitsToSettle();
   TestCallTableKeepsFunctionsTheTableDropped();
+  TestIndexSwitchValueIsDefinedOnEveryPath();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
