@@ -95,6 +95,16 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
 
+      # The sccache server checks its storage when it starts, and every compile fails when that check fails.
+      # When the GitHub cache does not answer, the build uses the local disk cache.
+      - name: Start sccache
+        shell: bash
+        run: |
+          if ! sccache --start-server; then
+            echo "::warning title=sccache::The GitHub cache is not available. This build does not use the shared cache."
+            echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Verify toolchain
         shell: cmd
         run: |
@@ -187,6 +197,16 @@ jobs:
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
+
+      # The sccache server checks its storage when it starts, and every compile fails when that check fails.
+      # When the GitHub cache does not answer, the build uses the local disk cache.
+      - name: Start sccache
+        shell: bash
+        run: |
+          if ! sccache --start-server; then
+            echo "::warning title=sccache::The GitHub cache is not available. This build does not use the shared cache."
+            echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+          fi
 
       - name: Verify toolchain
         shell: bash
@@ -358,6 +378,16 @@ jobs:
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
+
+      # The sccache server checks its storage when it starts, and every compile fails when that check fails.
+      # When the GitHub cache does not answer, the build uses the local disk cache.
+      - name: Start sccache
+        shell: bash
+        run: |
+          if ! sccache --start-server; then
+            echo "::warning title=sccache::The GitHub cache is not available. This build does not use the shared cache."
+            echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+          fi
 
       - name: Verify toolchain
         shell: bash
