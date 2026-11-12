@@ -1,9 +1,13 @@
 #include "common/emulatorConfig.h"
 
 #include "common/assert.h"
+#include "common/cacheFolder.h"
+#include "common/dataFolder.h"
 #include "common/debugCounters.h"
+#include "common/perfCounters.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 
 namespace Config {
@@ -29,6 +33,7 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
 
 	*g_config = cfg;
+	PerfCounters::SetEnabled(cfg.perf_counters_enabled);
 	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
 }
 
@@ -62,6 +67,10 @@ uint32_t GetControllerSpeakerVolume() {
 
 uint32_t GetControllerVibrationIntensity() {
 	return g_config->controller_vibration_intensity;
+}
+
+VideoOutResolution GetVideoOutResolution() {
+	return g_config->video_out_resolution;
 }
 
 uint32_t GetKeyboardPlayer() {
@@ -121,6 +130,14 @@ bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
 }
 
+uint32_t GetGpuFramesInFlight() {
+	return std::clamp(g_config->gpu_frames_in_flight, 1u, MAX_GPU_FRAMES_IN_FLIGHT);
+}
+
+bool GetGpuGuestMemoryImport() {
+	return g_config->gpu_guest_memory_import;
+}
+
 bool GuestTscEnabled() {
 	return g_config->guest_tsc_enabled;
 }
@@ -141,8 +158,16 @@ bool IsNetworkConnected() {
 	return g_config->network_connected;
 }
 
+void SetNetworkConnected() {
+	g_config->network_connected = true;
+}
+
 bool PsnEmulationEnabled() {
 	return g_config->psn_emulation_enabled;
+}
+
+bool EaEmulationEnabled() {
+	return g_config->ea_emulation_enabled;
 }
 
 bool ShaderValidationEnabled() {
@@ -155,6 +180,49 @@ bool ShaderCacheEnabled() {
 
 LogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
+}
+
+std::filesystem::path GetBenchScript() {
+	return g_config->bench_script;
+}
+
+std::filesystem::path GetTraceDir() {
+	return g_config->trace_dir;
+}
+
+uint32_t GetTraceScreenshotSeconds() {
+	return g_config->trace_screenshot_seconds;
+}
+
+uint32_t GetTraceHangSeconds() {
+	return std::max(g_config->trace_hang_seconds, 5u);
+}
+
+static std::string EnvironmentVariable(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr ? std::string(value) : std::string();
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static constexpr auto HOST = Common::CacheHost::Windows;
+#elif defined(__APPLE__)
+static constexpr auto HOST = Common::CacheHost::MacOs;
+#else
+static constexpr auto HOST = Common::CacheHost::Linux;
+#endif
+
+std::filesystem::path GetPipelineCacheFolder() {
+	return Common::PipelineCacheFolder(g_config->pipeline_cache_folder, HOST,
+	                                   {.home           = EnvironmentVariable("HOME"),
+	                                    .xdg_cache_home = EnvironmentVariable("XDG_CACHE_HOME"),
+	                                    .local_app_data = EnvironmentVariable("LOCALAPPDATA")});
+}
+
+std::filesystem::path GetDataFolder() {
+	return Common::DataFolder(g_config->data_folder, HOST,
+	                          {.home          = EnvironmentVariable("HOME"),
+	                           .xdg_data_home = EnvironmentVariable("XDG_DATA_HOME"),
+	                           .app_data      = EnvironmentVariable("APPDATA")});
 }
 
 std::filesystem::path GetShaderLogFolder() {
@@ -171,6 +239,10 @@ std::filesystem::path GetCommandBufferDumpFolder() {
 
 bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
+}
+
+bool GpuDebugLabelsEnabled() {
+	return g_config->gpu_debug_labels_enabled;
 }
 
 LogDirection GetPrintfDirection() {

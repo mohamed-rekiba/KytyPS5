@@ -3,7 +3,19 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <string_view>
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+// An image or sampler descriptor the shader translator cannot follow reads as a null descriptor,
+// instead of stopping the game. So does a table of image or sampler pointers with no static row
+// bound and more rows than the materializer can read. A shader can choose its descriptors from
+// code it calls through game data, so new shapes keep appearing; a null texture is a visible fault
+// the rest of the frame survives. Buffers, run-ahead guesses and the tests of the rejection rules
+// still fail. Each case logs once per shader and site.
+void SetNullUnplannedDescriptors(bool allowed) noexcept;
+[[nodiscard]] bool NullUnplannedDescriptorsAllowed() noexcept;
+void LogNullDescriptorOnce(uint64_t shader_hash, std::string_view site, std::string_view reason);
 
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
 // ResourceSnapshot and therefore do not create shader permutations.
@@ -64,7 +76,13 @@ bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePl
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
-// Applies an already-derived specialization to native IR before layout and emission.
+// True when `specialization` can be applied to a program with these resources. A specialization
+// kept from another build of the translator may not fit what this build finds in the shader.
+[[nodiscard]] bool ResourceSpecializationFits(const ShaderInfo&             info,
+                                              const ResourceSpecialization& specialization);
+
+// Applies an already-derived specialization to native IR before layout and emission. The
+// specialization must fit (see ResourceSpecializationFits).
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
 // Kind of an image heap entry as root sees it, or 0 (and a zeroed value) when root reads it as

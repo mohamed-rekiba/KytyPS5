@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/frontWorker.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -245,6 +246,7 @@ public:
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 
+		m_generation.fetch_add(1, std::memory_order_release);
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
 			EraseUnlocked(position);
@@ -321,6 +323,9 @@ public:
 		first->second = replacement;
 		UpdatePageTableEntries(first->second, true);
 		MergeAroundUnlocked(first);
+		if (IsCommittedRangeType(expected_type) && !IsCommittedRangeType(type)) {
+			m_generation.fetch_add(1, std::memory_order_release);
+		}
 		return true;
 	}
 
@@ -399,7 +404,16 @@ public:
 		return true;
 	}
 
-	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
+	// Changes whenever committed memory can shrink: a range is removed, or a committed range is
+	// replaced by a reserved one. A committed span seen by ClampRangeSize stays committed while
+	// this does not change. Added ranges and edits of protection or name cannot shrink a span, and
+	// the game maps memory many times per frame, so they keep the value.
+	uint64_t Generation() const noexcept { return m_generation.load(std::memory_order_acquire); }
+
+	// Also returns the committed span the walk passed, from the start of the first range to the
+	// end of the last one: every byte in it is committed.
+	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size, uint64_t* span_begin,
+	                        uint64_t* span_end) {
 		Common::LockGuard lock(m_mutex);
 
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
@@ -410,17 +424,16 @@ public:
 		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
 			return 0;
 		}
-		const auto vma_end = End(vma->second.start, vma->second.size);
+		*span_begin = vma->second.start;
+		*span_end   = End(vma->second.start, vma->second.size);
 
-		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
-		uint64_t expected     = virtual_addr + clamped_size;
+		uint64_t clamped_size = std::min(size, *span_end - virtual_addr);
 		++vma;
 
-		while (vma != m_ranges.end() && vma->second.start == expected &&
+		while (vma != m_ranges.end() && vma->second.start == *span_end &&
 		       IsCommittedRangeType(vma->second.type) && clamped_size < size) {
-			const auto chunk = std::min(size - clamped_size, vma->second.size);
-			clamped_size += chunk;
-			expected += chunk;
+			clamped_size += std::min(size - clamped_size, vma->second.size);
+			*span_end = End(vma->second.start, vma->second.size);
 			++vma;
 		}
 
@@ -605,6 +618,9 @@ private:
 
 	RangeMap      m_ranges;
 	Common::Mutex m_mutex;
+	// Starts apart from every other instance: a new table never matches an answer of an old one.
+	std::atomic<uint64_t>               m_generation {s_next_generation.fetch_add(1) << 40u};
+	static inline std::atomic<uint64_t> s_next_generation {1};
 	uint64_t      m_cpu_page_table_entries = 0;
 	uint64_t      m_gpu_page_table_entries = 0;
 };
@@ -817,20 +833,50 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
+DirectMemoryFile GetDirectMemoryFile() {
+	if (g_guest_address_space == nullptr) {
+		return {};
+	}
+	return {g_guest_address_space->GetBackingFileDescriptor(),
+	        g_guest_address_space->GetBackingSize()};
+}
+
+bool TranslateDirectMemory(uint64_t vaddr, uint64_t size, uint64_t* file_offset) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryTranslateBacking(vaddr, size, file_offset);
+}
+
+bool ContiguousDirectMemory(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high,
+                            uint64_t* begin, uint64_t* end) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryContiguousBacking(vaddr, size, low, high, begin, end);
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
-	return g_guest_address_space->TryReadBacking(vaddr, data, size);
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread()) {
-			return false;
-		}
 		auto& buffers = GetGpuResources().GetBufferCache();
+		if (!Graphics::GuestGpu::IsGpuThread()) {
+			// The front worker reads what the GPU did not write; a read-back is the GPU thread's.
+			if (!Graphics::InFrontJob()) {
+				return false;
+			}
+			if (buffers.HasGpuDirtyBytesShared(vaddr, size)) {
+				Graphics::AbortFrontJob();
+				return false;
+			}
+			Graphics::NoteFrontRead(vaddr, size);
+			return TryReadBacking(vaddr, data, size);
+		}
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			buffers.ReadMemory(vaddr, size);
 		}
@@ -841,7 +887,29 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
-	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	// The renderer asks for many ranges inside the same few mappings. A range inside a committed
+	// stretch seen before needs no clamp, until a virtual range changes.
+	struct Span {
+		uint64_t begin      = 0;
+		uint64_t end        = 0;
+		uint64_t generation = ~uint64_t {0};
+	};
+	static thread_local std::array<Span, 8> spans;
+	static thread_local uint32_t            next_span  = 0;
+	const auto                              generation = g_virtual_ranges->Generation();
+	for (const auto& span: spans) {
+		if (span.generation == generation && vaddr >= span.begin && vaddr < span.end &&
+		    size <= span.end - vaddr) {
+			return size;
+		}
+	}
+
+	uint64_t   span_begin   = 0;
+	uint64_t   span_end     = 0;
+	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size, &span_begin, &span_end);
+	if (clamped_size == size) {
+		spans[next_span++ % spans.size()] = {span_begin, span_end, generation};
+	}
 	if (clamped_size == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
 		     "\n",
@@ -908,6 +976,41 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	}
 
 	return false;
+}
+
+static bool OverlapsPrtAperture(uint64_t address, uint64_t size) {
+	Common::LockGuard lock(g_prt_aperture_mutex);
+	return std::any_of(g_prt_apertures.begin(), g_prt_apertures.end(), [&](const auto& aperture) {
+		return aperture.size != 0 && address < aperture.address + aperture.size &&
+		       aperture.address < address + size;
+	});
+}
+
+// A new mapping goes into a reserved or free span. Such a span holds no GPU state (see
+// UnmapGpuRanges), except where a PRT aperture maps it for the GPU: pages mapped into an aperture
+// replace what the GPU cached from it. An unmap waits for the GPU thread, up to a frame, with the
+// memory lock held, so it is done only there.
+static void UnmapGpuRangeBeforeMap(uint64_t vaddr, uint64_t size) {
+	if (OverlapsPrtAperture(vaddr, size)) {
+		UnmapGpuRange(vaddr, size);
+	}
+}
+
+uint64_t BackedPrefix(uint64_t vaddr, uint64_t size) {
+	constexpr uint64_t Page = 0x4000;
+	uint64_t           done = 0;
+	while (done < size) {
+		uint32_t value = 0;
+		if (!TryReadBacking(vaddr + done, &value, sizeof(value))) {
+			break;
+		}
+		done += std::min<uint64_t>(Page - ((vaddr + done) & (Page - 1u)), size - done);
+	}
+	return done;
+}
+
+uint64_t BackingGeneration() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->BackingGeneration() : 0;
 }
 
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -1618,14 +1721,14 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 				return result;
 			}
 		}
-		UnmapGpuRange(in_addr, len);
+		UnmapGpuRangeBeforeMap(in_addr, len);
 		reserved_target = true;
 		out_addr        = in_addr;
 	} else {
 		const auto search_addr = (in_addr != 0 ? in_addr : DEFAULT_PS5_BASE);
 		out_addr               = FindGuestFreeRange(search_addr, len, map_alignment);
 		if (out_addr != 0) {
-			UnmapGpuRange(out_addr, len);
+			UnmapGpuRangeBeforeMap(out_addr, len);
 		}
 	}
 
@@ -1857,7 +1960,8 @@ static void UnmapMemoryOwner(const VirtualRanges::Range& range, bool keep_pool_r
 	}
 }
 
-// Reserved fragments and holes hold nothing the GPU can cache, so each run of adjacent committed
+// Reserved fragments and holes hold nothing the GPU can cache: every path that unmaps, reserves
+// or releases over mapped memory unmaps it from the GPU. So each run of adjacent committed
 // fragments is unmapped from the GPU with one call.
 static void UnmapGpuRanges(const std::vector<VirtualRanges::Range>& ranges) {
 	for (size_t i = 0; i < ranges.size(); i++) {
@@ -2299,7 +2403,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 					return result;
 				}
 			}
-			UnmapGpuRange(in_addr, len);
+			UnmapGpuRangeBeforeMap(in_addr, len);
 			replace_target = true;
 			if (map_shared_fixed(in_addr)) {
 				out_addr = in_addr;
@@ -2309,7 +2413,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		constexpr size_t DEFAULT_ALIGNMENT = 0x4000;
 		alignment                          = (alignment != 0 ? alignment : DEFAULT_ALIGNMENT);
 		if (in_addr != 0 && IsReservedSpan(in_addr, len)) {
-			UnmapGpuRange(in_addr, len);
+			UnmapGpuRangeBeforeMap(in_addr, len);
 			replace_target = true;
 			if (map_shared_fixed(in_addr)) {
 				out_addr = in_addr;
@@ -2318,7 +2422,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		if (!replace_target) {
 			out_addr = FindGuestFreeRange(in_addr, len, alignment);
 			if (out_addr != 0) {
-				UnmapGpuRange(out_addr, len);
+				UnmapGpuRangeBeforeMap(out_addr, len);
 				if (!map_shared_fixed(out_addr)) {
 					out_addr = 0;
 				}
@@ -2358,6 +2462,10 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	EXIT_IF(!published);
 
 	MapGpuRange(out_addr, len);
+	// Memory the GPU may use gets its import windows built now, not when a frame first needs them.
+	if (g_gpu_resources != nullptr && (prot & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0) {
+		g_gpu_resources->PrefetchGuestMemory(static_cast<uint64_t>(direct_memory_start), len);
+	}
 
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);
@@ -2532,7 +2640,7 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 		alignment = (alignment != 0 ? alignment : PAGE_SIZE);
 		out_addr  = FindGuestFreeRange(in_addr, len, alignment);
 		if (out_addr != 0) {
-			UnmapGpuRange(out_addr, len);
+			UnmapGpuRangeBeforeMap(out_addr, len);
 		}
 	}
 
@@ -2799,7 +2907,7 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 	if (vaddr == 0 || g_virtual_ranges->HasOverlap(vaddr, mapped_size)) {
 		return 0;
 	}
-	UnmapGpuRange(vaddr, mapped_size);
+	UnmapGpuRangeBeforeMap(vaddr, mapped_size);
 	if (!g_guest_address_space->Commit(vaddr, mapped_size, mode)) {
 		return 0;
 	}
@@ -2880,7 +2988,8 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 }
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-	return g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {

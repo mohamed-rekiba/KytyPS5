@@ -9,14 +9,43 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
+#include <mutex>
 #include <numeric>
+#include <set>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+namespace {
+std::atomic<bool> g_null_unplanned {false};
+} // namespace
+
+void SetNullUnplannedDescriptors(bool allowed) noexcept {
+	g_null_unplanned.store(allowed, std::memory_order_relaxed);
+}
+
+bool NullUnplannedDescriptorsAllowed() noexcept {
+	return g_null_unplanned.load(std::memory_order_relaxed);
+}
+
+void LogNullDescriptorOnce(uint64_t shader_hash, std::string_view site, std::string_view reason) {
+	static std::mutex                                 mutex;
+	static std::set<std::pair<uint64_t, std::string>> logged;
+	std::scoped_lock lock {mutex};
+	if (!logged.emplace(shader_hash, std::string(site)).second) return;
+	std::fprintf(stderr,
+	             "!!! NULL DESCRIPTOR !!! shader=0x%016llx %.*s: %.*s; it reads a null descriptor, "
+	             "so rendering is incomplete\n",
+	             static_cast<unsigned long long>(shader_hash), static_cast<int>(site.size()), site.data(),
+	             static_cast<int>(reason.size()), reason.data());
+}
+
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
@@ -561,17 +590,28 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	auto& byte_offsets = program.material_keys;
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
+	// An image heap holds thousands of distinct descriptors: a search through the children so far
+	// would cost more than everything else in a frame.
+	struct DescriptorHash {
+		size_t operator()(const DescriptorValue& value) const noexcept {
+			uint64_t hash = value.dword_count;
+			for (const auto word: value.dwords)
+				hash = (hash ^ word) * 0x100000001b3ull;
+			return static_cast<size_t>(hash ^ (hash >> 32u));
+		}
+	};
+	std::unordered_map<DescriptorValue, uint32_t, DescriptorHash> child_ordinals;
 	const auto intern_candidate = [&](const DescriptorValue& candidate) {
 		if (candidate == descriptors[resource_index]) return 0u;
-		const auto found = std::find(descriptors.begin() + children_begin, descriptors.end(), candidate);
-		const auto ordinal = static_cast<uint32_t>(found - descriptors.begin() - children_begin + 1u);
-		if (found == descriptors.end()) {
+		const auto [found, inserted] = child_ordinals.try_emplace(
+		    candidate, static_cast<uint32_t>(descriptors.size() - children_begin + 1u));
+		if (inserted) {
 			descriptors.push_back(candidate);
 			auto child = root_resource;
 			child.indirect_root = resource_index;
 			specializations.push_back(child);
 		}
-		return ordinal;
+		return found->second;
 	};
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
@@ -711,6 +751,21 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					return true;
 				}
 			}
+			// A table of image or sampler pointers whose rows are bounded only by its size, more
+			// rows than can be read: every row reads the null descriptor the root already holds.
+			// Buffer tables still fail.
+			if constexpr (!std::is_same_v<Specialization, ResourceSpecialization::Buffer>) {
+				if (pointer != nullptr && child_count != 0u && !image_heap &&
+				    count * child_count > MaxIndirectDescriptorProbes && !indirect.table_maximum &&
+				    NullUnplannedDescriptorsAllowed()) {
+					constexpr bool image = std::is_same_v<Specialization, ResourceSpecialization::Image>;
+					LogNullDescriptorOnce(program.shader_hash,
+					    fmt::format("{} {}", image ? "image" : "sampler", resource_index),
+					    fmt::format("a descriptor pointer table of {} rows is over the {}-row limit",
+					                count, MaxIndirectDescriptorProbes));
+					return true;
+				}
+			}
 			if (child_count == 0u || (!image_heap && count * child_count > MaxIndirectDescriptorProbes))
 				return failed("candidate count", fmt::format("rows={} limit={}", count, MaxIndirectDescriptorProbes));
 			// Affine SMEM offsets wrap in U32 before adding the aligned immediate.
@@ -726,20 +781,54 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			for (uint32_t word = 0; word < count; ++word) {
 				const auto table_offset = affine ? first + word * step : uint64_t {word} * 4u;
 				uint64_t pointer_base = 0u;
+				uint64_t pointee_size = UINT64_MAX;
+				uint64_t slot_offset  = 0u;
 				if (pointer != nullptr) {
 					std::array<uint32_t, 2> address {};
 					if (!ReadScalarTable(table_base, table_size, table_offset, runtime, address))
 						return read_failed("parent pointer read", word, 0u, table_base, table_offset, sizeof(address));
 					pointer_base = (uint64_t {address[1]} << 32u) | address[0];
+					if (pointer->slot) {
+						// The row's own index into the descriptor array, read as the GPU reads it:
+						// zero past the end of its V#'s buffer.
+						const auto& slot = *pointer->slot;
+						DescriptorValue vsharp {.dword_count = 4u};
+						std::array<uint32_t, 1> packed {};
+						ShaderBufferResource buffer;
+						if (!ReadScalarTable(pointer_base, UINT64_MAX, slot.vsharp_offset, runtime,
+						                     std::span(vsharp.dwords).first(4u)))
+							return read_failed("slot buffer read", word, 0u, pointer_base, slot.vsharp_offset, 16u);
+						if (!DecodeBufferDescriptor(vsharp, buffer)) return false;
+						if (!ReadScalarTable(buffer.Base48(), buffer.GetSize(), slot.dword_offset, runtime, packed))
+							return read_failed("slot read", word, 0u, buffer.Base48(), slot.dword_offset, 4u);
+						const auto field = slot.bit_count >= 32u
+						    ? packed[0] >> slot.bit_offset
+						    : (packed[0] >> slot.bit_offset) & ((1u << slot.bit_count) - 1u);
+						slot_offset = uint64_t {field} * pointer->stride;
+					}
+					if (pointer->vsharp_offset) {
+						// The descriptor is in the buffer of the V# the pointer leads to, and reads
+						// past that buffer's size are zero, as on the GPU.
+						DescriptorValue vsharp {.dword_count = 4u};
+						if (!ReadScalarTable(pointer_base, UINT64_MAX, *pointer->vsharp_offset, runtime,
+						                     std::span(vsharp.dwords).first(4u)))
+							return read_failed("child buffer read", word, 0u, pointer_base,
+							                   *pointer->vsharp_offset, 16u);
+						ShaderBufferResource buffer;
+						if (!DecodeBufferDescriptor(vsharp, buffer)) return false;
+						pointer_base = buffer.Base48();
+						pointee_size = buffer.GetSize();
+					}
 				}
 				for (uint32_t child = 0; child < child_count; ++child) {
 					DescriptorValue candidate {.dword_count = dword_count};
 					if (pointer != nullptr) {
-						if (!ReadScalarTable(pointer_base, UINT64_MAX,
-						        uint64_t {child} * pointer->stride + pointer->offset, runtime,
+						const auto child_offset =
+						    uint64_t {child} * pointer->stride + pointer->offset + slot_offset;
+						if (!ReadScalarTable(pointer_base, pointee_size, child_offset, runtime,
 						        std::span(candidate.dwords).first(read_dwords)))
 							return read_failed("child descriptor read", word, child, pointer_base,
-							    uint64_t {child} * pointer->stride + pointer->offset, descriptor_bytes);
+							    child_offset, descriptor_bytes);
 					} else if (!image_heap) {
 						if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
 						                     std::span(candidate.dwords).first(read_dwords))) return false;
@@ -1576,8 +1665,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.uniform_fill.element_count = Clone(plan.uniform_fill.element_count);
 	plan.capture_specialization_reads |=
 	    capture_indirect_reads || capture_control_reads || !plan.source_reads.empty();
-	if (capture_indirect_reads || !plan.source_reads.empty())
-		plan.resource_tracking_complete &= !program.has_address_writes;
+	// Address writes are not tracked, so values captured from memory the shader may write are not
+	// known to stay. Linked calls read guest code and function tables, which shaders do not write.
+	if (capture_indirect_reads) plan.resource_tracking_complete &= !program.has_address_writes;
 	DerivePlanState(plan);
 	return plan;
 }
@@ -2153,6 +2243,28 @@ bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan) {
 	Reader reader {bytes};
 	IoPlan(reader, plan);
 	return reader.ok && reader.bytes.empty() && DerivePlanState(plan);
+}
+
+bool ResourceSpecializationFits(const ShaderInfo&             info,
+                                const ResourceSpecialization& specialization) {
+	// Each entry past the shader's own resources is a copy of one of them; every indirect root
+	// is an entry.
+	const auto fits = [](const auto& sources, size_t original_count, uint32_t no_root) {
+		if (original_count > sources.size()) {
+			return false;
+		}
+		for (size_t index = 0; index < sources.size(); index++) {
+			const auto root = sources[index].indirect_root;
+			if ((index >= original_count && root >= original_count) ||
+			    (root != no_root && root >= sources.size())) {
+				return false;
+			}
+		}
+		return true;
+	};
+	return fits(specialization.buffers, info.buffers.size(), BufferResource::NoIndirectBuffer) &&
+	       fits(specialization.images, info.images.size(), ImageResource::NoIndirectImage) &&
+	       fits(specialization.samplers, info.samplers.size(), SamplerResource::NoIndirectSampler);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

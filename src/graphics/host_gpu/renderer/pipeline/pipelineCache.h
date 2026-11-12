@@ -8,6 +8,7 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -20,7 +21,9 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+
 #include <queue>
+
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -189,20 +192,39 @@ public:
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
-		// The push constant range's stages, which every update names.
-		vk::ShaderStageFlags    push_stages;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// The stages the push constant range names: a push must name all of them.
+		vk::ShaderStageFlags push_constant_stages;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
 	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
 	// Null skips the dispatch.
+	// push_data_start: PushData::NoStart keeps the shader data out of the push constants (an
+	// indirect dispatch in thread dimensions, whose data the GPU writes).
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
-	                                      ShaderComputeInputInfo&      input_info);
+	                                      ShaderComputeInputInfo&      input_info,
+	                                      uint32_t                     push_data_start = 0);
 
-	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
-	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
+	// Null while the pipeline is still compiling on a worker (see SetCompileBudget): the caller
+	// skips the draw.
+	Pipeline* GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
+	// Null while the pipeline is still compiling on a worker (see SetCompileBudget): the caller
+	// skips the dispatch.
+	Pipeline* GetComputePipeline(const ShaderComputeInputInfo& input_info);
+
+	// The longest the GPU thread waits for a new pipeline. A longer compile goes on on a worker
+	// thread, and the work that needs the pipeline is skipped until it is ready, so that a slow
+	// driver compile cannot stop the game. WaitForCompile, the default, always waits.
+	static constexpr std::chrono::milliseconds WaitForCompile {-1};
+	static void SetCompileBudget(std::chrono::milliseconds budget) noexcept;
+
+	// Run-ahead (computePrescan.h): starts translating, on worker threads, the compute program a
+	// dispatch with these registers and initiator will need, when the program cache has none. A
+	// guess that no dispatch uses only costs worker time.
+	void PrefetchComputeProgram(const HW::ComputeShaderInfo& regs, uint32_t dispatch_mode,
+	                            bool async_compute);
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -214,9 +236,24 @@ private:
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<ShaderModule>                    modules;
 		bool                                         skip_dispatch = false;
+		// Translated in this boot (not only loaded from the shader store).
+		bool translated = false;
+		// A program with GPU-selected calls: the callee code `resource_plan` was made for, and
+		// the plans of the callee code it had before. A game can switch between a few sets of
+		// callees, and a translation to remake the plan takes many milliseconds.
+		struct CallPlan {
+			std::vector<uint32_t>              code;
+			ShaderRecompiler::IR::ResourcePlan plan;
+		};
+		static constexpr size_t MaxCallPlans = 8;
+		std::vector<uint32_t>   plan_code;
+		std::vector<CallPlan>   call_plans;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
+		// After the callee code changed: keeps the current plan for its code, and takes back the
+		// plan made earlier for the new code. False when there is none: a translation makes it.
+		bool TakeCallPlan();
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                         uint32_t                                push_data_cursor);
@@ -242,6 +279,9 @@ private:
 
 	using ModuleMap = std::unordered_map<uint64_t, const ShaderModule*>;
 
+	// The worker threads and jobs of PrefetchComputeProgram (pipelineCache.cpp).
+	struct ProgramPrefetch;
+
 	GraphicContext&                        m_graphics;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
@@ -254,9 +294,24 @@ private:
 	bool                          m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
+	// Pipelines that a worker is still compiling.
+	struct PendingPipeline;
+	std::unique_ptr<PipelineCompileQueue>                          m_compile_queue;
+	std::unordered_map<uint64_t, std::unique_ptr<PendingPipeline>> m_pending_compute;
+	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<PendingPipeline>,
+	                   GraphicsPipelineKeyHash>
+	    m_pending_graphics;
+	// The pipeline of `key` from `ready`, or null while a worker compiles it (see
+	// SetCompileBudget). `make_task()` gives the task that builds the pipeline: it owns what it
+	// reads, as the worker may run it after the caller's data is gone. `created` is set when the
+	// pipeline became ready.
+	template <class Ready, class Pending, class Key, class MakeTask>
+	Pipeline* ObtainPipeline(Ready& ready, Pending& pending, const Key& key, MakeTask&& make_task,
+	                         bool& created);
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created if a shader store is open, and writes the driver cache.
 	ShaderStoreWriter m_store;
+	std::unique_ptr<ProgramPrefetch> m_prefetch;
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -287,8 +342,6 @@ private:
 // The shader store of the running title; empty unless --shader-cache is on in a Release build
 // without debug dumps, which change the SPIR-V.
 std::filesystem::path ShaderStorePath();
-// Host capabilities that change the emitted SPIR-V.
-ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
 
 // Stages are indexed like GraphicsPipelineKey::stage_ids.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,

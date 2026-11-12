@@ -390,18 +390,16 @@ static size_t audioout2_pcm_size(const AudioOut2PortStateEntry& state) {
 	       audioout2_data_format_channels(state.data_format) * bytes_per_sample;
 }
 
-static bool audioout2_context_has_queueable_device(const AudioOut2ContextState& context) {
-	for (const auto& state: context.ports) {
-		if (state.used && !state.pcm_data.empty()) {
-			const int handle = audioout2_port_type_is_object(state.port_type)
-			                       ? context.object_audio_handle
-			                       : state.audio_handle;
-			if (AudioInternal::AudioOutHasDevice(handle)) {
-				return true;
-			}
-		}
+// Time until the oldest queued grain finishes playing, capped at one grain.
+static uint32_t audioout2_micros_to_next_drain(const AudioOut2ContextState& state) {
+	const auto grain_micros = audioout2_grain_micros(state.num_grains);
+	if (state.queued == 0) {
+		return grain_micros;
 	}
-	return false;
+	const auto next = state.last_update + uint64_t {state.num_grains} * 125;
+	const auto now  = audioout2_clock();
+	const auto wait = (next > now ? (next - now + 5) / 6 : 0);
+	return static_cast<uint32_t>(std::clamp<uint64_t>(wait, 100, grain_micros));
 }
 
 static void audioout2_mix_object(std::vector<float>& mix, uint32_t num_grains,
@@ -627,28 +625,39 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
 	uint32_t sleep_micros = audioout2_grain_micros(512);
+	bool     submitted    = false;
 
+	// A blocking push waits for a free slot, queues its grain, then waits until the queue has room
+	// for the next push. A caller that reads the queue level right after a push to decide whether to
+	// render the next grain then always finds a free slot, so its render loop keeps running.
 	for (;;) {
-		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
-		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
-		// vibration/failed-open handle) has no downstream operation that can block this call.
 		g_audioout2_state_mutex.Lock();
-		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-			const bool use_device_clock =
-			    blocking != 0 && audioout2_context_has_queueable_device(*state);
+		auto* state = audioout2_find_context_locked(ctx);
+		if (state == nullptr && submitted) {
+			g_audioout2_state_mutex.Unlock();
+			return OK;
+		}
+		if (state != nullptr) {
 			audioout2_update_context_locked(state);
-			sleep_micros = audioout2_grain_micros(state->num_grains);
-			if (state->queued < state->queue_depth || use_device_clock) {
+			sleep_micros   = audioout2_micros_to_next_drain(*state);
+			const bool room = state->queued < state->queue_depth;
+			if (room && submitted) {
+				g_audioout2_state_mutex.Unlock();
+				return OK;
+			}
+			if (room) {
 				if (state->queued == 0) {
 					state->last_update = audioout2_clock();
 				}
-				if (state->queued < state->queue_depth) {
-					state->queued++;
-				}
+				state->queued++;
 				auto& submission = audioout2_submission(*state);
 				g_audioout2_state_mutex.Unlock();
 				audioout2_queue_context_audio(ctx, submission, blocking != 0);
-				return OK;
+				if (blocking == 0) {
+					return OK;
+				}
+				submitted = true;
+				continue;
 			}
 		}
 		g_audioout2_state_mutex.Unlock();

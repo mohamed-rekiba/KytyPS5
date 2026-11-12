@@ -144,6 +144,7 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::PopsExitingWaveId: return IR::U32(IR::Value(0u));
 		case Decoder::OperandKind::SharedLimit:
 		case Decoder::OperandKind::PrivateLimit: return IR::U32(IR::Value(0xffffffffu));
+		case Decoder::OperandKind::LinkedConstant: return ir.GetLinkedConstant(operand.value);
 		case Decoder::OperandKind::Sgpr:
 			return ir.GetScalarReg(static_cast<IR::ScalarReg>(operand.reg));
 		case Decoder::OperandKind::Vgpr:

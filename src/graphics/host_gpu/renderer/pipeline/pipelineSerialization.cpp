@@ -1,11 +1,11 @@
-#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
-
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "kytyShaderStamps.h"
 
 #include <algorithm>
 #include <chrono>
@@ -14,13 +14,6 @@
 #include <ranges>
 #include <xxhash.h>
 #include <zstd.h>
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#endif
 
 // The shader store: a header, then zstd-compressed records of everything a run created first.
 // Records are only appended, so a store cut short by a crash keeps every complete record.
@@ -41,34 +34,60 @@ struct Frame {
 	uint64_t checksum        = 0; // XXH3 of the compressed bytes.
 };
 
-// Changes with every build, so records never meet code that encodes them differently. Zero when
-// the executable cannot be found.
-uint64_t BuildStamp() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	std::array<wchar_t, 32768> name {};
-	GetModuleFileNameW(nullptr, name.data(), static_cast<DWORD>(name.size()));
-	const std::filesystem::path path = name.data();
-#elif defined(__APPLE__)
-	std::array<char, 4096> name {};
-	auto size = static_cast<uint32_t>(name.size());
-	_NSGetExecutablePath(name.data(), &size);
-	const std::filesystem::path path = name.data();
-#else
-	const std::filesystem::path path = "/proc/self/exe";
-#endif
-	std::error_code error;
-	const auto      time = std::filesystem::last_write_time(path, error).time_since_epoch().count();
-	return error ? 0 : static_cast<uint64_t>(time);
+// The host as the store sees it: every field by value, never the object's bytes, which have
+// padding. A new field of HostCapabilities or DriverFaults must be added here, or modules built
+// for another host would be taken from the store.
+uint64_t HostSignature(const HostGpu& host) {
+	const auto&    c       = host.capabilities;
+	const auto&    f       = host.faults;
+	const uint32_t words[] = {
+	    c.image_view_min_lod,
+	    c.cull_distance,
+	    c.buffer_int64_atomics,
+	    c.shared_int64_atomics,
+	    c.image_int64_atomics,
+	    c.float64,
+	    c.float16,
+	    c.fragment_barycentric,
+	    c.depth_bounds,
+	    c.depth_clamp,
+	    c.depth_clip_enable,
+	    c.mesh_shader,
+	    c.compute_derivatives,
+	    c.push_descriptors,
+	    c.packed_scaled_vertex_input,
+	    c.provoking_vertex_last,
+	    c.attachment_feedback_loop,
+	    c.compute_subgroup_size_control,
+	    c.block_texel_view,
+	    c.maintenance8,
+	    c.robust_buffer_access,
+	    c.r8_srgb_views,
+	    c.r8g8_srgb_views,
+	    c.sampler_filter_minmax,
+	    c.device_clock_period_ps,
+	    c.draw_indirect_first_instance,
+	    c.guest_float_min_max,
+	    c.subgroup_supported_stages,
+	    c.subgroup_supported_operations,
+	    c.max_stage_samplers,
+	    f.pushed_buffers_have_no_size,
+	    f.no_per_vertex_inputs,
+	    f.no_centroid_barycentric,
+	    f.volatile_loads_are_reused,
+	    f.no_contraction_is_slow,
+	    f.pipeline_cache_load_is_slow,
+	    f.pipeline_cache_serializes_builds,
+	    f.vertex_subgroups_unreported,
+	};
+	return XXH3_64bits(words, sizeof(words));
 }
 
-// What every record depends on besides its own fields; empty when the build is unknown.
+// What every record depends on besides its own fields. The stamps change with the code that
+// encodes records or decides what a shader becomes, not with every build.
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
-	const auto stamp = BuildStamp();
-	if (stamp == 0) {
-		return {};
-	}
 	Writer header;
-	IoAll(header, stamp, SpirvProfile(graphics),
+	IoAll(header, ShaderStamps::Format, ShaderStamps::Translator, HostSignature(graphics.host),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
 }
@@ -143,9 +162,6 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		return;
 	}
 	const auto header = StoreHeader(m_graphics);
-	if (header.empty()) {
-		return;
-	}
 	const auto           start = std::chrono::steady_clock::now();
 	std::vector<uint8_t> bytes;
 	if (Common::File file;
@@ -155,10 +171,13 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
 		bytes.resize(read);
 	}
+	// Builds that share the driver cache run one at a time under its lock on some drivers: more
+	// threads only wait (DriverFaults::pipeline_cache_serializes_builds).
+	const bool serial = m_graphics.host.faults.pipeline_cache_serializes_builds;
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader cache: compiling shaders and pipelines from {} ({:.1f} MB) with {} threads\n",
 	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
-	    Common::ParallelThreads()));
+	    serial ? size_t {1} : Common::ParallelThreads()));
 	auto       records = std::span<const uint8_t>(bytes);
 	const bool reusable =
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
@@ -186,7 +205,13 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			});
 		}
 	}
-	Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	if (serial) {
+		for (auto& job: jobs) {
+			job();
+		}
+	} else {
+		Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	}
 	// A key with a stage missing from the store keeps no pipeline.
 	std::erase_if(m_graphics_pipelines,
 	              [](const auto& entry) { return entry.second.pipeline == nullptr; });

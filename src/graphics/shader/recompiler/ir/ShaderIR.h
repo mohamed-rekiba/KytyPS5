@@ -11,6 +11,7 @@
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <list>
@@ -89,12 +90,9 @@ struct MemoryInfo {
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
 		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
 		return data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
-		                  : opcode == ValueOpcode::ReadConstBuffer ||
-		                        opcode == ValueOpcode::LoadBufferU32 ||
-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4);
+		       ((!formatted && opcode == ValueOpcode::ReadConstBuffer) ||
+		        opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+		        opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -212,6 +210,10 @@ struct SampledResourcePair {
 	uint32_t image        = 0;
 	uint32_t sampler      = 0;
 	uint32_t first_use_pc = 0;
+	// The entry of the sampler binding that holds the sampler for this texture alone, or
+	// UINT32_MAX. Set on a host where a sampler applies the minimum LOD of the texture it reads,
+	// because the texture view cannot (see DefineDescriptors).
+	uint32_t descriptor_index = UINT32_MAX;
 
 	bool operator==(const SampledResourcePair& other) const = default;
 };
@@ -365,6 +367,14 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 5;
+	// An emulated mesh draw adds the 64-bit address of the record buffer and the workgroup count of
+	// the draw's first dimension.
+	static constexpr uint32_t MeshEmulationAddressDword  = MeshDrawDwordCount;
+	static constexpr uint32_t MeshEmulationGroupsDword   = MeshDrawDwordCount + 2;
+	static constexpr uint32_t MeshEmulatedDrawDwordCount = MeshDrawDwordCount + 3;
+	// Depth bounds test of a pixel shader: depth buffer copy address (two dwords), row width in
+	// pixels, minimum and maximum bound as float bits.
+	static constexpr uint32_t DepthBoundsDwordCount = 5;
 	// Indirect mesh draws read the draw parameters, then the record's first instance, from the
 	// task payload (gpu_mesh_indirect.task).
 	static constexpr uint32_t MeshTaskPayloadDwordCount = MeshDrawDwordCount + 1;
@@ -495,6 +505,8 @@ struct Bindings {
 	uint64_t descriptor_mask = 0;
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
+	// The values a linked call table compares its targets with, one dword each.
+	uint32_t linked_constant_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
@@ -543,6 +555,8 @@ struct ShaderInfo {
 	bool                            uses_flattened_srt            = false;
 	bool                            uses_image_heap               = false;
 	bool                            uses_dispatch_threads         = false;
+	// The slots GetLinkedConstant reads.
+	uint32_t                        linked_constants              = 0;
 	bool                            bvh                           = false;
 	bool                            bvh8                          = false;
 	bool                            bvh_stack                     = false;
@@ -564,6 +578,12 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	// The shader has packed FP16 arithmetic (PackedFPAdd16 and its kind).
+	bool packed_float16 = false;
+	// The shader moves an append or consume counter.
+	bool append_consume = false;
+	// The shader reads the barycentrics as values.
+	bool barycentric = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -604,11 +624,26 @@ struct DescriptorSource {
 
 			bool operator==(const SelectorRead& other) const = default;
 		};
+		// A per-row index the materializer reads itself: a bit field of the dword at `dword_offset`
+		// in the buffer of the V# at `vsharp_offset` from the row's pointer.
+		struct SlotRead {
+			uint32_t vsharp_offset = 0;
+			uint32_t dword_offset  = 0;
+			uint32_t bit_offset    = 0;
+			uint32_t bit_count     = 32;
+
+			bool operator==(const SlotRead& other) const = default;
+		};
 		struct PointerTable {
 			uint32_t offset = 0;
 			uint32_t stride = 0;
 			uint32_t count = 1;
 			bool indexed = false; // Parent pointers use raw MUBUF record addressing.
+			// When set, the pointer leads to a V# at this offset, and `offset` is the descriptor's
+			// offset in that V#'s buffer.
+			std::optional<uint32_t> vsharp_offset;
+			// The descriptor is at `slot * stride + offset` in that V#'s buffer.
+			std::optional<SlotRead> slot;
 
 			bool operator==(const PointerTable& other) const = default;
 		};
@@ -668,6 +703,8 @@ struct CompiledShaderInfo {
 	uint32_t   user_data_base     = 0;
 	uint32_t   param_export_mask  = 0;
 	bool       has_address_writes = false;
+	// A mesh program compiled as a compute shader (see capturedVertexLayout.h).
+	bool       mesh_emulated = false;
 	ShaderInfo info;
 	Bindings   bindings;
 };
@@ -678,6 +715,8 @@ struct UniformFillPlan {
 	Value                pattern_size;
 	Value                element_count;
 };
+
+class SrtTrace;
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
@@ -737,11 +776,14 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
+	// The shader has a DS_ORDERED_COUNT: it adds once per wave, so it needs real waves.
+	bool uses_ordered_count = false;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
 	std::vector<ScalarWrite>      scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
+	bool                          mesh_emulated        = false;
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;

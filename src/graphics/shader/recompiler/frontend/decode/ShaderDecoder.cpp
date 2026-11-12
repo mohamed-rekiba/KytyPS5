@@ -406,7 +406,11 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 			if (branch_targets.empty()) {
 				branch_targets.resize(code.size());
 			}
-			branch_targets[target_index] = true;
+			// A target outside the code (a test fragment, a malformed branch) is the CFG's to
+			// reject; decoding does not continue there.
+			if (target_index < branch_targets.size()) {
+				branch_targets[target_index] = true;
+			}
 		}
 		if (inst.opcode == Opcode::S_ENDPGM &&
 		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
@@ -443,6 +447,7 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::PrivateBase: text = "private_base"; break;
 		case OperandKind::PrivateLimit: text = "private_limit"; break;
 		case OperandKind::Null: text = "null"; break;
+		case OperandKind::LinkedConstant: text = fmt::format("linked[{}]", operand.value); break;
 		default: text = "unknown"; break;
 	}
 	if (operand.sdwa_sel != 6 || operand.sdwa_sext) {

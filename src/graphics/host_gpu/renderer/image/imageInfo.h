@@ -42,6 +42,11 @@ struct ImageSubresources {
 	uint32_t levels                                      = 1;
 	uint32_t layers                                      = 1;
 	auto     operator<=>(const ImageSubresources&) const = default;
+	// True when every level and layer of other is here. The ordered operators compare levels
+	// first, so {9 levels, 1 layer} is not less than {1 level, 6 layers}.
+	[[nodiscard]] bool Holds(const ImageSubresources& other) const noexcept {
+		return levels >= other.levels && layers >= other.layers;
+	}
 };
 
 struct ImageSubresourceRange {
